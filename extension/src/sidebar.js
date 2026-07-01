@@ -1,7 +1,13 @@
+import {
+  FaceDetector as MediaPipeFaceDetector,
+  FilesetResolver
+} from "../vendor/mediapipe/vision_bundle.mjs";
+
 const ANALYSIS_INTERVAL_MS = 250;
 const EVENT_INTERVAL_MS = 1000;
 const PREVIEW_WIDTH = 640;
 const PREVIEW_HEIGHT = 360;
+const MEDIAPIPE_MODEL_PATH = "models/blaze_face_short_range.tflite";
 
 const elements = {
   statusBadge: document.getElementById("statusBadge"),
@@ -28,7 +34,7 @@ let eventTimer = null;
 let previousFrame = null;
 let latestFeatures = createEmptyFeatures();
 let ws = null;
-let faceDetector = null;
+let faceDetectorBackend = null;
 let tracks = [];
 let nextTrackId = 1;
 
@@ -46,20 +52,69 @@ async function restoreSettings() {
 }
 
 async function initFaceDetector() {
-  if (!("FaceDetector" in window)) {
-    logEvent({ type: "edge_vision_status", message: "FaceDetector unavailable; using motion-only fallback" });
+  const mediaPipeDetector = await createMediaPipeFaceDetector();
+  if (mediaPipeDetector) {
+    faceDetectorBackend = mediaPipeDetector;
+    logEvent({ type: "edge_vision_status", message: "MediaPipe FaceDetector enabled" });
     return;
   }
 
+  const nativeDetector = createNativeFaceDetector();
+  if (nativeDetector) {
+    faceDetectorBackend = nativeDetector;
+    logEvent({ type: "edge_vision_status", message: "Native FaceDetector enabled" });
+    return;
+  }
+
+  logEvent({ type: "edge_vision_status", message: "Face detector unavailable; using motion-only fallback" });
+}
+
+async function createMediaPipeFaceDetector() {
   try {
-    faceDetector = new window.FaceDetector({
+    const vision = await FilesetResolver.forVisionTasks(
+      chrome.runtime.getURL("vendor/mediapipe/wasm")
+    );
+    const detector = await MediaPipeFaceDetector.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: chrome.runtime.getURL(MEDIAPIPE_MODEL_PATH),
+        delegate: "CPU"
+      },
+      runningMode: "VIDEO",
+      minDetectionConfidence: 0.45
+    });
+
+    return {
+      modelVersion: "mediapipe-blaze-face-short-range-v1",
+      async detect(source, timestampMs) {
+        const result = detector.detectForVideo(source, timestampMs);
+        return result.detections.map((detection) => normalizeMediaPipeFace(detection.boundingBox));
+      }
+    };
+  } catch (error) {
+    logEvent({ type: "mediapipe_init_error", message: error.message });
+    return null;
+  }
+}
+
+function createNativeFaceDetector() {
+  if (!("FaceDetector" in window)) return null;
+
+  try {
+    const detector = new window.FaceDetector({
       fastMode: true,
       maxDetectedFaces: 12
     });
-    logEvent({ type: "edge_vision_status", message: "FaceDetector enabled" });
+
+    return {
+      modelVersion: "shape-detection-face-v1",
+      async detect(source) {
+        const detected = await detector.detect(source);
+        return detected.map((face) => normalizeNativeFace(face.boundingBox));
+      }
+    };
   } catch (error) {
-    faceDetector = null;
-    logEvent({ type: "edge_vision_error", message: error.message });
+    logEvent({ type: "native_face_detector_error", message: error.message });
+    return null;
   }
 }
 
@@ -131,21 +186,29 @@ async function runAnalysisFrame() {
 }
 
 async function detectFaces() {
-  if (!faceDetector) return [];
+  if (!faceDetectorBackend) return [];
 
   try {
-    const detected = await faceDetector.detect(canvas);
-    return detected.map((face) => normalizeFace(face.boundingBox));
+    return await faceDetectorBackend.detect(canvas, performance.now());
   } catch (error) {
     logEvent({ type: "face_detection_error", message: error.message });
     return [];
   }
 }
 
-function normalizeFace(box) {
+function normalizeNativeFace(box) {
   return {
     x: clamp(box.x / PREVIEW_WIDTH, 0, 1),
     y: clamp(box.y / PREVIEW_HEIGHT, 0, 1),
+    w: clamp(box.width / PREVIEW_WIDTH, 0, 1),
+    h: clamp(box.height / PREVIEW_HEIGHT, 0, 1)
+  };
+}
+
+function normalizeMediaPipeFace(box) {
+  return {
+    x: clamp(box.originX / PREVIEW_WIDTH, 0, 1),
+    y: clamp(box.originY / PREVIEW_HEIGHT, 0, 1),
     w: clamp(box.width / PREVIEW_WIDTH, 0, 1),
     h: clamp(box.height / PREVIEW_HEIGHT, 0, 1)
   };
@@ -252,7 +315,7 @@ function buildFeatures(faces, motionScore) {
     motion_score: round(motionScore),
     attention_score: round(attentionScore),
     gaze_estimate: faceVisible ? "unknown" : "not_visible",
-    client_model_version: faceDetector ? "shape-detection-face-v1" : "motion-fallback-v1"
+    client_model_version: faceDetectorBackend?.modelVersion ?? "motion-fallback-v1"
   };
 }
 

@@ -1,0 +1,14 @@
+{
+  "name": "reaction-engine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Google Meet reaction analysis Chrome extension.",
+  "scripts": {
+    "check": "node --check extension/src/sidebar.js && node --check extension/src/service-worker.js && node --check extension/src/content-script.js && node --check scripts/ws-log-server.cjs",
+    "ws:log": "node scripts/ws-log-server.cjs"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "0.10.35"
+  }
+}

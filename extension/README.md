@@ -7,8 +7,9 @@ Google Meet 用の Chrome 拡張 MVP です。sidebar から画面キャプチ�
 - Chrome side panel / sidebar の表示
 - `getDisplayMedia` による Meet 画面キャプチャ
 - preview canvas への表示
-- `FaceDetector` が使える環境での顔 bbox 検出
-- `FaceDetector` が使えない環境での motion score fallback
+- MediaPipe Face Detector による顔 bbox 検出
+- MediaPipe が初期化できない場合の native `FaceDetector` fallback
+- 顔検出が使えない場合の motion score fallback
 - `attention_score` の暫定算出
 - 1秒ごとの `realtime_feature` 生成
 - WebSocket URL が設定されている場合の event 送信
@@ -30,7 +31,7 @@ WebSocket URL は任意です。未設定でも sidebar 上で feature event を
 ローカルで受信ログを見たい場合は、リポジトリルートで次を実行します。
 
 ```sh
-node scripts/ws-log-server.js
+node scripts/ws-log-server.cjs
 ```
 
 その後、sidebar の WebSocket URL に次を入れて `Connect` を押します。
@@ -60,7 +61,7 @@ ws://localhost:8787/realtime
     "motion_score": 0.08,
     "attention_score": 0.58,
     "gaze_estimate": "unknown",
-    "client_model_version": "shape-detection-face-v1"
+    "client_model_version": "mediapipe-blaze-face-short-range-v1"
   }
 }
 ```
@@ -68,5 +69,6 @@ ws://localhost:8787/realtime
 ## 注意
 
 - MVP では本格的な視線推定や人物同一性 tracking は未実装です。
-- `FaceDetector` は Chrome の環境や設定によって利用できない場合があります。その場合は motion score のみで動きます。
-- 本番では MediaPipe Tasks Vision や ONNX Runtime Web に置き換え、顔ランドマーク、頭部姿勢、視線推定、タイル追跡を追加します。
+- MediaPipe runtime と face detector model は拡張内に同梱しています。
+- MediaPipe が初期化できない環境では native `FaceDetector` を試し、それも使えない場合は motion score のみで動きます。
+- 次の段階では MediaPipe Face Landmarker を追加し、顔ランドマーク、頭部姿勢、視線推定、タイル追跡を強化します。
