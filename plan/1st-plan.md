@@ -1,194 +1,317 @@
-# Chrome 拡張を用いた分析系プロダクト 初期アーキテクチャ案
+# Google Meet リアクション分析プロダクト アーキテクチャ案
 
 ## 目的
 
-発信者と傍聴者が明確に分かれるオンライン会議/発表の場で、発信者に次の2種類の価値を返す。
+Google Meet 上の発表・商談・授業・社内共有などで、発信者に対して次の価値を返す。
 
-1. **リアルタイム提案**: 発表中に「反応が落ちている」「間が長い」「説明が詰まっている」などの小さなフィードバックを出す。
-2. **セッション後分析**: どの発話・どの区間で傍聴者の反応が変化したかを、タイムラインと根拠つきレポートで返す。
+1. **リアルタイム理解**: 傍聴者の顔・タイル・視線・姿勢・動き・音声反応を会議中に解析し、発信者へ小さなフィードバックを返す。
+2. **セッション後分析**: 発話内容、画面上の反応、傍聴者ごとの時系列変化を統合し、反応が落ちた区間や改善点を根拠つきで提示する。
+3. **継続改善**: ユーザー修正、確定ラベル、評価データを蓄積し、プロンプト・モデル・しきい値・個人較正を継続的に改善する。
 
-このプロダクトの核は「Chrome 拡張で会議中のシグナルを取り、リアルタイムには軽く返し、セッション後には重く分析する」こと。最初から全てを高精度にやるより、**取得できるデータ、低遅延で返すデータ、後処理で分析するデータを分離する**。
+重要なのは、Chrome 拡張で画像を扱うとしても、画像を常にサーバーへ流す設計にしないこと。最終形では、**リアルタイムな視覚処理はできるだけブラウザ内で実行し、サーバーには特徴量・イベント・必要最小限の代表フレームだけを送る**。
 
-## MVP の前提
+## リアルタイムな顔分析は可能か
 
-- 対象は Google Meet に固定する。
-- Chrome 拡張は MV3 を前提にする。
-- 画面/タブ/音声の取得はユーザー許可ベースで行う。
-- 生の映像・音声を長期保存する設計にはしない。保存する場合もセッション単位の明示同意を必須にする。
-- 最初の精度目標は「表情や反応を完全に当てる」ではなく、**反応変化の候補区間をそれらしく提示できること**。
+可能。カメラ映像や画面キャプチャから人の顔を検出して、顔の周囲を矩形で囲うような処理は、ブラウザ上でも実装できる。
+
+ただし Google Meet 連携では、カメラの生映像を直接扱うというより、以下のどちらかになる。
+
+- **画面キャプチャ方式**: Google Meet の画面またはタブをキャプチャし、映っている参加者タイルから顔・上半身・動き・視線推定を行う。
+- **DOM 補助方式**: Google Meet の DOM から参加者タイル、発話者状態、名前表示などを補助的に取得し、画面キャプチャ上の検出結果と対応づける。
+
+最終形ではこの2つを併用する。DOM は変更に弱いので主経路にはせず、視覚検出の補助情報として扱う。
 
 ## 全体アーキテクチャ
 
 ```mermaid
 flowchart TB
-  user["発信者"]
-  meeting["Google Meet<br/>meet.google.com"]
+  presenter["発信者"]
+  meet["Google Meet<br/>meet.google.com"]
 
-  subgraph ext["Chrome Extension"]
-    content["Content Script<br/>overlay / side panel UI"]
-    capture["Capture UI<br/>画面・タブ・音声取得"]
-    local["Local Signal Extractor<br/>フレーム間引き / 顔・タイル候補 / 音量 / 無音"]
-    feedbackClient["Realtime Feedback Client<br/>WebSocket / SSE"]
+  subgraph extension["Chrome Extension"]
+    content["Content Script<br/>Meet UI integration / debug overlay"]
+    sidebar["Sidebar / Side Panel<br/>realtime feedback / timeline / controls"]
+    capture["Capture Layer<br/>tab capture / display capture / audio capture"]
+    edgeVision["Edge Vision Pipeline<br/>face detection / tile tracking / gaze estimate / motion"]
+    edgeAudio["Edge Audio Pipeline<br/>volume / silence / speaking rate / turn-taking"]
+    localState["Local Session State<br/>participant map / calibration / buffers"]
+    realtimeClient["Realtime Client<br/>WebSocket uplink + downlink"]
+    uploadClient["Upload Client<br/>representative frame / clip upload"]
   end
 
-  subgraph api["Backend API"]
-    sessionApi["Session API<br/>セッション作成 / 同意 / role 管理"]
-    ingestApi["Ingest API<br/>フレーム / 音声特徴 / 文字起こし / UI イベント"]
-    realtime["Realtime Engine<br/>低遅延ルール + 軽量モデル"]
-    queue["Queue<br/>後処理ジョブ投入"]
+  subgraph realtimeBackend["Realtime Backend"]
+    gateway["Realtime Gateway<br/>WebSocket"]
+    streamProcessor["Stream Processor<br/>window aggregation / smoothing / cooldown"]
+    realtimeDecision["Realtime Decision Engine<br/>rules + lightweight model + policy"]
+    feedbackApi["Feedback Delivery<br/>speaker hints / sidebar events"]
   end
 
-  subgraph workers["Analysis Workers"]
-    transcription["Transcription / diarization"]
-    visual["Visual reaction labeling"]
-    changePoint["Change point detection"]
-    gemini["Gemini 統合分析<br/>要約 / 根拠生成 / report"]
+  subgraph coreBackend["Core Backend"]
+    sessionApi["Session API<br/>consent / roles / lifecycle"]
+    ingestApi["Ingest API<br/>events / features / transcripts / media refs"]
+    mediaApi["Media API<br/>signed upload / retention / redaction"]
+    reportApi["Report API<br/>timeline / coaching report"]
   end
 
-  subgraph store["Data Store"]
-    sessionStore[("Session metadata")]
-    signalStore[("Time-series signals")]
-    transcriptStore[("Transcript chunks")]
-    analysisStore[("Analysis events")]
-    reportStore[("Reports")]
-    versionStore[("Prompt / model / eval versions")]
+  subgraph asyncPlatform["Async Analysis Platform"]
+    queue["Event Queue / Job Queue"]
+    transcriptWorker["Transcript Worker<br/>ASR / diarization / alignment"]
+    visionWorker["Vision Worker<br/>high accuracy labeling / representative frames"]
+    changeWorker["Change Point Worker<br/>reaction delta / anomaly detection"]
+    llmWorker["LLM Analysis Worker<br/>Gemini report / evidence generation"]
+    evalWorker["Evaluation Worker<br/>golden sessions / regression checks"]
   end
 
-  user --> meeting
-  meeting --> content
+  subgraph dataPlatform["Data Platform"]
+    postgres[("Postgres<br/>sessions / participants / events / reports")]
+    timeseries[("Time-series Store<br/>signals / scores / windows")]
+    objectStorage[("Object Storage<br/>frames / short clips / artifacts")]
+    vectorStore[("Vector Store<br/>examples / report snippets / retrieval")]
+    warehouse[("Analytics Warehouse<br/>cost / latency / quality metrics")]
+  end
+
+  subgraph ops["Model Ops / Product Ops"]
+    promptRegistry["Prompt Registry"]
+    modelRegistry["Model Registry"]
+    evalDashboard["Evaluation Dashboard"]
+    costDashboard["Cost / Latency Dashboard"]
+    privacyControls["Privacy / Retention Controls"]
+  end
+
+  presenter --> meet
+  meet --> content
+  content --> sidebar
   content --> capture
-  capture --> local
-  local -->|session events / sampled frames / transcript chunks| ingestApi
+  capture --> edgeVision
+  capture --> edgeAudio
+  edgeVision --> localState
+  edgeAudio --> localState
+
+  localState -->|features / events| realtimeClient
+  realtimeClient --> gateway
+  gateway --> streamProcessor
+  streamProcessor --> realtimeDecision
+  realtimeDecision --> feedbackApi
+  feedbackApi --> gateway
+  gateway --> realtimeClient
+  realtimeClient --> sidebar
+  sidebar -->|feedback / controls| presenter
+
   content --> sessionApi
+  localState -->|feature batches / transcript chunks| ingestApi
+  uploadClient -->|selected frames / short clips| mediaApi
 
-  ingestApi --> realtime
-  realtime -->|feedback event| feedbackClient
-  feedbackClient --> content
-  content -->|overlay feedback| user
-
+  sessionApi --> postgres
+  ingestApi --> postgres
+  ingestApi --> timeseries
+  mediaApi --> objectStorage
   ingestApi --> queue
-  queue --> transcription
-  queue --> visual
-  transcription --> changePoint
-  visual --> changePoint
-  changePoint --> gemini
+  mediaApi --> queue
 
-  sessionApi --> sessionStore
-  ingestApi --> signalStore
-  transcription --> transcriptStore
-  gemini --> analysisStore
-  gemini --> reportStore
-  realtime --> versionStore
-  gemini --> versionStore
+  queue --> transcriptWorker
+  queue --> visionWorker
+  transcriptWorker --> changeWorker
+  visionWorker --> changeWorker
+  changeWorker --> llmWorker
+  llmWorker --> reportApi
+
+  reportApi --> postgres
+  llmWorker --> vectorStore
+  transcriptWorker --> timeseries
+  visionWorker --> timeseries
+  changeWorker --> timeseries
+
+  evalWorker --> evalDashboard
+  postgres --> evalWorker
+  timeseries --> evalWorker
+  objectStorage --> evalWorker
+
+  promptRegistry --> llmWorker
+  modelRegistry --> realtimeDecision
+  modelRegistry --> visionWorker
+  postgres --> warehouse
+  timeseries --> warehouse
+  warehouse --> costDashboard
+  privacyControls --> mediaApi
 ```
 
-## 2パス設計
+## Edge Vision Pipeline
+
+発信者が見たことのある「顔を四角で囲ってリアルタイムに検出する」処理は、この層で実現する。基本は Chrome 拡張内で `video -> canvas -> detector -> tracking -> features -> sidebar/debug overlay` の流れを作る。
 
 ```mermaid
 flowchart LR
-  capture["Chrome 拡張<br/>capture + local features"]
-  ingest["Backend Ingest"]
+  video["Google Meet tab/display stream"]
+  sampler["Frame Sampler<br/>例: 10-30fps input / 1-10fps analysis"]
+  detector["Face / Person Detector<br/>MediaPipe / ONNX Runtime Web / WebGPU / WASM"]
+  tracker["Tracker<br/>tile id / face id / smoothing"]
+  landmarks["Landmarks / Pose / Gaze Estimate"]
+  features["Feature Extractor<br/>face_visible / gaze / head_pose / motion / attention score"]
+  sidebar["Sidebar<br/>scores / alerts / controls"]
+  overlay["Debug Overlay<br/>bounding boxes / debug view"]
+  eventBus["Local Event Bus"]
 
-  subgraph realtimePath["リアルタイム提案パス"]
-    shortWindow["2〜5秒 window 集計"]
-    rules["ルール / 軽量モデル<br/>threshold / moving average / cooldown"]
-    feedback["Feedback Event"]
-    overlay["発信者 overlay"]
-  end
-
-  subgraph analysisPath["セッション後分析パス"]
-    queue2["Analysis Queue"]
-    transcript["文字起こし / 話者分離"]
-    features["傍聴者別の時系列特徴量"]
-    cp["変化点検出"]
-    llm["Gemini 統合分析"]
-    report["Reaction timeline / Report"]
-  end
-
-  capture --> ingest
-  ingest --> shortWindow
-  shortWindow --> rules
-  rules --> feedback
-  feedback --> overlay
-
-  ingest --> queue2
-  queue2 --> transcript
-  queue2 --> features
-  transcript --> cp
-  features --> cp
-  cp --> llm
-  llm --> report
+  video --> sampler
+  sampler --> detector
+  detector --> tracker
+  tracker --> landmarks
+  landmarks --> features
+  tracker --> overlay
+  features --> sidebar
+  features --> eventBus
 ```
 
-### 1. リアルタイム提案パス
+この処理はリアルタイムにできる。ただし負荷が高いので、常に30fpsで重いモデルを回すのではなく、以下のように分ける。
 
-目的は「発表中に邪魔にならない小さいヒント」を出すこと。精密な解釈より、低遅延・低ノイズ・安全な表現を優先する。
+- 表示用の矩形追跡: 軽量・高頻度
+- 反応スコア用の特徴抽出: 中頻度
+- 高精度ラベリング: 低頻度またはサーバー後処理
 
-- 入力
-  - 発信者音声の音量、無音時間、話速
-  - 傍聴者タイルの簡易特徴量
-  - 直近の文字起こし chunk
-- 処理
-  - 2〜5秒ごとの短い窓で集計
-  - 閾値、移動平均、cooldown を使って出しすぎを防ぐ
-  - 初期はルールベース中心でよい
-- 出力
-  - `reaction_down_candidate`
-  - `long_silence`
-  - `too_fast`
-  - `low_confidence`
+## 通信設計
 
-注意点: リアルタイム UI は断定しない。「反応が落ちています」より「反応が薄くなっている可能性があります」のような表現にする。モデルの解釈をそのまま出さず、UI 表現の policy layer を挟む。
+画像そのものを WebSocket で送ることは可能だが、最終形でも主経路にはしない。リアルタイムで必要なのは画像本体ではなく、画像から抽出した特徴量とイベントだから。
 
-### 2. セッション後分析パス
+```mermaid
+sequenceDiagram
+  participant Ext as Chrome Extension
+  participant WS as Realtime Gateway
+  participant API as Core API
+  participant Obj as Object Storage
+  participant Worker as Analysis Workers
 
-目的は「なぜ反応が変化したのか」を発話内容・画面上の反応・時間変化から説明すること。数十秒から数分の遅延は許容し、根拠と再現性を優先する。
+  Ext->>API: POST /sessions
+  API-->>Ext: session_id / upload policy / realtime token
 
-- 入力
-  - セッション全体の文字起こし
-  - 傍聴者ごとの時系列特徴量
-  - 低頻度サンプリングされた代表フレーム
-  - リアルタイム提案イベント
-- 処理
-  - 変化点検出で候補区間を抽出
-  - 候補区間の前後発話を Gemini に渡して要約・理由付け
-  - 傍聴者ごとの反応スコアを計算
-  - 低 confidence の結果は「不確実」として残す
-- 出力
-  - 反応タイムライン
-  - 発話区間ごとの reaction delta
-  - 傍聴者別スコア
-  - コーチングレポート
-  - 次回改善 suggestion
+  Ext->>WS: connect(session_id)
+  loop every 100-1000ms
+    Ext->>WS: feature_event(face_visible, gaze, motion, audio_level)
+    WS-->>Ext: feedback_event(optional)
+  end
+
+  loop selected frames
+    Ext->>API: request signed upload URL
+    API-->>Ext: signed URL
+    Ext->>Obj: upload representative frame / short clip
+    Ext->>API: media_ref + metadata
+  end
+
+  API->>Worker: enqueue analysis job
+  Worker->>API: analysis events / report
+  API-->>Ext: report ready
+```
+
+### WebSocket で送るもの
+
+- `face_visible`
+- `face_bbox`
+- `tile_bbox`
+- `gaze_estimate`
+- `head_pose`
+- `motion_score`
+- `attention_score`
+- `audio_level`
+- `silence_ms`
+- `speaking_rate`
+- `speaker_change`
+- `feedback_ack`
+
+### REST / signed upload で送るもの
+
+- 代表フレーム
+- 短いクリップ
+- transcript chunk
+- セッション終了イベント
+- レポート取得
+- ユーザー修正・確定ラベル
+
+### 原則
+
+- WebSocket は **低遅延イベント用**。
+- REST は **状態変更・確定データ・メディア参照用**。
+- Object Storage は **画像・短い動画・分析 artifact 用**。
+- DB には画像本体を入れず、`media_ref` と metadata を保存する。
+
+## リアルタイム分析パス
+
+```mermaid
+flowchart LR
+  edge["Edge Vision / Audio Features"]
+  ws["WebSocket"]
+  window["Window Aggregation<br/>1s / 3s / 10s"]
+  state["Session State<br/>baseline / participant calibration"]
+  decision["Decision Engine<br/>rules + lightweight model"]
+  policy["Feedback Policy<br/>confidence / cooldown / wording"]
+  ui["Sidebar / Side Panel"]
+
+  edge --> ws
+  ws --> window
+  window --> state
+  state --> decision
+  decision --> policy
+  policy --> ui
+```
+
+リアルタイムパスでは断定的な感情推定を避ける。出すべきなのは「退屈しています」ではなく、「一部の反応が薄くなっている可能性があります」「発話速度が上がっています」「間を置いて確認するとよさそうです」のような、発信者がすぐ行動に移せる表現。
+
+## セッション後分析パス
+
+```mermaid
+flowchart LR
+  events["Time-series Events"]
+  media["Representative Frames / Clips"]
+  transcript["Transcript"]
+  align["Timeline Alignment"]
+  change["Change Point Detection"]
+  evidence["Evidence Builder"]
+  llm["LLM Report Generation"]
+  report["Reaction Timeline / Coaching Report"]
+  feedback["User Correction"]
+  eval["Evaluation Dataset"]
+
+  events --> align
+  media --> align
+  transcript --> align
+  align --> change
+  change --> evidence
+  evidence --> llm
+  llm --> report
+  report --> feedback
+  feedback --> eval
+```
+
+セッション後分析では、リアルタイム中に捨てた情報を必要に応じて補う。代表フレーム、発話前後の transcript、反応スコアの変化点をまとめて Gemini に渡し、理由・根拠・確信度を生成する。
 
 ## Chrome 拡張の責務
 
-Chrome 拡張は「全てを分析する場所」ではなく、**取得・軽量前処理・表示**に責務を絞る。
+Chrome 拡張は最終形でも重要な分析コンポーネントになる。ただし、重い統合分析や長期保存は担当しない。
 
-- 会議ページ上に overlay または side panel を表示する
-- ユーザー許可を取り、画面/タブ/音声を取得する
-- 映像はそのまま全量送らず、まずは低頻度サンプリングする
-- 可能ならローカルで顔/タイル候補を抽出する
-- 発信者にリアルタイム提案を表示する
-- セッション終了後にレポート画面へ遷移する
-
-初期 MVP では Google Meet の DOM 構造に深く依存しすぎない方がよい。Meet の DOM は変わりやすいため、最初は画面キャプチャ上のタイル検出を基本にし、Meet 専用の参加者名・タイル位置・発話者状態の補助抽出は後から追加する。
+- Google Meet 上に sidebar / side panel を表示する
+- 顔 bbox などの矩形表示は、通常 UI ではなく debug overlay として扱う
+- ユーザー同意を取り、Meet のタブ/画面/音声を取得する
+- 画面キャプチャから参加者タイルと顔領域を検出する
+- 顔 bbox、タイル bbox、視線推定、頭部姿勢、動き量をリアルタイムに抽出する
+- 発信者音声の音量、無音、話速、話者交代を抽出する
+- 参加者ごとの baseline をローカルで保持する
+- WebSocket で軽量イベントを送る
+- 必要な代表フレーム/短いクリップだけを upload する
+- サーバーからの feedback event を UI に反映する
 
 ## バックエンドの責務
 
-バックエンドは「セッション状態を管理し、リアルタイム処理と後処理を分岐させる」場所。
+バックエンドは「セッション状態、リアルタイム判断、後処理分析、評価」を管理する。
 
-- session lifecycle の管理
-- データ同意/保存ポリシーの管理
-- 拡張からの ingest
-- リアルタイム提案の生成
-- 後処理ジョブの投入
-- 分析結果の保存と配信
-- prompt/model version、cost、latency、confidence の記録
+- session lifecycle、role、consent、retention policy の管理
+- WebSocket gateway によるリアルタイムイベント受信
+- window aggregation、baseline 補正、cooldown 制御
+- feedback policy による文言・頻度・確信度制御
+- 代表フレーム/短いクリップの保存先管理
+- 文字起こし、視覚ラベリング、変化点検出、LLM レポート生成
+- ユーザー修正の収集
+- golden sessions による評価
+- prompt/model/threshold version の管理
+- cost、latency、quality、confidence の可観測性
 
 ## データ契約
-
-Day 1 でここを固定する。これが決まれば、拡張・分析・基盤をサンプルデータで並行開発できる。
 
 ### 1. Session
 
@@ -201,29 +324,52 @@ Day 1 でここを固定する。これが決まれば、拡張・分析・基�
   "consent": {
     "capture_screen": true,
     "capture_audio": true,
-    "store_raw_media": false
+    "store_representative_frames": true,
+    "store_raw_video": false,
+    "retention_days": 30
   }
 }
 ```
 
-### 2. Capture Event
+### 2. Realtime Feature Event
 
 ```json
 {
+  "type": "realtime_feature",
   "session_id": "sess_123",
   "t_ms": 12345,
-  "source": "screen_sample",
   "audience_id": "aud_2",
-  "frame_ref": "storage://sample-frame.jpg",
+  "tile_bbox": { "x": 112, "y": 240, "w": 320, "h": 180 },
+  "face_bbox": { "x": 174, "y": 265, "w": 82, "h": 92 },
   "features": {
     "face_visible": true,
     "gaze_estimate": "screen",
-    "motion_score": 0.42
+    "head_pose": { "yaw": -8.2, "pitch": 4.1, "roll": 1.0 },
+    "motion_score": 0.42,
+    "attention_score": 0.66
+  },
+  "client_model_version": "edge-vision-v1"
+}
+```
+
+### 3. Media Reference
+
+```json
+{
+  "type": "media_ref",
+  "session_id": "sess_123",
+  "t_ms": 12345,
+  "audience_id": "aud_2",
+  "media_ref": "storage://sessions/sess_123/frames/frame_12345.webp",
+  "mime": "image/webp",
+  "purpose": "representative_frame",
+  "redaction": {
+    "applied": false
   }
 }
 ```
 
-### 3. Transcript Chunk
+### 4. Transcript Chunk
 
 ```json
 {
@@ -236,7 +382,23 @@ Day 1 でここを固定する。これが決まれば、拡張・分析・基�
 }
 ```
 
-### 4. Analysis Event
+### 5. Feedback Event
+
+```json
+{
+  "type": "feedback_event",
+  "session_id": "sess_123",
+  "t_ms": 65000,
+  "feedback_type": "reaction_down_candidate",
+  "severity": "low",
+  "message": "一部の反応が薄くなっている可能性があります",
+  "reason_codes": ["attention_score_drop", "motion_drop"],
+  "confidence": 0.64,
+  "cooldown_ms": 30000
+}
+```
+
+### 6. Analysis Event
 
 ```json
 {
@@ -256,93 +418,54 @@ Day 1 でここを固定する。これが決まれば、拡張・分析・基�
 }
 ```
 
-### 5. Feedback Event
+## 画像データの扱い
 
-```json
-{
-  "session_id": "sess_123",
-  "t_ms": 65000,
-  "feedback_type": "reaction_down_candidate",
-  "severity": "low",
-  "message": "一部の反応が薄くなっている可能性があります",
-  "cooldown_ms": 30000
-}
-```
+Chrome 拡張は画像を扱う。ただし、常時サーバーへ転送するのではなく、以下の3段階に分ける。
+
+| データ | 主な用途 | 通信 | 保存 |
+| --- | --- | --- | --- |
+| 顔 bbox / 視線 / 動き量などの特徴量 | リアルタイム判断 | WebSocket | Time-series store |
+| 代表フレーム | 後処理分析、根拠表示、評価 | REST + signed upload | Object Storage |
+| 短いクリップ | 詳細分析、デバッグ、ユーザー許可ありの再分析 | REST + signed upload | Object Storage |
+
+WebSocket で画像バイナリを送ること自体は可能。ただし、低遅延 feedback と大きな画像転送を同じ経路に混ぜると、詰まりや再送設計が難しくなる。最終形でも、画像本体は upload 経路、リアルタイム判断は特徴量経路に分ける。
+
+## 技術選定
+
+- Extension: Chrome MV3, TypeScript, React または Web Components
+- Capture: `chrome.tabCapture`, `getDisplayMedia`, Web Audio API
+- Edge Vision: MediaPipe Tasks Vision, ONNX Runtime Web, WebGPU/WASM backend
+- Realtime: WebSocket
+- Core API: FastAPI または Node.js/Fastify
+- Queue: Cloud Tasks / Pub/Sub / BullMQ / Celery
+- DB: Postgres
+- Time-series: TimescaleDB, ClickHouse, BigQuery など
+- Object Storage: GCS / S3 互換
+- Analysis Workers: Python
+- Transcription: Whisper 系 API またはクラウド ASR
+- Vision/LLM: Gemini Flash 系
+- Evaluation: golden sessions + expected feedback/analysis events
 
 ## 責務分担
 
-Role は肩書きではなく、依存関係を切るための ownership として置く。
-
 | Role | Ownership | 主な成果物 |
 | --- | --- | --- |
-| A. Extension / UX | Chrome 拡張、取得許可、overlay、リアルタイム表示 | 拡張 MVP、画面/音声取得、feedback 表示 |
-| B. Signal / AI | 特徴量、文字起こし、変化点検出、Gemini 分析 | reaction score、analysis event、report |
-| C. Platform / Evaluation | API、DB、queue、評価、cost/latency 可視化 | session API、ingest、worker 実行基盤、評価 dashboard |
+| A. Extension / Edge AI | Chrome 拡張、Google Meet 連携、画面/音声取得、Edge Vision、sidebar | 顔 bbox デバッグ表示、特徴量抽出、WebSocket 送信、feedback 表示 |
+| B. Realtime / Product Intelligence | リアルタイム集計、baseline 補正、feedback policy、低遅延判断 | feedback engine、cooldown、文言制御、反応スコア |
+| C. Analysis / LLM | 文字起こし、変化点検出、Gemini 統合分析、レポート | reaction timeline、analysis events、coaching report |
+| D. Platform / Evaluation | API、DB、queue、media storage、評価、可観測性、コスト | session platform、評価 dashboard、prompt/model registry |
 
-3人で作る場合、C を「余り」ではなく本丸に置く。分析系プロダクトは、単発の AI 出力よりも **データ契約・評価・再実行性・可観測性** が価値になる。
+3人で作る場合は B と C を統合してもよい。ただし最終形の責務としては、リアルタイム判断とセッション後分析は分けて考える。
 
-## MVP スコープ
+## 主要リスク
 
-### 作る
-
-- Chrome 拡張から会議画面をサンプリング取得する
-- 発信者音声またはタブ音声を取得し、短い transcript chunk を作る
-- session / capture / transcript / analysis / feedback の API を用意する
-- リアルタイムにはルールベースの feedback を overlay に出す
-- セッション後に reaction timeline と report を表示する
-- デモ用に「ユーザー修正 → 評価データ追加 → report 改善」の流れを見せる
-
-### まだ作らない
-
-- Google Meet 以外の会議サービス対応
-- 完全な感情推定
-- 高精度な個人識別
-- 常時録画保存
-- 複雑な権限管理
-- 本格的なモデル学習
-
-## 技術選定の初期案
-
-- Extension: Chrome MV3, TypeScript, React または素の Web Components
-- UI: overlay + side panel
-- Backend API: Node.js/Fastify または Python/FastAPI
-- Realtime: WebSocket または SSE
-- Queue: BullMQ / Cloud Tasks / Celery のいずれか
-- DB: Postgres
-- Object Storage: GCS / S3 互換
-- Analysis: Python workers
-- Transcription: Whisper 系 API またはローカル whisper 実行
-- Vision/LLM: Gemini Flash 系
-- Evaluation: golden sessions + expected analysis events
-
-ハッカソンなら、最初は API と worker を同一リポジトリの monolith として作り、queue だけ抽象化するのが現実的。分散システムとして綺麗に分けるより、セッションを1本通す方を優先する。
-
-## 開発順序
-
-1. データ契約とサンプル JSON を固定する。
-2. Backend の session / ingest / feedback / report API を mock 実装する。
-3. Chrome 拡張で overlay と capture permission flow を作る。
-4. サンプルデータから analysis event と report を生成する worker を作る。
-5. 拡張の実 capture を backend に流し、report まで1本通す。
-6. リアルタイム feedback の閾値・cooldown・文言を調整する。
-7. golden sessions を作り、prompt/model version ごとの結果差分を見える化する。
-
-## デモの見せ方
-
-1. 発信者が Chrome 拡張を起動し、会議画面の取得を許可する。
-2. 発表中に overlay が小さい feedback を出す。
-3. セッション終了後、反応タイムラインが生成される。
-4. 「この発話区間で反応が下がった可能性」と根拠を表示する。
-5. ユーザーが分析結果を修正する。
-6. 修正が評価データに入り、次回の report/prompt 評価に反映されることを dashboard で見せる。
-
-## 最大のリスク
-
-- Chrome 拡張で安定して映像/音声を取得できるか
 - Google Meet の DOM / UI 変更
-- 反応推定の過信
-- プライバシー/同意設計
-- リアルタイム提案が邪魔になること
-- 生データ保存とコストの肥大化
+- Chrome 拡張での画面/音声取得制約
+- Edge Vision の CPU/GPU 負荷
+- 顔・視線・反応推定の過信
+- プライバシー、同意、保存期間の設計
+- リアルタイム feedback が発信者の邪魔になること
+- 生メディア保存によるコスト増大
+- 個人ごとの反応差を無視した誤判定
 
-対策として、MVP では「低頻度サンプリング」「断定しない feedback」「保存しない/短期保存」「サービス1つに限定」「後処理重視」に寄せる。
+対策として、最終形でも「画像本体より特徴量中心」「代表フレームのみ保存」「断定しない feedback」「個人 baseline 補正」「モデル/プロンプト/しきい値の評価管理」を設計原則にする。
