@@ -24,6 +24,8 @@ Google Meet 用の Chrome 拡張 MVP です。sidebar から画面キャプチ�
 6. 拡張アイコンを押して side panel を開く。
 7. `Start Capture` を押し、Google Meet のタブまたは画面を選択する。
 
+拡張のコードを変更した後は、`chrome://extensions` で Reaction Engine MVP の Reload を押してから side panel を開き直します。Reload しないと古い manifest の CSP が残り、MediaPipe の WASM 初期化が失敗します。
+
 ## WebSocket
 
 WebSocket URL は任意です。未設定でも sidebar 上で feature event を確認できます。
@@ -71,4 +73,5 @@ ws://localhost:8787/realtime
 - MVP では本格的な視線推定や人物同一性 tracking は未実装です。
 - MediaPipe runtime と face detector model は拡張内に同梱しています。
 - MediaPipe が初期化できない環境では native `FaceDetector` を試し、それも使えない場合は motion score のみで動きます。
+- MediaPipe が動いている場合は `edge_vision_status` に `MediaPipe FaceDetector enabled` が出ます。
 - 次の段階では MediaPipe Face Landmarker を追加し、顔ランドマーク、頭部姿勢、視線推定、タイル追跡を強化します。
