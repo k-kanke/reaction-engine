@@ -30,6 +30,7 @@ Google Meet を対象に、Chrome の sidebar から画面キャプチャを開�
 
 4. **Edge Vision Pipeline の MVP を実装する**
    - MediaPipe Face Detector で顔 bbox を検出
+   - MediaPipe Face Landmarker で目・口・鼻の landmark 特徴量を抽出
    - MediaPipe が利用不可なら native `FaceDetector` を試す
    - どちらも利用不可なら frame differencing で motion score を算出
    - `attention_score` は face visibility + motion から暫定算出

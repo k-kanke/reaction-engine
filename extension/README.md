@@ -8,6 +8,7 @@ Google Meet 用の Chrome 拡張 MVP です。sidebar から画面キャプチ�
 - `getDisplayMedia` による Meet 画面キャプチャ
 - preview canvas への表示
 - MediaPipe Face Detector による顔 bbox 検出
+- MediaPipe Face Landmarker による顔パーツ特徴量の抽出
 - MediaPipe が初期化できない場合の native `FaceDetector` fallback
 - 顔検出が使えない場合の motion score fallback
 - `attention_score` の暫定算出
@@ -57,13 +58,21 @@ ws://localhost:8787/realtime
     "face_tracks": [
       {
         "audience_id": "aud_1",
-        "face_bbox": { "x": 0.12, "y": 0.2, "w": 0.1, "h": 0.18 }
+        "face_bbox": { "x": 0.12, "y": 0.2, "w": 0.1, "h": 0.18 },
+        "eye_openness": { "left": 0.28, "right": 0.31 },
+        "mouth_openness": 0.04,
+        "head_pose_estimate": { "yaw": -0.08, "pitch": 0.02, "roll": 0.01 },
+        "gaze_estimate": "screen",
+        "landmark_count": 478
       }
     ],
     "motion_score": 0.08,
     "attention_score": 0.58,
-    "gaze_estimate": "unknown",
-    "client_model_version": "mediapipe-blaze-face-short-range-v1"
+    "gaze_estimate": "screen",
+    "client_model_version": {
+      "face_detector": "mediapipe-blaze-face-short-range-v1",
+      "face_landmarker": "mediapipe-face-landmarker-v1"
+    }
   }
 }
 ```
@@ -74,4 +83,6 @@ ws://localhost:8787/realtime
 - MediaPipe runtime と face detector model は拡張内に同梱しています。
 - MediaPipe が初期化できない環境では native `FaceDetector` を試し、それも使えない場合は motion score のみで動きます。
 - MediaPipe が動いている場合は `edge_vision_status` に `MediaPipe FaceDetector enabled` が出ます。
-- 次の段階では MediaPipe Face Landmarker を追加し、顔ランドマーク、頭部姿勢、視線推定、タイル追跡を強化します。
+- Face Landmarker が動いている場合は `edge_vision_status` に `MediaPipe FaceLandmarker enabled` が出ます。
+- `head_pose_estimate` と `gaze_estimate` はランドマーク位置から計算した簡易推定です。精密な視線推定ではありません。
+- 次の段階ではタイル追跡、参加者名との紐づけ、音声特徴量を追加します。

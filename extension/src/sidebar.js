@@ -1,5 +1,6 @@
 import {
   FaceDetector as MediaPipeFaceDetector,
+  FaceLandmarker,
   FilesetResolver
 } from "../vendor/mediapipe/vision_bundle.mjs";
 
@@ -8,6 +9,7 @@ const EVENT_INTERVAL_MS = 1000;
 const PREVIEW_WIDTH = 640;
 const PREVIEW_HEIGHT = 360;
 const MEDIAPIPE_MODEL_PATH = "models/blaze_face_short_range.tflite";
+const MEDIAPIPE_LANDMARKER_MODEL_PATH = "models/face_landmarker.task";
 
 const elements = {
   statusBadge: document.getElementById("statusBadge"),
@@ -35,12 +37,13 @@ let previousFrame = null;
 let latestFeatures = createEmptyFeatures();
 let ws = null;
 let faceDetectorBackend = null;
+let faceLandmarkerBackend = null;
 let tracks = [];
 let nextTrackId = 1;
 
 elements.sessionId.textContent = sessionId;
 restoreSettings();
-initFaceDetector();
+initEdgeVision();
 
 elements.startButton.addEventListener("click", startCapture);
 elements.stopButton.addEventListener("click", stopCapture);
@@ -51,22 +54,26 @@ async function restoreSettings() {
   if (stored.wsUrl) elements.wsUrl.value = stored.wsUrl;
 }
 
-async function initFaceDetector() {
+async function initEdgeVision() {
   const mediaPipeDetector = await createMediaPipeFaceDetector();
   if (mediaPipeDetector) {
     faceDetectorBackend = mediaPipeDetector;
     logEvent({ type: "edge_vision_status", message: "MediaPipe FaceDetector enabled" });
-    return;
+  } else {
+    const nativeDetector = createNativeFaceDetector();
+    if (nativeDetector) {
+      faceDetectorBackend = nativeDetector;
+      logEvent({ type: "edge_vision_status", message: "Native FaceDetector enabled" });
+    } else {
+      logEvent({ type: "edge_vision_status", message: "Face detector unavailable; using motion-only fallback" });
+    }
   }
 
-  const nativeDetector = createNativeFaceDetector();
-  if (nativeDetector) {
-    faceDetectorBackend = nativeDetector;
-    logEvent({ type: "edge_vision_status", message: "Native FaceDetector enabled" });
-    return;
+  const mediaPipeLandmarker = await createMediaPipeFaceLandmarker();
+  if (mediaPipeLandmarker) {
+    faceLandmarkerBackend = mediaPipeLandmarker;
+    logEvent({ type: "edge_vision_status", message: "MediaPipe FaceLandmarker enabled" });
   }
-
-  logEvent({ type: "edge_vision_status", message: "Face detector unavailable; using motion-only fallback" });
 }
 
 async function createMediaPipeFaceDetector() {
@@ -92,6 +99,37 @@ async function createMediaPipeFaceDetector() {
     };
   } catch (error) {
     logEvent({ type: "mediapipe_init_error", message: error.message });
+    return null;
+  }
+}
+
+async function createMediaPipeFaceLandmarker() {
+  try {
+    const vision = await FilesetResolver.forVisionTasks(
+      chrome.runtime.getURL("vendor/mediapipe/wasm")
+    );
+    const landmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: chrome.runtime.getURL(MEDIAPIPE_LANDMARKER_MODEL_PATH),
+        delegate: "CPU"
+      },
+      runningMode: "VIDEO",
+      numFaces: 4,
+      outputFaceBlendshapes: false,
+      minFaceDetectionConfidence: 0.45,
+      minFacePresenceConfidence: 0.45,
+      minTrackingConfidence: 0.45
+    });
+
+    return {
+      modelVersion: "mediapipe-face-landmarker-v1",
+      detect(source, timestampMs) {
+        const result = landmarker.detectForVideo(source, timestampMs);
+        return result.faceLandmarks.map((landmarks) => buildFacePartsFromLandmarks(landmarks));
+      }
+    };
+  } catch (error) {
+    logEvent({ type: "mediapipe_landmarker_init_error", message: error.message });
     return null;
   }
 }
@@ -178,7 +216,7 @@ async function runAnalysisFrame() {
   const motionScore = calculateMotionScore(imageData);
   previousFrame = imageData;
 
-  const faces = await detectFaces();
+  const faces = await analyzeFaces();
   const trackedFaces = updateTracks(faces);
   latestFeatures = buildFeatures(trackedFaces, motionScore);
   drawDebugFrame(trackedFaces, latestFeatures);
@@ -194,6 +232,46 @@ async function detectFaces() {
     logEvent({ type: "face_detection_error", message: error.message });
     return [];
   }
+}
+
+async function detectFaceParts() {
+  if (!faceLandmarkerBackend) return [];
+
+  try {
+    return faceLandmarkerBackend.detect(canvas, performance.now());
+  } catch (error) {
+    logEvent({ type: "face_landmarker_error", message: error.message });
+    return [];
+  }
+}
+
+async function analyzeFaces() {
+  const [faces, faceParts] = await Promise.all([
+    detectFaces(),
+    detectFaceParts()
+  ]);
+
+  if (!faceParts.length) return faces;
+  if (!faces.length) return faceParts.map((parts) => ({ ...parts.face_bbox, parts }));
+
+  const unmatchedPartIndexes = new Set(faceParts.map((_, index) => index));
+  const enrichedFaces = faces.map((face) => {
+    const matchIndex = findClosestFacePartIndex(face, faceParts, unmatchedPartIndexes);
+    if (matchIndex === null) return face;
+
+    unmatchedPartIndexes.delete(matchIndex);
+    return {
+      ...face,
+      parts: faceParts[matchIndex]
+    };
+  });
+
+  for (const index of unmatchedPartIndexes) {
+    const parts = faceParts[index];
+    enrichedFaces.push({ ...parts.face_bbox, parts });
+  }
+
+  return enrichedFaces;
 }
 
 function normalizeNativeFace(box) {
@@ -212,6 +290,171 @@ function normalizeMediaPipeFace(box) {
     w: clamp(box.width / PREVIEW_WIDTH, 0, 1),
     h: clamp(box.height / PREVIEW_HEIGHT, 0, 1)
   };
+}
+
+function findClosestFacePartIndex(face, faceParts, candidateIndexes) {
+  let bestIndex = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (const index of candidateIndexes) {
+    const distance = bboxCenterDistance(face, faceParts[index].face_bbox);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+
+  return bestDistance < 0.22 ? bestIndex : null;
+}
+
+function buildFacePartsFromLandmarks(landmarks) {
+  const face_bbox = bboxFromLandmarks(landmarks);
+  const leftEye = summarizeLandmarkGroup(landmarks, [33, 133, 159, 145]);
+  const rightEye = summarizeLandmarkGroup(landmarks, [362, 263, 386, 374]);
+  const mouth = summarizeLandmarkGroup(landmarks, [61, 291, 13, 14]);
+  const nose = summarizeLandmarkGroup(landmarks, [1, 4, 98, 327]);
+  const headPose = estimateHeadPose(landmarks);
+
+  return {
+    face_bbox,
+    face_parts: {
+      left_eye: leftEye,
+      right_eye: rightEye,
+      mouth,
+      nose
+    },
+    eye_openness: {
+      left: round(eyeOpenness(leftEye)),
+      right: round(eyeOpenness(rightEye))
+    },
+    mouth_openness: round(mouthOpenness(mouth, face_bbox)),
+    head_pose_estimate: headPose,
+    gaze_estimate: estimateGazeFromHeadPose(headPose),
+    landmark_count: landmarks.length
+  };
+}
+
+function bboxFromLandmarks(landmarks) {
+  let minX = 1;
+  let minY = 1;
+  let maxX = 0;
+  let maxY = 0;
+
+  for (const point of landmarks) {
+    minX = Math.min(minX, point.x);
+    minY = Math.min(minY, point.y);
+    maxX = Math.max(maxX, point.x);
+    maxY = Math.max(maxY, point.y);
+  }
+
+  return {
+    x: clamp(minX, 0, 1),
+    y: clamp(minY, 0, 1),
+    w: clamp(maxX - minX, 0, 1),
+    h: clamp(maxY - minY, 0, 1)
+  };
+}
+
+function summarizeLandmarkGroup(landmarks, indexes) {
+  const points = indexes
+    .map((index) => landmarks[index])
+    .filter(Boolean)
+    .map((point) => ({
+      x: round(point.x),
+      y: round(point.y),
+      z: round(point.z ?? 0)
+    }));
+
+  if (!points.length) {
+    return {
+      center: { x: 0, y: 0, z: 0 },
+      points: []
+    };
+  }
+
+  const center = points.reduce(
+    (acc, point) => ({
+      x: acc.x + point.x / points.length,
+      y: acc.y + point.y / points.length,
+      z: acc.z + point.z / points.length
+    }),
+    { x: 0, y: 0, z: 0 }
+  );
+
+  return {
+    center: {
+      x: round(center.x),
+      y: round(center.y),
+      z: round(center.z)
+    },
+    points
+  };
+}
+
+function eyeOpenness(eye) {
+  if (eye.points.length < 4) return 0;
+
+  const horizontal = pointDistance(eye.points[0], eye.points[1]);
+  const vertical = pointDistance(eye.points[2], eye.points[3]);
+  return horizontal ? clamp(vertical / horizontal, 0, 1) : 0;
+}
+
+function mouthOpenness(mouth, faceBox) {
+  if (mouth.points.length < 4 || !faceBox.h) return 0;
+
+  const vertical = pointDistance(mouth.points[2], mouth.points[3]);
+  return clamp(vertical / faceBox.h, 0, 1);
+}
+
+function estimateHeadPose(landmarks) {
+  const leftEye = averagePoint(landmarks, [33, 133]);
+  const rightEye = averagePoint(landmarks, [362, 263]);
+  const nose = landmarks[1];
+  const mouthCenter = averagePoint(landmarks, [13, 14]);
+  const eyeCenter = averagePoint(landmarks, [33, 133, 362, 263]);
+  const faceBox = bboxFromLandmarks(landmarks);
+
+  if (!leftEye || !rightEye || !nose || !mouthCenter || !eyeCenter || !faceBox.w || !faceBox.h) {
+    return null;
+  }
+
+  const yaw = clamp((nose.x - eyeCenter.x) / faceBox.w, -1, 1);
+  const pitch = clamp((nose.y - eyeCenter.y) / faceBox.h - 0.28, -1, 1);
+  const roll = clamp((rightEye.y - leftEye.y) / Math.max(0.001, rightEye.x - leftEye.x), -1, 1);
+
+  return {
+    yaw: round(yaw),
+    pitch: round(pitch),
+    roll: round(roll)
+  };
+}
+
+function estimateGazeFromHeadPose(headPose) {
+  if (!headPose) return "unknown";
+  if (Math.abs(headPose.yaw) < 0.18 && Math.abs(headPose.pitch) < 0.18) return "screen";
+  if (headPose.yaw <= -0.18) return "left";
+  if (headPose.yaw >= 0.18) return "right";
+  if (headPose.pitch <= -0.18) return "up";
+  if (headPose.pitch >= 0.18) return "down";
+  return "unknown";
+}
+
+function averagePoint(landmarks, indexes) {
+  const points = indexes.map((index) => landmarks[index]).filter(Boolean);
+  if (!points.length) return null;
+
+  return points.reduce(
+    (acc, point) => ({
+      x: acc.x + point.x / points.length,
+      y: acc.y + point.y / points.length,
+      z: acc.z + (point.z ?? 0) / points.length
+    }),
+    { x: 0, y: 0, z: 0 }
+  );
+}
+
+function pointDistance(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
 function updateTracks(faces) {
@@ -299,6 +542,7 @@ function calculateMotionScore(imageData) {
 function buildFeatures(faces, motionScore) {
   const faceVisible = faces.length > 0;
   const attentionScore = clamp((faceVisible ? 0.55 : 0.2) + motionScore * 0.35, 0, 1);
+  const firstGaze = faces.find((face) => face.parts?.gaze_estimate)?.parts.gaze_estimate;
 
   return {
     face_visible: faceVisible,
@@ -310,12 +554,21 @@ function buildFeatures(faces, motionScore) {
         y: round(face.y),
         w: round(face.w),
         h: round(face.h)
-      }
+      },
+      face_parts: face.parts?.face_parts ?? null,
+      eye_openness: face.parts?.eye_openness ?? null,
+      mouth_openness: face.parts?.mouth_openness ?? null,
+      head_pose_estimate: face.parts?.head_pose_estimate ?? null,
+      gaze_estimate: face.parts?.gaze_estimate ?? "unknown",
+      landmark_count: face.parts?.landmark_count ?? 0
     })),
     motion_score: round(motionScore),
     attention_score: round(attentionScore),
-    gaze_estimate: faceVisible ? "unknown" : "not_visible",
-    client_model_version: faceDetectorBackend?.modelVersion ?? "motion-fallback-v1"
+    gaze_estimate: faceVisible ? firstGaze ?? "unknown" : "not_visible",
+    client_model_version: {
+      face_detector: faceDetectorBackend?.modelVersion ?? "motion-fallback-v1",
+      face_landmarker: faceLandmarkerBackend?.modelVersion ?? null
+    }
   };
 }
 
@@ -332,6 +585,7 @@ function drawDebugFrame(faces, features) {
     ctx.fillStyle = "#34a853";
     ctx.font = "12px system-ui, sans-serif";
     ctx.fillText(face.audience_id, face.x * PREVIEW_WIDTH, Math.max(14, face.y * PREVIEW_HEIGHT - 6));
+    drawFacePartPoints(face.parts?.face_parts);
   }
 
   ctx.fillStyle = "rgba(16, 24, 40, 0.72)";
@@ -340,6 +594,19 @@ function drawDebugFrame(faces, features) {
   ctx.font = "13px system-ui, sans-serif";
   ctx.fillText(`faces: ${features.face_count}`, 20, 32);
   ctx.fillText(`motion: ${features.motion_score} attention: ${features.attention_score}`, 20, 54);
+}
+
+function drawFacePartPoints(faceParts) {
+  if (!faceParts) return;
+
+  ctx.fillStyle = "#fbbc04";
+  for (const part of Object.values(faceParts)) {
+    for (const point of part.points) {
+      ctx.beginPath();
+      ctx.arc(point.x * PREVIEW_WIDTH, point.y * PREVIEW_HEIGHT, 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
 }
 
 function drawEmptyPreview() {
@@ -436,7 +703,10 @@ function createEmptyFeatures() {
     motion_score: 0,
     attention_score: 0,
     gaze_estimate: "not_visible",
-    client_model_version: "uninitialized"
+    client_model_version: {
+      face_detector: "uninitialized",
+      face_landmarker: null
+    }
   };
 }
 
