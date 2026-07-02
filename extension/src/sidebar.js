@@ -10,6 +10,9 @@ const PREVIEW_WIDTH = 640;
 const PREVIEW_HEIGHT = 360;
 const MEDIAPIPE_MODEL_PATH = "models/blaze_face_short_range.tflite";
 const MEDIAPIPE_LANDMARKER_MODEL_PATH = "models/face_landmarker.task";
+const GESTURE_HISTORY_MS = 3500;
+const NOD_MIN_PITCH_DELTA = 0.08;
+const NOD_MIN_PHASE_MS = 120;
 
 const elements = {
   statusBadge: document.getElementById("statusBadge"),
@@ -39,6 +42,7 @@ let ws = null;
 let faceDetectorBackend = null;
 let faceLandmarkerBackend = null;
 let tracks = [];
+let trackHistory = new Map();
 let nextTrackId = 1;
 
 elements.sessionId.textContent = sessionId;
@@ -200,6 +204,8 @@ function stopCapture() {
   elements.startButton.disabled = false;
   elements.stopButton.disabled = true;
   previousFrame = null;
+  tracks = [];
+  trackHistory = new Map();
   latestFeatures = createEmptyFeatures();
   updateMetrics(latestFeatures);
   drawEmptyPreview();
@@ -218,6 +224,7 @@ async function runAnalysisFrame() {
 
   const faces = await analyzeFaces();
   const trackedFaces = updateTracks(faces);
+  updateGestureHistory(trackedFaces);
   latestFeatures = buildFeatures(trackedFaces, motionScore);
   drawDebugFrame(trackedFaces, latestFeatures);
   updateMetrics(latestFeatures);
@@ -477,6 +484,7 @@ function updateTracks(faces) {
   }
 
   tracks = tracks.filter((track) => now - track.last_seen_ms < 5000);
+  pruneTrackHistory(now);
   return trackedFaces;
 }
 
@@ -539,10 +547,116 @@ function calculateMotionScore(imageData) {
   return clamp(diff / samples / 255 / 3, 0, 1);
 }
 
+function updateGestureHistory(faces) {
+  const now = Date.now();
+
+  for (const face of faces) {
+    const pitch = face.parts?.head_pose_estimate?.pitch;
+    if (typeof pitch !== "number") continue;
+
+    const history = trackHistory.get(face.audience_id) ?? [];
+    history.push({ t_ms: now, pitch });
+    trackHistory.set(
+      face.audience_id,
+      history.filter((sample) => now - sample.t_ms <= GESTURE_HISTORY_MS)
+    );
+  }
+}
+
+function pruneTrackHistory(now) {
+  const activeAudienceIds = new Set(tracks.map((track) => `aud_${track.id}`));
+
+  for (const [audienceId, history] of trackHistory.entries()) {
+    if (!activeAudienceIds.has(audienceId)) {
+      trackHistory.delete(audienceId);
+      continue;
+    }
+
+    const nextHistory = history.filter((sample) => now - sample.t_ms <= GESTURE_HISTORY_MS);
+    if (nextHistory.length) {
+      trackHistory.set(audienceId, nextHistory);
+    } else {
+      trackHistory.delete(audienceId);
+    }
+  }
+}
+
+function detectNodGesture(audienceId) {
+  const history = trackHistory.get(audienceId) ?? [];
+  if (history.length < 5) {
+    return {
+      nod_count: 0,
+      nod_score: 0
+    };
+  }
+
+  const smoothed = smoothPitchHistory(history);
+  const directionChanges = [];
+  let previousDirection = 0;
+
+  for (let i = 1; i < smoothed.length; i += 1) {
+    const delta = smoothed[i].pitch - smoothed[i - 1].pitch;
+    const direction = Math.abs(delta) < 0.015 ? 0 : Math.sign(delta);
+
+    if (!direction) continue;
+    if (previousDirection && direction !== previousDirection) {
+      directionChanges.push(i);
+    }
+
+    previousDirection = direction;
+  }
+
+  let nodCount = 0;
+  let maxAmplitude = 0;
+
+  for (let i = 1; i < directionChanges.length; i += 1) {
+    const start = smoothed[directionChanges[i - 1]];
+    const end = smoothed[directionChanges[i]];
+    const duration = end.t_ms - start.t_ms;
+    const amplitude = pitchRange(smoothed, directionChanges[i - 1], directionChanges[i]);
+
+    if (duration >= NOD_MIN_PHASE_MS && amplitude >= NOD_MIN_PITCH_DELTA) {
+      nodCount += 1;
+      maxAmplitude = Math.max(maxAmplitude, amplitude);
+      i += 1;
+    }
+  }
+
+  return {
+    nod_count: nodCount,
+    nod_score: round(clamp(maxAmplitude / 0.22, 0, 1))
+  };
+}
+
+function smoothPitchHistory(history) {
+  return history.map((sample, index) => {
+    const start = Math.max(0, index - 1);
+    const end = Math.min(history.length, index + 2);
+    const window = history.slice(start, end);
+    const pitch = window.reduce((sum, item) => sum + item.pitch, 0) / window.length;
+    return {
+      t_ms: sample.t_ms,
+      pitch
+    };
+  });
+}
+
+function pitchRange(samples, startIndex, endIndex) {
+  const window = samples.slice(startIndex, endIndex + 1);
+  const pitches = window.map((sample) => sample.pitch);
+  return Math.max(...pitches) - Math.min(...pitches);
+}
+
 function buildFeatures(faces, motionScore) {
   const faceVisible = faces.length > 0;
   const attentionScore = clamp((faceVisible ? 0.55 : 0.2) + motionScore * 0.35, 0, 1);
   const firstGaze = faces.find((face) => face.parts?.gaze_estimate)?.parts.gaze_estimate;
+  const faceGestures = faces.map((face) => ({
+    audience_id: face.audience_id,
+    gestures: detectNodGesture(face.audience_id)
+  }));
+  const totalNodCount = faceGestures.reduce((sum, item) => sum + item.gestures.nod_count, 0);
+  const maxNodScore = faceGestures.reduce((max, item) => Math.max(max, item.gestures.nod_score), 0);
 
   return {
     face_visible: faceVisible,
@@ -560,11 +674,19 @@ function buildFeatures(faces, motionScore) {
       mouth_openness: face.parts?.mouth_openness ?? null,
       head_pose_estimate: face.parts?.head_pose_estimate ?? null,
       gaze_estimate: face.parts?.gaze_estimate ?? "unknown",
-      landmark_count: face.parts?.landmark_count ?? 0
+      landmark_count: face.parts?.landmark_count ?? 0,
+      gestures: faceGestures.find((item) => item.audience_id === face.audience_id)?.gestures ?? {
+        nod_count: 0,
+        nod_score: 0
+      }
     })),
     motion_score: round(motionScore),
     attention_score: round(attentionScore),
     gaze_estimate: faceVisible ? firstGaze ?? "unknown" : "not_visible",
+    gestures: {
+      nod_count: totalNodCount,
+      nod_score: round(maxNodScore)
+    },
     client_model_version: {
       face_detector: faceDetectorBackend?.modelVersion ?? "motion-fallback-v1",
       face_landmarker: faceLandmarkerBackend?.modelVersion ?? null
@@ -703,6 +825,10 @@ function createEmptyFeatures() {
     motion_score: 0,
     attention_score: 0,
     gaze_estimate: "not_visible",
+    gestures: {
+      nod_count: 0,
+      nod_score: 0
+    },
     client_model_version: {
       face_detector: "uninitialized",
       face_landmarker: null

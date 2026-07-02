@@ -63,12 +63,20 @@ ws://localhost:8787/realtime
         "mouth_openness": 0.04,
         "head_pose_estimate": { "yaw": -0.08, "pitch": 0.02, "roll": 0.01 },
         "gaze_estimate": "screen",
-        "landmark_count": 478
+        "landmark_count": 478,
+        "gestures": {
+          "nod_count": 1,
+          "nod_score": 0.68
+        }
       }
     ],
     "motion_score": 0.08,
     "attention_score": 0.58,
     "gaze_estimate": "screen",
+    "gestures": {
+      "nod_count": 1,
+      "nod_score": 0.68
+    },
     "client_model_version": {
       "face_detector": "mediapipe-blaze-face-short-range-v1",
       "face_landmarker": "mediapipe-face-landmarker-v1"
@@ -85,4 +93,5 @@ ws://localhost:8787/realtime
 - MediaPipe が動いている場合は `edge_vision_status` に `MediaPipe FaceDetector enabled` が出ます。
 - Face Landmarker が動いている場合は `edge_vision_status` に `MediaPipe FaceLandmarker enabled` が出ます。
 - `head_pose_estimate` と `gaze_estimate` はランドマーク位置から計算した簡易推定です。精密な視線推定ではありません。
+- `gestures.nod_count` と `gestures.nod_score` は直近約3.5秒の `head_pose_estimate.pitch` 変化から計算した簡易推定です。
 - 次の段階ではタイル追跡、参加者名との紐づけ、音声特徴量を追加します。
