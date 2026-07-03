@@ -360,29 +360,134 @@ async function runAnalysisFrame() {
   }
 }
 
+function detectGridTiles(imageData, width, height) {
+  const data = imageData.data;
+  const DARK_THRESHOLD = 35;
+  const GAP_MIN_PX = 3;
+  const TILE_MIN_PX = 60;
+
+  // Scan each row: compute average brightness
+  function rowBrightness(y) {
+    let sum = 0;
+    const step = 4;
+    for (let x = 0; x < width; x += step) {
+      const i = (y * width + x) * 4;
+      sum += (data[i] + data[i + 1] + data[i + 2]) / 3;
+    }
+    return sum / (width / step);
+  }
+
+  // Scan each column: compute average brightness
+  function colBrightness(x) {
+    let sum = 0;
+    const step = 4;
+    for (let y = 0; y < height; y += step) {
+      const i = (y * width + x) * 4;
+      sum += (data[i] + data[i + 1] + data[i + 2]) / 3;
+    }
+    return sum / (height / step);
+  }
+
+  // Find dark bands (gaps between tiles)
+  function findGaps(brightnessFn, length) {
+    const gaps = [];
+    let inGap = false;
+    let gapStart = 0;
+
+    for (let i = 0; i < length; i++) {
+      const dark = brightnessFn(i) < DARK_THRESHOLD;
+      if (dark && !inGap) {
+        gapStart = i;
+        inGap = true;
+      } else if (!dark && inGap) {
+        if (i - gapStart >= GAP_MIN_PX) {
+          gaps.push({ start: gapStart, end: i });
+        }
+        inGap = false;
+      }
+    }
+    if (inGap && length - gapStart >= GAP_MIN_PX) {
+      gaps.push({ start: gapStart, end: length });
+    }
+    return gaps;
+  }
+
+  const hGaps = findGaps(rowBrightness, height);
+  const vGaps = findGaps(colBrightness, width);
+
+  // Convert gaps to tile edges
+  function gapsToEdges(gaps, length) {
+    const edges = [0];
+    for (const gap of gaps) {
+      const mid = Math.round((gap.start + gap.end) / 2);
+      if (mid > TILE_MIN_PX && mid < length - TILE_MIN_PX) {
+        edges.push(mid);
+      }
+    }
+    edges.push(length);
+    return edges;
+  }
+
+  const yEdges = gapsToEdges(hGaps, height);
+  const xEdges = gapsToEdges(vGaps, width);
+
+  // Need at least a 2-tile grid to be useful
+  if (xEdges.length < 3 && yEdges.length < 3) return [];
+
+  const tiles = [];
+  for (let row = 0; row < yEdges.length - 1; row++) {
+    for (let col = 0; col < xEdges.length - 1; col++) {
+      const x = xEdges[col];
+      const y = yEdges[row];
+      const w = xEdges[col + 1] - x;
+      const h = yEdges[row + 1] - y;
+
+      if (w < TILE_MIN_PX || h < TILE_MIN_PX) continue;
+
+      tiles.push({
+        tile_id: `grid_${tiles.length + 1}`,
+        participant_name: null,
+        tile_bbox_viewport: { x, y, w, h },
+        source: "grid_detect"
+      });
+    }
+  }
+
+  return tiles;
+}
+
 async function analyzeWithTileCrop() {
-  const tiles = latestTileSnapshot?.tiles;
+  let tiles = latestTileSnapshot?.tiles;
+
+  // For recorded video files (no live tile data), auto-detect grid
   if (!tiles?.length) {
-    // No tile info — run detection on the full frame
+    const imageData = ctx.getImageData(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    tiles = detectGridTiles(imageData, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+  }
+
+  if (!tiles?.length) {
+    // No tiles detected — run detection on the full frame
     const bitmap = await createImageBitmap(canvas);
     const faces = await analyzeFaces(bitmap);
     bitmap.close();
     return faces;
   }
 
-  // Scale tile viewport coords to canvas coords
+  // Scale tile coords to canvas coords
+  // Live tiles use viewport coords (need scaling), detected tiles use canvas coords directly
   const video = elements.sourceVideo;
-  const scaleX = PREVIEW_WIDTH / video.videoWidth;
-  const scaleY = PREVIEW_HEIGHT / video.videoHeight;
+  const isLiveTile = latestTileSnapshot?.tiles?.length > 0;
+  const scaleX = isLiveTile ? PREVIEW_WIDTH / video.videoWidth : 1;
+  const scaleY = isLiveTile ? PREVIEW_HEIGHT / video.videoHeight : 1;
 
   const allFaces = [];
 
   for (const tile of tiles) {
     const tb = tile.tile_bbox_viewport;
-    const cx = Math.round(tb.x * scaleX);
-    const cy = Math.round(tb.y * scaleY);
-    const cw = Math.round(tb.w * scaleX);
-    const ch = Math.round(tb.h * scaleY);
+    const cx = Math.max(0, Math.round(tb.x * scaleX));
+    const cy = Math.max(0, Math.round(tb.y * scaleY));
+    const cw = Math.min(Math.round(tb.w * scaleX), PREVIEW_WIDTH - cx);
+    const ch = Math.min(Math.round(tb.h * scaleY), PREVIEW_HEIGHT - cy);
 
     if (cw < 30 || ch < 30) continue;
 
