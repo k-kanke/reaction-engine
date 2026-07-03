@@ -26,6 +26,7 @@ const elements = {
   sourceVideo: document.getElementById("sourceVideo"),
   startButton: document.getElementById("startButton"),
   stopButton: document.getElementById("stopButton"),
+  micPermButton: document.getElementById("micPermButton"),
   eventLog: document.getElementById("eventLog"),
   videoFile: document.getElementById("videoFile"),
   uploadPlayButton: document.getElementById("uploadPlayButton"),
@@ -51,12 +52,43 @@ let trackHistory = new Map();
 let nextTrackId = 1;
 let latestTileSnapshot = null;
 
+// --- 音声VAD (§4-1): ローカルのみ。相手=タブ音声, 自分=マイク(AEC) ---
+const VAD_INTERVAL_MS = 100; // VADサンプリング間隔
+const VAD_RMS_THRESHOLD = 0.02; // 発話判定のRMS閾値（仮値・後で実データ調整）
+const SPEECH_WINDOW_MS = 5000; // speech_ratio を出す移動窓
+// --- 代表フレーム取得 (§2.2 LLM定期パス用): 最初5分・30秒ごと ---
+const FRAME_CAPTURE_INTERVAL_MS = 30000; // 30秒ごと
+const FRAME_CAPTURE_DURATION_MS = 5 * 60 * 1000; // 最初の5分だけ
+const FRAME_CAPTURE_WIDTH = 480; // 縮小送信（プライバシー/帯域配慮）
+let frameTimer = null;
+let frameCanvas = null;
+let captureStartTs = 0;
+let audioContext = null;
+let micStream = null;
+let micRequestError = null;
+let vadTimer = null;
+const vad = {
+  self: createVadState(),
+  other: createVadState()
+};
+
+function createVadState() {
+  return {
+    analyser: null,
+    buf: null,
+    speaking: false,
+    lastSpeechTs: 0,
+    history: [] // {t, speaking} 直近 SPEECH_WINDOW_MS 分
+  };
+}
+
 elements.sessionId.textContent = sessionId;
 restoreSettings();
 initEdgeVision();
 
 elements.startButton.addEventListener("click", startCapture);
 elements.stopButton.addEventListener("click", stopCapture);
+elements.micPermButton.addEventListener("click", openMicPermission);
 elements.connectButton.addEventListener("click", toggleWebSocket);
 elements.videoFile.addEventListener("change", handleVideoFileSelect);
 elements.uploadPlayButton.addEventListener("click", startVideoFileAnalysis);
@@ -185,9 +217,28 @@ function createNativeFaceDetector() {
   }
 }
 
+function openMicPermission() {
+  // side panel からは getUserMedia の許可プロンプトが出せないため、
+  // 通常タブで一度だけ許可を取得する（許可は拡張オリジンに保存され再利用される）。
+  chrome.tabs.create({ url: chrome.runtime.getURL("src/permission.html") });
+}
+
 async function startCapture() {
   try {
     setStatus("Requesting capture");
+    // マイク要求を画面共有と "同じクリック操作の中" で同時に開始する。
+    // 後追いで呼ぶと side panel では許可プロンプトが dismiss されやすいため、
+    // クリック直下(awaitより前)で getUserMedia を発火させて安定化する。
+    // 失敗しても画面共有は続行できるよう catch でエラーだけ retain。
+    micRequestError = null;
+    micStream = null;
+    const micPromise = navigator.mediaDevices
+      .getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+      .catch((error) => {
+        micRequestError = error;
+        return null;
+      });
+
     stream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         frameRate: { ideal: 15, max: 30 },
@@ -197,6 +248,8 @@ async function startCapture() {
       audio: true
     });
 
+    micStream = await micPromise;
+
     elements.sourceVideo.srcObject = stream;
     await elements.sourceVideo.play();
 
@@ -205,8 +258,14 @@ async function startCapture() {
     elements.stopButton.disabled = false;
     previousFrame = null;
 
+    setupAudioAnalysis(stream);
+
     analysisTimer = window.setInterval(runAnalysisFrame, ANALYSIS_INTERVAL_MS);
     eventTimer = window.setInterval(sendFeatureEvent, EVENT_INTERVAL_MS);
+    vadTimer = window.setInterval(sampleVad, VAD_INTERVAL_MS);
+    captureStartTs = Date.now();
+    captureFrame(); // 開始直後に1枚
+    frameTimer = window.setInterval(captureFrame, FRAME_CAPTURE_INTERVAL_MS);
     setStatus("Capturing", "active");
   } catch (error) {
     setStatus("Capture failed", "error");
@@ -217,8 +276,13 @@ async function startCapture() {
 function stopCapture() {
   if (analysisTimer) window.clearInterval(analysisTimer);
   if (eventTimer) window.clearInterval(eventTimer);
+  if (vadTimer) window.clearInterval(vadTimer);
+  if (frameTimer) window.clearInterval(frameTimer);
   analysisTimer = null;
   eventTimer = null;
+  vadTimer = null;
+  frameTimer = null;
+  teardownAudioAnalysis();
 
   if (stream) {
     for (const track of stream.getTracks()) track.stop();
@@ -1169,6 +1233,143 @@ function pitchRange(samples, startIndex, endIndex) {
   return Math.max(...pitches) - Math.min(...pitches);
 }
 
+async function setupAudioAnalysis(displayStream) {
+  const startTs = Date.now();
+  vad.self.lastSpeechTs = startTs;
+  vad.other.lastSpeechTs = startTs;
+
+  try {
+    audioContext = new AudioContext();
+    if (audioContext.state === "suspended") await audioContext.resume();
+    sendDiagnostic("audio_status", `AudioContext state=${audioContext.state}`);
+  } catch (error) {
+    sendDiagnostic("audio_init_error", `AudioContext failed: ${error.name} ${error.message}`);
+    return;
+  }
+
+  // 相手 = タブ音声（getDisplayMedia の audio トラックを流用。スピーカー前のデジタル音声）
+  const audioTracks = displayStream.getAudioTracks();
+  if (audioTracks[0]) {
+    try {
+      const src = audioContext.createMediaStreamSource(new MediaStream([audioTracks[0]]));
+      vad.other.analyser = makeAnalyser(src);
+      sendDiagnostic("audio_status", "other(tab) VAD enabled");
+    } catch (error) {
+      sendDiagnostic("audio_init_error", `other(tab) failed: ${error.name} ${error.message}`);
+    }
+  } else {
+    sendDiagnostic("audio_status", "other(tab) no audio track — 「タブの音声を共有」未チェックの可能性");
+  }
+
+  // 自分 = マイク。startCapture がクリック直下で取得済み。ここでは接続のみ。
+  try {
+    const perm = await navigator.permissions.query({ name: "microphone" });
+    sendDiagnostic("audio_status", `mic permission: ${perm.state}`);
+  } catch {
+    // permissions API 非対応環境は無視
+  }
+
+  if (micStream) {
+    try {
+      const micSrc = audioContext.createMediaStreamSource(micStream);
+      vad.self.analyser = makeAnalyser(micSrc);
+      sendDiagnostic("audio_status", "self(mic) VAD enabled");
+    } catch (error) {
+      sendDiagnostic("audio_init_error", `self(mic) connect failed: ${error.name} ${error.message}`);
+    }
+  } else {
+    const reason = micRequestError
+      ? `${micRequestError.name} ${micRequestError.message}`
+      : "no mic stream";
+    sendDiagnostic("audio_init_error", `self(mic) failed: ${reason}（chrome://settings/content/microphone を確認）`);
+  }
+}
+
+function makeAnalyser(sourceNode) {
+  const analyser = audioContext.createAnalyser();
+  analyser.fftSize = 512;
+  sourceNode.connect(analyser);
+  return analyser;
+}
+
+function teardownAudioAnalysis() {
+  if (micStream) {
+    for (const t of micStream.getTracks()) t.stop();
+  }
+  micStream = null;
+  if (audioContext) audioContext.close().catch(() => {});
+  audioContext = null;
+  vad.self = createVadState();
+  vad.other = createVadState();
+}
+
+function computeRms(state) {
+  if (!state.buf) state.buf = new Uint8Array(state.analyser.fftSize);
+  state.analyser.getByteTimeDomainData(state.buf);
+  let sum = 0;
+  for (let i = 0; i < state.buf.length; i++) {
+    const v = (state.buf[i] - 128) / 128; // -1..1 に正規化
+    sum += v * v;
+  }
+  return Math.sqrt(sum / state.buf.length);
+}
+
+function sampleVad() {
+  const now = Date.now();
+  const cutoff = now - SPEECH_WINDOW_MS;
+  for (const key of ["self", "other"]) {
+    const s = vad[key];
+    if (!s.analyser) continue;
+    const speaking = computeRms(s) > VAD_RMS_THRESHOLD;
+    if (speaking) s.lastSpeechTs = now;
+    s.speaking = speaking;
+    s.history.push({ t: now, speaking });
+    while (s.history.length && s.history[0].t < cutoff) s.history.shift();
+  }
+}
+
+function buildSpeechFeatures() {
+  const now = Date.now();
+  const perSource = (key) => {
+    const s = vad[key];
+    if (!s.analyser) return null; // 音源が無い（例: タブ音声を共有していない）
+    const total = s.history.length;
+    const speakingCount = s.history.reduce((n, h) => n + (h.speaking ? 1 : 0), 0);
+    return {
+      speaking: s.speaking,
+      pause_ms: s.speaking ? 0 : Math.round(now - s.lastSpeechTs),
+      speech_ratio: total ? round(speakingCount / total) : 0
+    };
+  };
+  return { self: perSource("self"), other: perSource("other") };
+}
+
+function captureFrame() {
+  const video = elements.sourceVideo;
+  if (!video || !video.videoWidth) return;
+
+  // 最初5分を過ぎたら自動停止
+  if (Date.now() - captureStartTs > FRAME_CAPTURE_DURATION_MS) {
+    if (frameTimer) window.clearInterval(frameTimer);
+    frameTimer = null;
+    sendDiagnostic("frame_capture_done", "5分経過: 代表フレーム取得を終了");
+    return;
+  }
+
+  if (!frameCanvas) frameCanvas = document.createElement("canvas");
+  const w = FRAME_CAPTURE_WIDTH;
+  const h = Math.round((video.videoHeight / video.videoWidth) * w) || 270;
+  frameCanvas.width = w;
+  frameCanvas.height = h;
+  frameCanvas.getContext("2d").drawImage(video, 0, 0, w, h);
+  const dataUrl = frameCanvas.toDataURL("image/jpeg", 0.5);
+
+  // 画像本体はWSへ（UIログには要約のみ＝肥大化回避）
+  const event = { type: "frame_capture", t_ms: Date.now(), w, h, image: dataUrl };
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
+  logEvent({ type: "frame_capture", t_ms: event.t_ms, message: `frame ${w}x${h} ~${Math.round(dataUrl.length / 1024)}KB` });
+}
+
 function buildFeatures(faces, motionScore) {
   const faceVisible = faces.length > 0;
   const firstGaze = faces.find((face) => face.parts?.gaze_estimate)?.parts.gaze_estimate;
@@ -1220,6 +1421,7 @@ function buildFeatures(faces, motionScore) {
       visible_faces: engagement.visible_faces,
       calibrating: engagement.calibrating
     },
+    speech: buildSpeechFeatures(),
     gaze_estimate: faceVisible ? firstGaze ?? "unknown" : "not_visible",
     gestures: {
       nod_count: totalNodCount,
@@ -1273,6 +1475,12 @@ function drawFacePartPoints(faceParts) {
 function drawEmptyPreview() {
   ctx.fillStyle = "#101828";
   ctx.fillRect(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+}
+
+function sendDiagnostic(type, message) {
+  const event = { type, message, t_ms: Date.now() };
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
+  logEvent(event);
 }
 
 function sendFeatureEvent() {
@@ -1363,6 +1571,7 @@ function createEmptyFeatures() {
     face_tracks: [],
     motion_score: 0,
     attention_score: 0,
+    speech: { self: null, other: null },
     gaze_estimate: "not_visible",
     gestures: {
       nod_count: 0,
