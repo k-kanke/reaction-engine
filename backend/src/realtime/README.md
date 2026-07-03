@@ -2,6 +2,8 @@
 
 Realtime decision and short-term state logic.
 
+This directory owns the システム演算層 inside the Cloud Run WebSocket Gateway.
+
 Responsibilities:
 
 - Read/write recent feature windows in Memorystore for Redis.

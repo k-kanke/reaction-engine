@@ -14,6 +14,7 @@ Reaction Engine は、Google Meet 上の発表・商談・授業・社内共有�
 | --- | --- | --- |
 | Chrome Extension | Chrome MV3 | Meet 画面/音声取得、Edge Vision、feature event 送信 |
 | WebSocket Gateway | Cloud Run service | `realtime_feature` 受信、Redis/Pub/Sub への分岐、`feedback_event` 返却 |
+| システム演算層 | Cloud Run WebSocket Gateway 内 | window 集計、変化率、signal summary、decision log の一回計算 |
 | Realtime state | Memorystore for Redis | 直近 window、latest state、feedback cooldown |
 | Durable event pipeline | Pub/Sub | compact raw feature、signal summary、decision log を後続 worker に渡す durable queue |
 | Durable Writer | Cloud Run service / Cloud Run worker | Pub/Sub を購読し、Cloud Storage / Cloud SQL に保存 |
@@ -42,7 +43,8 @@ flowchart TB
   subgraph realtime["Realtime Path"]
     gateway["Cloud Run<br/>WebSocket Gateway"]
     redis[("Memorystore for Redis<br/>ZSET/HASH recent state")]
-    decision["Gateway Realtime Decision<br/>window集計・signal summary・rule・cooldown"]
+    systemCompute["システム演算層<br/>window集計・signal summary・decision log"]
+    decision["Realtime Decision<br/>rule・template・cooldown"]
   end
 
   subgraph durable["Durable / Async Path"]
@@ -62,12 +64,13 @@ flowchart TB
   edge -->|realtime_feature / WebSocket| gateway
 
   gateway -->|compact raw feature| redis
-  redis --> decision
+  redis --> systemCompute
+  systemCompute --> decision
   decision -->|feedback_event| gateway
   gateway --> sidebar
   sidebar --> presenter
 
-  gateway -->|compact raw feature + signal summary + decision log| pubsub
+  systemCompute -->|compact raw feature + signal summary + decision log| pubsub
   pubsub --> writer
   writer -->|raw JSONL| storage
   writer -->|signal summary / decision log / feedback history| cloudsql
@@ -97,7 +100,12 @@ Chrome 拡張はリアルタイム分析の一次処理を担当する。
 
 ## Cloud Run WebSocket Gateway
 
-Cloud Run Gateway は Chrome 拡張から WebSocket で `realtime_feature` を受け取り、リアルタイムの軽量なシステム処理まで担当する。
+Cloud Run Gateway は Chrome 拡張から WebSocket で `realtime_feature` を受け取り、Gateway 内の **システム演算層** でリアルタイムの軽量な演算処理まで担当する。
+
+システム演算層は、同じ feature event に対して一度だけ演算する。その結果を2方向に分岐する。
+
+- **リアルタイム feedback path**: signal summary / decision log から `feedback_event` を返す。
+- **永続化 path**: compact raw feature、signal summary、decision log を Pub/Sub に publish する。
 
 1. **Memorystore for Redis**
    - compact raw feature を保存する
@@ -125,6 +133,7 @@ on realtime_feature:
   Realtime processing:
     read 5s / 10s / 30s recent windows
     calculate signal_summary
+    create decision_log
     evaluate feedback decision with cooldown
 
   Pub/Sub:
@@ -132,6 +141,26 @@ on realtime_feature:
 ```
 
 Cloud Run の WebSocket は long-running request なので、request timeout と reconnect を前提にする。接続先 Cloud Run instance が変わっても問題ないよう、session state は instance memory ではなく Memorystore / Pub/Sub 側に置く。
+
+## システム演算層
+
+システム演算層は Cloud Run WebSocket Gateway 内に置く。目的は、raw な瞬間値をそのまま feedback や LLM に渡さず、低コストで安定した signal に変換すること。
+
+入力:
+
+- Chrome 拡張から届いた latest `realtime_feature`
+- Memorystore for Redis の recent window
+- session baseline
+- feedback cooldown state
+
+出力:
+
+- `compact_raw_feature`
+- `signal_summary`
+- `decision_log`
+- optional `feedback_event`
+
+この層で計算した `signal_summary` と `decision_log` を、リアルタイム feedback と後続の保存/分析の両方で使う。つまり、同じ演算を Durable Writer や後分析 worker で繰り返さない。
 
 ## Memorystore for Redis
 
@@ -229,7 +258,7 @@ Cloud Storage の JSONL は append ではなく、一定件数/一定時間ご�
 
 ## リアルタイム分析
 
-リアルタイム判定は Cloud Run Gateway 内で行う。Gateway は Memorystore for Redis の直近 window だけを見る。Cloud SQL や Cloud Storage を判定のたびに読まない。
+リアルタイム判定は Cloud Run Gateway 内のシステム演算層で行う。Gateway は Memorystore for Redis の直近 window だけを見る。Cloud SQL や Cloud Storage を判定のたびに読まない。
 
 入力:
 
@@ -242,7 +271,7 @@ Cloud Storage の JSONL は append ではなく、一定件数/一定時間ご�
 - `gestures`
 - 将来: `audio_level`, `silence_ms`, `speaking_rate`
 
-Gateway で計算する signal summary:
+システム演算層で計算する signal summary:
 
 - latest
 - 5秒平均

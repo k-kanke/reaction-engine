@@ -19,7 +19,7 @@ This backend is planned as:
 backend/
   src/
     gateway/        Cloud Run WebSocket Gateway
-    realtime/       Memorystore windows, signal summaries, cooldown, feedback rules
+    realtime/       システム演算層: Memorystore windows, signal summaries, cooldown, feedback rules
     events/         Pub/Sub publisher/subscriber adapters and event envelopes
     writer/         Pub/Sub -> Cloud Storage / Cloud SQL durable writer
     storage/        Cloud Storage raw JSONL / frames / clips helpers

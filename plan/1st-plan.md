@@ -43,8 +43,8 @@ flowchart TB
     gateway["Cloud Run<br/>WebSocket Gateway"]
     redisRecent[("Memorystore for Redis<br/>ZSET / HASH recent windows / session state / cooldown")]
     pubsub[("Pub/Sub<br/>feature-events topic")]
-    streamProcessor["Gateway Realtime Processor<br/>window aggregation / signal summary / cooldown"]
-    realtimeDecision["Realtime Decision Engine<br/>rules + decision log + policy"]
+    systemCompute["システム演算層<br/>window aggregation / signal summary / decision log"]
+    realtimeDecision["Realtime Decision Engine<br/>rules + template + cooldown"]
     feedbackApi["Feedback Delivery<br/>speaker hints / sidebar events"]
   end
 
@@ -93,9 +93,9 @@ flowchart TB
   localState -->|features / events| realtimeClient
   realtimeClient --> gateway
   gateway -->|recent compact feature| redisRecent
-  gateway -->|compact raw feature + signal summary + decision log| pubsub
-  redisRecent --> streamProcessor
-  streamProcessor --> realtimeDecision
+  redisRecent --> systemCompute
+  systemCompute --> realtimeDecision
+  systemCompute -->|compact raw feature + signal summary + decision log| pubsub
   realtimeDecision --> feedbackApi
   feedbackApi --> gateway
   gateway --> realtimeClient
@@ -164,7 +164,7 @@ flowchart TB
 
   subgraph realtime["リアルタイム判断"]
     redis["Memorystore for Redis<br/>直近window・状態・cooldown"]
-    stream["集計・平滑化"]
+    systemCompute["システム演算層<br/>集計・変化率・decision log"]
     decision["判断エンジン<br/>ルール+軽量モデル"]
   end
 
@@ -181,9 +181,9 @@ flowchart TB
   meet --> capture
   capture --> vision
   vision -->|特徴量イベント| redis
-  vision -->|Gatewayで集計後にpublish| eventStream
-  redis --> stream
-  stream --> decision
+  redis --> systemCompute
+  systemCompute --> decision
+  systemCompute -->|演算結果をpublish| eventStream
   decision -->|即時フィードバック| sidebar
   sidebar --> presenter
 
@@ -200,7 +200,7 @@ flowchart TB
 **読み方**
 
 - 左上〜拡張: 発信者が Meet を開くと、拡張がタブ画面をキャプチャし、ブラウザ内（Edge）で顔・視線・動き・音声の特徴量を抽出する。画像そのものは基本的にサーバーに送らない。
-- リアルタイム判断: 特徴量イベントを Memorystore for Redis の直近 window に入れ、集計し、断定しすぎない軽いフィードバック（例:「反応が薄くなっている可能性」）を即座に発信者へ返す。
+- リアルタイム判断: 特徴量イベントを Memorystore for Redis の直近 window に入れ、Cloud Run Gateway 内のシステム演算層で signal summary / decision log を一度だけ作り、断定しすぎない軽いフィードバック（例:「反応が薄くなっている可能性」）を即座に発信者へ返す。
 - 蓄積・非同期分析: Gateway が作った compact raw feature、signal summary、decision log を Pub/Sub に publish し、Cloud Run Durable Writer が Cloud Storage に JSONL、Cloud SQL に summary / decision log として保存する。会議後は保存済み特徴量、transcript、代表フレームを使って変化点検出・LLMレポート化を行う。
 - 運用: プロンプト/モデル/しきい値は継続的に評価・更新され、リアルタイム判断と非同期分析の両方にフィードバックされる。
 
@@ -245,6 +245,7 @@ sequenceDiagram
   participant Ext as Chrome Extension
   participant WS as Cloud Run<br/>WebSocket Gateway
   participant Redis as Memorystore<br/>ZSET/HASH
+  participant Compute as システム演算層
   participant PubSub as Pub/Sub
   participant Writer as Cloud Run<br/>Durable Writer
   participant API as Core API
@@ -260,8 +261,8 @@ sequenceDiagram
     Ext->>WS: feature_event(face_visible, gaze, motion, audio_level)
     WS->>Redis: ZADD recent window / HSET latest state / EXPIRE
     WS->>Redis: read recent windows
-    WS->>WS: calculate signal summary / decision log
-    WS->>PubSub: publish compact raw feature + signal summary + decision log
+    WS->>Compute: calculate signal summary / decision log once
+    Compute->>PubSub: publish compact raw feature + signal summary + decision log
     Redis-->>WS: recent window / cooldown state
     WS-->>Ext: feedback_event(optional)
   end
@@ -305,7 +306,7 @@ Cloud Run WebSocket Gateway は `realtime_feature` を受け取ったら、1回�
      - topic: `feature-events`
      - subscription: `feature-events-durable-writer`
 
-Gateway は Cloud SQL や Cloud Storage へ同期保存しない。低遅延 path では Memorystore と Pub/Sub への軽い書き込みまでに留め、永続化は Cloud Run Durable Writer が batch で行う。リアルタイムの window 集計、signal summary、decision log 作成は Gateway 内で行う。
+Gateway は Cloud SQL や Cloud Storage へ同期保存しない。低遅延 path では Memorystore と Pub/Sub への軽い書き込みまでに留め、永続化は Cloud Run Durable Writer が batch で行う。リアルタイムの window 集計、signal summary、decision log 作成は Gateway 内の **システム演算層** で一度だけ行う。
 
 ```text
 on realtime_feature:
@@ -320,6 +321,7 @@ on realtime_feature:
   Realtime processing:
     read 5s / 10s / 30s recent windows
     calculate signal_summary
+    create decision_log
     evaluate feedback decision with cooldown
   Pub/Sub:
     publish feature-events compact_raw_feature + signal_summary + decision_log

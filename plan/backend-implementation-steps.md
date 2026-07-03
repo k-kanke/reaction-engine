@@ -26,8 +26,8 @@
 Chrome 拡張から送られる `realtime_feature` を Cloud Run WebSocket Gateway で受け取り、以下を実現する。
 
 1. Memorystore for Redis に直近 window / latest state / cooldown を保存する。
-2. Gateway 内で 5s / 10s / 30s window の signal summary を計算する。
-3. Gateway 内で decision log を作り、簡単な `feedback_event` を返す。
+2. Gateway 内のシステム演算層で 5s / 10s / 30s window の signal summary を計算する。
+3. Gateway 内のシステム演算層で decision log を作り、簡単な `feedback_event` を返す。
 4. Pub/Sub topic `feature-events` に compact raw feature + signal summary + decision log を publish する。
 5. Cloud Run Durable Writer が Pub/Sub event を読み、JSONL を Cloud Storage に保存する。
 6. session metadata / signal summary / decision log / feedback history を Cloud SQL for PostgreSQL に保存する。
@@ -267,7 +267,7 @@ MVP では Google Cloud 実リソースなしでも最低限動く fallback を�
 5. `server_received_at_ms` を付与する。
 6. compact raw feature に正規化する。
 7. Redis recent state writer に渡す。
-8. Redis recent window を読み、signal summary を計算する。
+8. Redis recent window を読み、システム演算層で signal summary を計算する。
 9. feedback decision を実行し、decision log を作る。
 10. Pub/Sub publisher に compact raw feature + signal summary + decision log を渡す。
 11. feedback があれば WebSocket に返す。
