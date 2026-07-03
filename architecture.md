@@ -941,18 +941,25 @@ GCP 上の処理（既存のセッション後分析を再利用）:
 ## 技術選定
 
 - Extension: Chrome MV3
+- Backend Language: Go
+- Backend Runtime: Go 1.26
+- Backend HTTP: standard `net/http` + lightweight router
+- Backend WebSocket: `nhooyr.io/websocket` or `gorilla/websocket`
+- Backend DB: `pgx` + Cloud SQL for PostgreSQL
+- Backend Redis: `go-redis` + Memorystore for Redis
+- Backend GCP SDK: `cloud.google.com/go/*`
 - Edge Vision: MediaPipe Tasks Vision
 - Edge Audio: Web Audio API（AudioWorklet で self/other PCM抽出）
 - Realtime Transport: WebSocket（特徴量 + 音声チャンクを同一コネクションで多重化）
-- WebSocket Gateway: Cloud Run
+- WebSocket Gateway: Go service on Cloud Run
 - Realtime State: Memorystore for Redis
 - Realtime Transcription: Speech-to-Text streaming（session_idごとにself/other各1本）
 - Realtime LLM: Vertex AI / Gemini Flash（~10秒間隔、timeout + rule fallback）
 - Durable Event Pipeline: Pub/Sub
-- Durable Writer: Cloud Run service / worker
+- Durable Writer: Go Cloud Run service / worker
 - Durable Storage: Cloud Storage JSONL
 - Media Upload: Cloud Run signed upload API + Cloud Storage signed URL
-- Image Analysis Worker: Cloud Run service / Jobs + Pub/Sub + Vertex AI / Gemini Vision
+- Image Analysis Worker: Go Cloud Run service / Jobs + Pub/Sub + Vertex AI / Gemini Vision
 - App DB: Cloud SQL for PostgreSQL
 - Post-session Workers: Cloud Run Jobs（ASRは行わず、変化点検出・レポート生成のみ）
 - LLM Report: Vertex AI / Gemini（post-session report + realtime reasoning）

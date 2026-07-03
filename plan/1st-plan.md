@@ -702,8 +702,11 @@ WebSocket で画像バイナリを送ること自体は可能。ただし、低�
 - Realtime Transcription: Google Cloud Speech-to-Text streaming（session_idごとにself/other各1本）
 - Realtime LLM: Vertex AI / Gemini Flash（~10秒間隔、timeout + rule fallback）
 - Event Stream: Pub/Sub
-- Core API: Cloud Run + FastAPI または Node.js/Fastify
-- Durable Writer: Cloud Run service / worker + Pub/Sub ack / retry / dead-letter topic
+- Core API: Go service on Cloud Run
+- WebSocket Gateway: Go + `net/http` + WebSocket library
+- Durable Writer: Go Cloud Run service / worker + Pub/Sub ack / retry / dead-letter topic
+- Media API: Go Cloud Run service + Cloud Storage signed URL
+- Image Analysis Worker: Go Cloud Run service / Jobs + Pub/Sub + Vertex AI / Gemini Vision
 - Job Queue: Pub/Sub / Cloud Tasks
 - DB: Cloud SQL for PostgreSQL
 - Time-series: MVP では Cloud Storage JSONL + Cloud SQL summary。高頻度検索が必要になったら BigQuery

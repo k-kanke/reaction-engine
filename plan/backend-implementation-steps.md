@@ -1,19 +1,22 @@
 # Backend 実装ステップ
 
-このドキュメントは、Reaction Engine のサーバーサイドを Google Cloud 前提で実装するための step-by-step plan。
+このドキュメントは、Reaction Engine のサーバーサイドを Google Cloud 前提で Go で実装するための step-by-step plan。
 
 対象スタック:
 
-- Language: TypeScript
-- Runtime: Node.js 22
-- Framework: Fastify
+- Language: Go
+- Runtime: Go 1.26
+- HTTP: standard `net/http` + `chi` or standard router
+- WebSocket: `nhooyr.io/websocket` or `gorilla/websocket`
 - Deploy: Cloud Run
-- Validation: TypeBox
-- DB: Kysely + postgres.js
-- Redis: ioredis against Memorystore for Redis
+- Validation: Go struct validation + JSON Schema / OpenAPI contract
+- DB: Cloud SQL for PostgreSQL + `pgx`
+- Redis: `go-redis` against Memorystore for Redis
 - GCP SDK:
-  - `@google-cloud/pubsub`
-  - `@google-cloud/storage`
+  - `cloud.google.com/go/pubsub`
+  - `cloud.google.com/go/storage`
+  - `cloud.google.com/go/speech/apiv1`
+  - Vertex AI / Gemini SDK or REST client
 
 対象ディレクトリ:
 
@@ -23,31 +26,33 @@
 
 ## Goal
 
-Chrome 拡張から送られる `realtime_feature` を Cloud Run WebSocket Gateway で受け取り、以下を実現する。
+Chrome 拡張から送られる `realtime_feature` / `audio_chunk` を Cloud Run WebSocket Gateway で受け取り、以下を実現する。
 
-1. Memorystore for Redis に直近 window / latest state / cooldown を保存する。
-2. Gateway 内のシステム演算層で 5s / 10s / 30s window の signal summary を計算する。
-3. Gateway 内のシステム演算層で decision log を作り、簡単な `feedback_event` を返す。
-4. Pub/Sub topic `feature-events` に compact raw feature + signal summary + decision log を publish する。
-5. Cloud Run Durable Writer が Pub/Sub event を読み、JSONL を Cloud Storage に保存する。
-6. session metadata / signal summary / decision log / feedback history を Cloud SQL for PostgreSQL に保存する。
-7. 後続の Cloud Run Jobs が compact raw JSONL、signal summary、transcript からセッション後レポートを作れる状態にする。
+1. Memorystore for Redis に参加者ごとの直近 window / latest state / cooldown を保存する。
+2. Gateway 内のシステム演算層で signal summary / decision log を計算する。
+3. Realtime LLM を timeout 付きで呼び、失敗時は rule fallback で `feedback_event` を返す。
+4. Speech-to-Text streaming に self/other 音声チャンクを中継し、final transcript を保存経路へ流す。
+5. Pub/Sub topic `feature-events` に compact raw feature + signal summary + transcript_chunk + decision log を publish する。
+6. Durable Writer が Pub/Sub event を読み、JSONL を Cloud Storage、summary を Cloud SQL に保存する。
+7. Media API が signed upload URL、`media_ref`、`capture_snapshots.feature_snapshot` を管理する。
+8. Image Analysis Worker が画像 + `capture_snapshots.feature_snapshot` から participant baseline / visual summary を作る。
+9. Post-session Job が compact raw JSONL、signal summary、transcript、participant baseline、visual summary からレポートを作る。
 
 ## Phase 0: 前提整理
 
 ### 0.1 決定事項を固定する
 
-実装前に以下を README または issue に明記する。
-
 - Google Cloud project id
 - default region
-- Cloud Run service 名
+- Cloud Run service / job 名
   - `reaction-gateway`
+  - `reaction-media-api`
   - `reaction-writer`
-  - `reaction-analysis-job`
+  - `reaction-image-analysis-worker`
+  - `reaction-post-session-job`
 - Pub/Sub topic / subscription 名
   - topic: `feature-events`
-  - subscription: `feature-events-durable-writer`
+  - topic: `media-analysis-events`
   - dead-letter topic: `feature-events-dead-letter`
 - Cloud Storage bucket 名
 - Cloud SQL instance / database 名
@@ -66,800 +71,433 @@ MVP では Google Cloud 実リソースなしでも最低限動く fallback を�
 - Redis 未設定時: in-memory recent window
 - Pub/Sub 未設定時: local log publisher
 - Cloud Storage 未設定時: local JSONL writer
-- Cloud SQL 未設定時: DB 書き込み skip または local Postgres
+- Cloud SQL 未設定時: local Postgres or DB write skip
 
 受け入れ条件:
 
 - ローカルで Chrome 拡張から WebSocket 接続し、`feedback_event` を返せる。
 - GCP 接続がないことを理由に gateway 開発が止まらない。
 
-## Phase 1: Backend project skeleton
+## Phase 1: Go project skeleton
 
-### 1.1 `backend/package.json` を作る
+### 1.1 Go module を作る
 
-追加する scripts:
+追加するファイル:
 
-- `dev:gateway`
-- `dev:writer`
-- `build`
-- `check`
-- `test`
-- `lint` optional
-- `typecheck`
+- `backend/go.mod`
+- `backend/go.sum`
+- `backend/Makefile`
+- `backend/cmd/gateway/main.go`
+- `backend/cmd/media-api/main.go`
+- `backend/cmd/writer/main.go`
+- `backend/cmd/image-analysis-worker/main.go`
+- `backend/cmd/post-session-job/main.go`
 
-依存候補:
+標準コマンド:
 
-- `fastify`
-- `@fastify/websocket`
-- `@sinclair/typebox`
-- `kysely`
-- `postgres`
-- `ioredis`
-- `@google-cloud/pubsub`
-- `@google-cloud/storage`
-- `tsx`
-- `typescript`
-- `vitest`
+```text
+make test
+make lint
+make build
+make run-gateway
+make run-media-api
+make run-writer
+```
 
 受け入れ条件:
 
-- `cd backend && npm run check` が実行できる。
-- Node.js 22 前提が README または `engines` にある。
+- `cd backend && go test ./...` が通る。
+- 各 `cmd/*` が placeholder として build できる。
 
-### 1.2 TypeScript 設定を作る
+### 1.2 パッケージ構成を作る
 
-追加候補:
+推奨構成:
 
-- `backend/tsconfig.json`
-- `backend/src/index.ts` placeholder
+```text
+backend/
+  cmd/
+    gateway/
+    media-api/
+    writer/
+    image-analysis-worker/
+    post-session-job/
+  internal/
+    config/
+    contract/
+    db/
+    redis/
+    pubsub/
+    storage/
+    gateway/
+    realtime/
+    media/
+    imageanalysis/
+    writer/
+    analysis/
+    observability/
+  migrations/
+  deploy/
+  tests/
+```
 
 方針:
 
-- ESM で統一する。
-- `strict: true`
-- source は `src/`
-- build output は `dist/`
+- `cmd/*` は起動だけを担当する。
+- 業務ロジックは `internal/*` に閉じ込める。
+- Chrome 拡張と共有する payload contract は `internal/contract` と `docs/openapi` に集約する。
 
-受け入れ条件:
-
-- `npm run typecheck` が通る。
-
-### 1.3 backend env schema を作る
+### 1.3 env config を作る
 
 場所:
 
-- `backend/src/config/env.ts`
+- `backend/internal/config/config.go`
 
 必要な env:
 
-- `NODE_ENV`
 - `PORT`
 - `GOOGLE_CLOUD_PROJECT`
 - `GCP_REGION`
-- `REDIS_HOST`
-- `REDIS_PORT`
-- `PUBSUB_FEATURE_EVENTS_TOPIC`
-- `PUBSUB_FEATURE_EVENTS_SUBSCRIPTION`
-- `FEATURE_BUCKET`
+- `REDIS_ADDR`
 - `DATABASE_URL`
-- `LOCAL_FALLBACK_ENABLED`
+- `FEATURE_EVENTS_TOPIC`
+- `MEDIA_ANALYSIS_EVENTS_TOPIC`
+- `FEATURE_EVENTS_SUBSCRIPTION`
+- `MEDIA_BUCKET`
+- `SIGNED_URL_TTL_SECONDS`
+- `REALTIME_LLM_TIMEOUT_MS`
 
 受け入れ条件:
 
-- env の不足時に分かりやすい error を出す。
-- local fallback が有効な場合は GCP env 不足を許容できる。
+- 起動時に config を validate する。
+- 不足 env は明確な error で落ちる。
 
-## Phase 2: Shared schemas
+## Phase 2: データ契約
 
-### 2.1 `realtime_feature` schema を定義する
+### 2.1 Go structs を定義する
 
 場所:
 
-- `backend/src/schemas/realtime-feature.ts`
-
-含めるフィールド:
-
-- `event_id`
-- `type`
-- `schema_version`
-- `session_id`
-- `t_ms`
-- `server_received_at_ms`
-- `meeting_provider`
-- `source`
-- `features`
-  - `face_visible`
-  - `face_count`
-  - `face_tracks`
-  - `motion_score`
-  - `attention_score`
-  - `gaze_estimate`
-  - `gestures`
-  - `client_model_version`
-
-注意:
-
-- Chrome 拡張から送られる時点では `event_id` と `server_received_at_ms` はなくてもよい。
-- Gateway internal event では必須にする。
-
-受け入れ条件:
-
-- inbound payload と enriched payload の schema が分かれている。
-- TypeBox から TypeScript type を export している。
-
-### 2.2 `feedback_event` schema を定義する
-
-場所:
-
-- `backend/src/schemas/feedback-event.ts`
-
-含めるフィールド:
-
-- `type`
-- `session_id`
-- `t_ms`
-- `feedback_type`
-- `severity`
-- `message`
-- `reason_codes`
-- `confidence`
-- `cooldown_ms`
-
-受け入れ条件:
-
-- Chrome 拡張 sidebar が表示しやすい形になっている。
-- message は短く、発表者がすぐ行動できる表現にする。
-
-### 2.3 Pub/Sub envelope を定義する
-
-場所:
-
-- `backend/src/schemas/pubsub-event.ts`
-
-含めるフィールド:
-
-- `event_id`
-- `type`
-- `schema_version`
-- `session_id`
-- `t_ms`
-- `server_received_at_ms`
-- `payload`
-
-受け入れ条件:
-
-- Durable Writer が `event_id` で冪等処理できる。
-- 将来 schema migration できるよう `schema_version` がある。
-
-## Phase 3: Gateway MVP
-
-### 3.1 Fastify app を作る
-
-場所:
-
-- `backend/src/server.ts`
-- `backend/src/gateway/register-routes.ts`
-
-エンドポイント:
-
-- `GET /healthz`
-- `GET /readyz`
-- `GET /realtime` WebSocket
-
-受け入れ条件:
-
-- `npm run dev:gateway` で起動できる。
-- `GET /healthz` が 200 を返す。
-- WebSocket 接続ができる。
-
-### 3.2 WebSocket message handler を作る
-
-場所:
-
-- `backend/src/gateway/websocket.ts`
-
-処理:
-
-1. client から JSON message を受け取る。
-2. `type === "realtime_feature"` を検証する。
-3. payload schema validation を行う。
-4. `event_id` を採番する。
-5. `server_received_at_ms` を付与する。
-6. compact raw feature に正規化する。
-7. Redis recent state writer に渡す。
-8. Redis recent window を読み、システム演算層で signal summary を計算する。
-9. feedback decision を実行し、decision log を作る。
-10. Pub/Sub publisher に compact raw feature + signal summary + decision log を渡す。
-11. feedback があれば WebSocket に返す。
-
-受け入れ条件:
-
-- 不正 JSON で gateway が落ちない。
-- schema validation error を log に出せる。
-- 正常 event で signal summary / feedback decision / Pub/Sub publish まで到達する。
-
-### 3.3 ローカル互換を維持する
-
-現在の `scripts/ws-log-server.cjs` はローカル検証用として残す。
+- `backend/internal/contract/realtime_feature.go`
+- `backend/internal/contract/audio_chunk.go`
+- `backend/internal/contract/transcript_chunk.go`
+- `backend/internal/contract/feedback_event.go`
+- `backend/internal/contract/capture_snapshot.go`
+- `backend/internal/contract/pubsub_event.go`
 
 方針:
 
-- 新 gateway が動いたら README に推奨を切り替える。
-- 古い log server は simple receiver として維持してよい。
+- `json` tag を必ず付ける。
+- schema version を持つ。
+- `event_id` / `server_received_at_ms` は Gateway 側で付与する。
+- `capture_snapshot` は画像処理フロー専用で、`realtime_feature` には含めない。
 
-受け入れ条件:
+### 2.2 schema 生成方針を決める
 
-- 既存 Chrome 拡張の WebSocket URL に新 gateway を指定できる。
-- 既存 log server を壊さない。
-
-## Phase 4: Memorystore / Redis recent state
-
-### 4.1 Redis client adapter を作る
-
-場所:
-
-- `backend/src/realtime/redis-client.ts`
-- `backend/src/realtime/recent-state.ts`
-
-実装:
-
-- `ioredis` client
-- local fallback in-memory implementation
-- interface を定義する
-
-interface 案:
-
-```ts
-interface RecentStateStore {
-  writeFeature(event: EnrichedRealtimeFeatureEvent): Promise<void>;
-  readWindow(sessionId: string, fromMs: number, toMs: number): Promise<CompactFeature[]>;
-  readLatest(sessionId: string): Promise<CompactFeature | null>;
-  getCooldown(sessionId: string, feedbackType: string): Promise<number | null>;
-  setCooldown(sessionId: string, feedbackType: string, untilMs: number): Promise<void>;
-}
-```
-
-受け入れ条件:
-
-- Redis 実装と in-memory 実装を差し替えられる。
-- unit test で window read/write を確認できる。
-
-### 4.2 Redis key design を実装する
-
-keys:
-
-- `features:recent:{session_id}`
-- `session:state:{session_id}`
-- `feedback:cooldown:{session_id}`
-
-write:
-
-- `ZADD features:recent:{session_id} t_ms compact_payload`
-- `ZREMRANGEBYSCORE features:recent:{session_id} -inf now-60000`
-- `HSET session:state:{session_id} latest_feature compact_payload latest_t_ms t_ms`
-- `EXPIRE ... 3600`
-
-受け入れ条件:
-
-- 直近 60秒より古い event が削除される。
-- TTL が設定される。
-- Redis 書き込み失敗時に gateway 全体が落ちない。
-
-## Phase 5: Signal summary and Pub/Sub publish
-
-### 5.1 realtime signal summary を作る
-
-場所:
-
-- `backend/src/realtime/window-aggregation.ts`
-- `backend/src/realtime/signal-summary.ts`
-
-計算する値:
-
-- latest
-- 5秒平均
-- 10秒平均
-- 30秒平均
-- 直前 window との差分
-- session baseline との差分
-- slope
-- low / high state の継続時間
-- confidence
-
-対象 signal:
-
-- `attention_score`
-- `motion_score`
-- `face_count`
-- `gaze_estimate`
-- `gestures.nod_count`
-- 将来: `audio_level`, `silence_ms`, `speaking_rate`
-
-受け入れ条件:
-
-- 1件の latest feature と Redis recent window から signal summary を作れる。
-- 欠損 signal があっても落ちない。
-- unit test で avg / delta / duration を確認できる。
-
-### 5.2 decision log を作る
-
-場所:
-
-- `backend/src/realtime/decision-log.ts`
-
-含める情報:
-
-- `event_id`
-- `session_id`
-- `t_ms`
-- `rule_version`
-- `signal_summary`
-- `feedback_type`
-- `reason_codes`
-- `confidence`
-- `cooldown_applied`
-- `feedback_emitted`
-
-受け入れ条件:
-
-- feedback が出ない場合も decision log を作れる。
-- 後から「なぜ feedback が出た/出なかったか」を追える。
-
-### 5.3 Pub/Sub publisher adapter を作る
-
-場所:
-
-- `backend/src/events/pubsub-publisher.ts`
-
-実装:
-
-- `@google-cloud/pubsub`
-- topic name は env から読む。
-- local fallback は console log / local file でもよい。
-
-受け入れ条件:
-
-- gateway から compact raw feature + signal summary + decision log を publish できる。
-- publish 失敗時は log に出る。
-- retry するか、gateway の response 方針を明記する。
-
-### 5.4 Pub/Sub message attributes を決める
-
-attributes:
-
-- `event_type`
-- `session_id`
-- `schema_version`
-- `source`
-
-受け入れ条件:
-
-- subscription filtering を将来追加できる。
-- logs で session 単位に追える。
-
-## Phase 6: Realtime feedback decision
-
-### 6.1 MVP rule engine を作る
-
-場所:
-
-- `backend/src/realtime/decision.ts`
-
-最初の rule:
-
-- face_count が 0 の状態が 5秒以上続く
-- attention_score が 10秒平均で一定以下
-- motion_score が 10秒平均で極端に低い
-- cooldown 中は同じ feedback を出さない
-
-出力:
-
-- `feedback_event`
-
-受け入れ条件:
-
-- signal summary から feedback が生成される。
-- cooldown が効く。
-- feedback message が短く行動可能な文言になっている。
-
-### 6.2 feedback policy を分ける
-
-場所:
-
-- `backend/src/realtime/feedback-policy.ts`
-
-責務:
-
-- severity
-- confidence
-- cooldown_ms
-- wording
-
-受け入れ条件:
-
-- rule と文言が密結合しすぎない。
-
-## Phase 7: Durable Writer MVP
-
-### 7.1 writer entrypoint を作る
-
-場所:
-
-- `backend/src/writer/main.ts`
-
-形:
-
-- Pub/Sub pull worker か push endpoint のどちらかを決める。
-- Cloud Run では push subscription endpoint の方が運用しやすい。
-- local dev では pull でもよい。
-
-受け入れ条件:
-
-- Pub/Sub event を受け取れる。
-- invalid payload を dead-letter または error log に回せる。
-
-### 7.2 Cloud Storage JSONL writer を作る
-
-場所:
-
-- `backend/src/storage/feature-jsonl-writer.ts`
-
-paths:
-
-```text
-gs://{FEATURE_BUCKET}/sessions/{session_id}/features/compact-raw/{yyyyMMdd-HHmmss}-{chunk_id}.jsonl
-gs://{FEATURE_BUCKET}/sessions/{session_id}/features/signal-summary/{yyyyMMdd-HHmmss}-{chunk_id}.jsonl
-gs://{FEATURE_BUCKET}/sessions/{session_id}/features/decision-log/{yyyyMMdd-HHmmss}-{chunk_id}.jsonl
-```
-
-方針:
-
-- Cloud Storage は append ではなく chunk file として保存する。
-- MVP では 1 message 1 JSONL file でもよい。
-- 次段階で batch chunk にする。
-- full face landmarks / face_parts は常時保存しない。
-
-受け入れ条件:
-
-- Pub/Sub event の compact raw feature / signal summary / decision log が Cloud Storage に JSONL として保存される。
-- JSONL 1行が valid JSON。
-- `event_id` が含まれる。
-
-### 7.3 Cloud SQL summary writer を作る
-
-場所:
-
-- `backend/src/db/client.ts`
-- `backend/src/db/schema.ts`
-- `backend/src/db/repositories/signal-summary-repository.ts`
-- `backend/src/db/repositories/decision-log-repository.ts`
-- `backend/src/db/repositories/session-summary-repository.ts`
-
-最小テーブル:
-
-- `sessions`
-- `feedback_events`
-- `signal_summaries`
-- `decision_logs`
-- `session_summaries`
-- `processed_events`
-
-注意:
-
-- compact raw feature を全件 Cloud SQL に入れない。
-- Cloud SQL には signal summary / decision log / feedback history を入れる。
-- `processed_events.event_id` で冪等性を担保する。
-
-受け入れ条件:
-
-- 同じ `event_id` を再処理しても signal summary / decision log / summary が二重保存されない。
-- DB 未設定時は writer が local JSONL だけで動ける fallback を用意する。
-
-## Phase 8: Database migrations
-
-### 8.1 migration tool を決める
-
-候補:
-
-- Kysely migration
-- node-pg-migrate
-- drizzle-kit は Drizzle を採用する場合のみ
+Chrome 拡張は TypeScript なので、Go struct を直接共有しない。
 
 推奨:
 
-- Kysely migration
+- API contract は OpenAPI / JSON Schema を source of truth にする。
+- Go 側は struct + validation を実装する。
+- Extension 側は JSON Schema / OpenAPI から TypeScript 型を生成する。
 
 受け入れ条件:
 
-- `backend/migrations/` に migration が置ける。
-- `npm run db:migrate` の方針が README に書かれている。
+- `realtime_feature`、`capture_snapshot`、`feedback_event` の schema が docs に残る。
 
-### 8.2 初期 schema を作る
+## Phase 3: WebSocket Gateway
 
-最小 schema:
+### 3.1 Gateway server を作る
 
-```sql
-sessions (
-  session_id text primary key,
-  meeting_provider text not null,
-  started_at timestamptz not null,
-  ended_at timestamptz,
-  status text not null,
-  created_at timestamptz not null
-)
+場所:
 
-processed_events (
-  event_id text primary key,
-  session_id text not null,
-  event_type text not null,
-  processed_at timestamptz not null
-)
+- `backend/cmd/gateway/main.go`
+- `backend/internal/gateway/server.go`
+- `backend/internal/gateway/websocket.go`
 
-feedback_events (
-  id bigserial primary key,
-  event_id text,
-  session_id text not null,
-  t_ms bigint not null,
-  feedback_type text not null,
-  severity text not null,
-  message text not null,
-  confidence double precision,
-  created_at timestamptz not null
-)
+要件:
 
-session_summaries (
-  session_id text primary key,
-  event_count bigint not null default 0,
-  avg_attention_score double precision,
-  avg_motion_score double precision,
-  max_face_count integer,
-  updated_at timestamptz not null
-)
+- `GET /healthz`
+- `GET /ws`
+- Cloud Run の `PORT` を使う。
+- `0.0.0.0` で listen する。
+- graceful shutdown する。
 
-signal_summaries (
-  event_id text primary key,
-  session_id text not null,
-  t_ms bigint not null,
-  attention_10s_avg double precision,
-  attention_delta_prev_10s double precision,
-  motion_10s_avg double precision,
-  motion_delta_prev_10s double precision,
-  low_duration_ms bigint,
-  confidence double precision,
-  created_at timestamptz not null
-)
+受け入れ条件:
 
-decision_logs (
-  event_id text primary key,
-  session_id text not null,
-  t_ms bigint not null,
-  rule_version text not null,
-  feedback_type text,
-  reason_codes jsonb not null,
-  confidence double precision,
-  cooldown_applied boolean not null,
-  feedback_emitted boolean not null,
-  created_at timestamptz not null
-)
+- Chrome 拡張から WebSocket 接続できる。
+- ping / close / reconnect を扱える。
+
+### 3.2 realtime_feature handler
+
+処理:
+
+1. payload validate
+2. `event_id` 採番
+3. `server_received_at_ms` 付与
+4. `session_id + audience_id` ごとに Redis recent window 更新
+5. signal summary / decision log 計算
+6. Pub/Sub publish
+7. `feedback_event` 返却
+
+Redis key:
+
+```text
+features:recent:{session_id}:{audience_id}
+session:computed:{session_id}:{audience_id}
+feedback:cooldown:{session_id}:{audience_id}
+session:baseline:{session_id}:{audience_id}
+session:visual_summary:{session_id}:{audience_id}
+session:baseline_status:{session_id}:{audience_id}
 ```
 
-受け入れ条件:
+## Phase 4: Speech-to-Text streaming
 
-- Durable Writer が signal summary / decision log を書ける。
-- report 用の詳細 schema は後続 phase に回せる。
-
-## Phase 9: Terraform MVP
-
-### 9.1 dev environment の最小リソース
+### 4.1 audio_chunk relay
 
 場所:
 
-- `infra/environments/dev/`
+- `backend/internal/gateway/audio_relay.go`
+- `backend/internal/realtime/transcription.go`
 
-最初に作るもの:
+処理:
 
-- Pub/Sub topic `feature-events`
-- Pub/Sub subscription `feature-events-durable-writer`
-- dead-letter topic
-- Cloud Storage bucket
-- service accounts
-- basic IAM bindings
-- Secret Manager placeholder
+- `audio_chunk` を既存 WebSocket で受ける。
+- session_id ごとに self/other 各1本の Speech-to-Text streaming session を持つ。
+- final result だけ `transcript_chunk` として Redis / Pub/Sub に流す。
+- 生 PCM は保存しない。
 
 受け入れ条件:
 
-- `terraform plan` が通る。
-- backend service account が Pub/Sub publish / subscribe と Cloud Storage write に必要な権限を持つ。
+- streaming session の再接続に対応する。
+- interim result は永続化しない。
 
-### 9.2 Cloud Run / Memorystore / Cloud SQL を追加
-
-次段階で追加:
-
-- Cloud Run `reaction-gateway`
-- Cloud Run `reaction-writer`
-- Cloud Run Job `reaction-analysis-job`
-- Memorystore for Redis
-- Cloud SQL for PostgreSQL
-- Serverless VPC Access
-
-受け入れ条件:
-
-- Cloud Run から Memorystore に接続できる。
-- Cloud Run から Cloud SQL に接続できる。
-- secrets は Secret Manager 経由で渡す。
-
-## Phase 10: Cloud Run deployment
-
-### 10.1 Dockerfile を作る
+## Phase 5: システム演算層
 
 場所:
+
+- `backend/internal/realtime/window.go`
+- `backend/internal/realtime/signal_summary.go`
+- `backend/internal/realtime/decision_log.go`
+- `backend/internal/realtime/feedback_policy.go`
+
+要件:
+
+- 5s / 10s / 30s window の平均・変化率・継続時間を計算する。
+- `participant_baseline` / `visual_summary` が Redis にある場合だけ補正に使う。
+- baseline 未準備なら `baseline_status = warming_up` として default threshold を使う。
+- feedback は cooldown を通す。
+
+## Phase 6: Realtime LLM
+
+場所:
+
+- `backend/internal/realtime/llm.go`
+
+要件:
+
+- 約10秒ごとに signal summary + transcript window を Gemini Flash に渡す。
+- timeout / quota / error 時は rule fallback に戻す。
+- LLM の出力も decision log に残す。
+- 因果を断定しない文言にする。
+
+## Phase 7: Pub/Sub publisher
+
+場所:
+
+- `backend/internal/pubsub/publisher.go`
+
+topic:
+
+- `feature-events`
+
+payload:
+
+- compact raw feature
+- signal summary
+- transcript_chunk optional
+- decision log
+
+受け入れ条件:
+
+- Pub/Sub 未設定時は local log publisher に fallback する。
+- publish 失敗時の retry / log がある。
+
+## Phase 8: Media API
+
+場所:
+
+- `backend/cmd/media-api/main.go`
+- `backend/internal/media/server.go`
+- `backend/internal/media/signed_url.go`
+- `backend/internal/media/capture_snapshot.go`
+
+API:
+
+```text
+POST /sessions/{session_id}/media/upload-url
+POST /sessions/{session_id}/media
+POST /sessions/{session_id}/media/{capture_id}/complete
+```
+
+処理:
+
+1. Chrome 拡張から `capture_id` / `t_ms` / `audience_id` / `tile_id` / compact `feature_snapshot` を受け取る。
+2. Cloud Storage signed upload URL と `media_ref` を発行する。
+3. Cloud SQL `capture_snapshots` に `feature_snapshot` を保存する。
+4. upload complete 時に Cloud Storage object の存在を確認する。
+5. `capture_snapshots.upload_status = uploaded` に更新する。
+6. `media-analysis-events` に `media_uploaded` を publish する。
+
+注意:
+
+- `capture_snapshot` は画像処理フロー専用。
+- `media_ref` / `feature_snapshot` は `realtime_feature` に混ぜない。
+
+## Phase 9: Image Analysis Worker
+
+場所:
+
+- `backend/cmd/image-analysis-worker/main.go`
+- `backend/internal/imageanalysis/worker.go`
+- `backend/internal/imageanalysis/vision.go`
+- `backend/internal/imageanalysis/baseline.go`
+
+処理:
+
+1. Pub/Sub topic `media-analysis-events` を subscribe する。
+2. `capture_id` で Cloud SQL `capture_snapshots` を読む。
+3. `media_ref` の画像を Cloud Storage から読む。
+4. `feature_snapshot` が無ければ `baseline_status = insufficient_snapshot` として終了する。
+5. 画像 + `feature_snapshot` を Gemini Vision / Vision model に渡す。
+6. `visual_summary` を作る。
+7. 複数 sample から `participant_baseline` を更新する。
+8. Redis に baseline / visual_summary / baseline_status を cache する。
+9. Cloud SQL に participant_baselines / visual_summaries を保存する。
+
+## Phase 10: Durable Writer
+
+場所:
+
+- `backend/cmd/writer/main.go`
+- `backend/internal/writer/worker.go`
+- `backend/internal/storage/jsonl_writer.go`
+
+処理:
+
+1. Pub/Sub subscription `feature-events-durable-writer` を読む。
+2. `event_id` で冪等性を確保する。
+3. compact raw feature / signal summary / decision log / transcript_chunk を Cloud Storage JSONL に保存する。
+4. signal summary / decision log / feedback history / transcript を Cloud SQL に保存する。
+5. 保存成功後に ack する。
+
+注意:
+
+- `capture_snapshots` と `media_refs` は Media API が作る。Durable Writer は作らない。
+
+## Phase 11: Cloud SQL schema / migrations
+
+場所:
+
+- `backend/migrations/`
+
+必要テーブル:
+
+- `sessions`
+- `participants`
+- `capture_snapshots`
+- `media_refs`
+- `participant_baselines`
+- `visual_summaries`
+- `signal_summaries`
+- `decision_logs`
+- `transcripts`
+- `feedback_events`
+- `reports`
+
+Go 実装:
+
+- migration tool は `golang-migrate/migrate` などを使う。
+- DB client は `pgxpool`。
+
+## Phase 12: Post-session Job
+
+場所:
+
+- `backend/cmd/post-session-job/main.go`
+- `backend/internal/analysis/job.go`
+
+入力:
+
+- Cloud Storage compact raw feature JSONL
+- Cloud SQL signal summaries
+- Cloud SQL transcripts
+- Cloud SQL participant_baselines
+- Cloud SQL visual_summaries
+- feedback history
+
+処理:
+
+1. timeline を align する。
+2. 変化点を検出する。
+3. visual summary / baseline を補正情報として使う。
+4. Gemini で report / coaching suggestion を生成する。
+5. Cloud SQL に report を保存する。
+
+## Phase 13: Docker / Cloud Run
+
+### 13.1 Dockerfile
+
+追加:
 
 - `backend/Dockerfile`
 
 方針:
 
-- Node.js 22
-- production dependencies のみ
-- `npm run build`
-- entrypoint を env で切り替えるか、service ごとに command を変える。
+- multi-stage build
+- static binary
+- distroless or scratch runtime
+- non-root user
+- `PORT` env を使う
 
-受け入れ条件:
+### 13.2 Cloud Run service split
 
-- gateway image が build できる。
-- writer image が build できる。
+- `reaction-gateway`
+- `reaction-media-api`
+- `reaction-writer`
+- `reaction-image-analysis-worker`
 
-### 10.2 service entrypoint を分ける
+Cloud Run Jobs:
 
-entrypoints:
+- `reaction-post-session-job`
 
-- `backend/src/gateway/main.ts`
-- `backend/src/writer/main.ts`
-- `backend/src/jobs/analysis-main.ts`
-
-受け入れ条件:
-
-- 同じ image で command だけ変えて Cloud Run service / job を動かせる。
-
-## Phase 11: End-to-end local test
-
-### 11.1 Chrome extension -> local gateway
-
-手順:
-
-1. `npm run dev:gateway`
-2. Chrome extension sidebar の WebSocket URL に local gateway を設定
-3. `Start Capture`
-4. `realtime_feature` が gateway log に出る
-5. feedback rule に合えば `feedback_event` が sidebar に出る
-
-受け入れ条件:
-
-- extension の既存 payload を gateway が受け取れる。
-- 1秒ごとの event で gateway が落ちない。
-
-### 11.2 local gateway -> local writer fallback
-
-手順:
-
-1. Pub/Sub fallback を local file にする。
-2. writer を起動する。
-3. compact raw / signal summary / decision log JSONL が local output に保存される。
-
-受け入れ条件:
-
-- compact raw event と signal summary / decision log が欠損なく JSONL に残る。
-- `event_id` が入る。
-
-## Phase 12: GCP dev smoke test
-
-### 12.1 Cloud Run gateway smoke test
-
-確認:
-
-- `/healthz`
-- `/readyz`
-- WebSocket connect
-- Redis write
-- Pub/Sub publish
-
-受け入れ条件:
-
-- Cloud Logging で session_id / event_id が追える。
-- Pub/Sub topic に message が入る。
-
-### 12.2 Durable writer smoke test
-
-確認:
-
-- Pub/Sub subscription から message を受け取る。
-- Cloud Storage に compact raw / signal summary / decision log JSONL ができる。
-- Cloud SQL に signal summary / decision log / session summary が入る。
-- 成功時 ack される。
-
-受け入れ条件:
-
-- 同じ message が再配信されても二重処理されない。
-
-## Phase 13: Post-session analysis skeleton
-
-### 13.1 analysis job placeholder
+## Phase 14: Observability
 
 場所:
 
-- `backend/src/jobs/analysis-main.ts`
+- `backend/internal/observability/`
 
-処理:
+必要なログ:
 
-1. `session_id` を受け取る。
-2. Cloud Storage の compact raw feature JSONL と signal summary JSONL 一覧を取得する。
-3. event を読み込む。
-4. simple summary report を作る。
-5. Cloud SQL に report placeholder を保存する。
+- session_id
+- audience_id
+- capture_id
+- event_id
+- latency
+- Redis latency
+- Pub/Sub publish latency
+- LLM latency / timeout / fallback
+- Image Analysis Worker success / failure
 
-受け入れ条件:
-
-- LLM なしで report placeholder まで作れる。
-- 後で Speech-to-Text / Vertex AI を差し込める。
-
-## Phase 14: Documentation
-
-### 14.1 backend README を更新する
-
-書く内容:
-
-- local dev setup
-- required env
-- gateway 起動手順
-- writer 起動手順
-- GCP dev smoke test
-- known fallbacks
-
-受け入れ条件:
-
-- 新しい開発者が README だけで gateway を起動できる。
-
-### 14.2 architecture と plan の同期
-
-更新対象:
-
-- `architecture.md`
-- `plan/1st-plan.md`
-- `plan/implementation-todo.md`
-
-受け入れ条件:
-
-- Redis Stream 前提の記述が復活していない。
-- Google Cloud 構成と backend 実装が一致している。
-
-## 実装順の推奨
-
-最初の PR は小さく分ける。
-
-1. backend TypeScript skeleton
-2. schemas
-3. Fastify WebSocket Gateway local only
-4. Redis recent state adapter with in-memory fallback
-5. signal summary / decision log
-6. Pub/Sub publisher with local fallback
-7. MVP feedback rules
-8. Durable Writer local JSONL
-9. Cloud Storage writer
-10. Cloud SQL schema + signal summary / decision log writer
-11. Terraform dev MVP
-12. Cloud Run deployment
-13. analysis job placeholder
-
-## Done の定義
+## Done Criteria
 
 MVP backend が done と言える状態:
 
-- Chrome extension から Cloud Run Gateway に WebSocket 接続できる。
-- `realtime_feature` が 1秒ごとに受信される。
-- Memorystore に recent state が入る。
-- Gateway が signal summary / decision log を生成する。
-- Pub/Sub に compact raw feature + signal summary + decision log が publish される。
-- feedback rule により `feedback_event` が返る。
-- Durable Writer が Pub/Sub event を Cloud Storage JSONL に保存する。
-- Cloud SQL に signal summary / decision log / session summary / feedback history が保存される。
-- session_id を指定して analysis job placeholder が report を作れる。
-- README に local / dev GCP の起動手順がある。
+- Go services が build / test できる。
+- Cloud Run Gateway が WebSocket で feature / audio を受ける。
+- Redis に participant ごとの recent window と baseline cache を保存できる。
+- Pub/Sub `feature-events` に realtime analysis event を publish できる。
+- Durable Writer が Cloud Storage / Cloud SQL に保存できる。
+- Media API が signed upload URL と capture snapshot を保存できる。
+- Image Analysis Worker が画像 + feature_snapshot から baseline / visual_summary を作れる。
+- Post-session Job が保存済みデータから report を作れる。
