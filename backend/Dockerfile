@@ -5,7 +5,8 @@ FROM golang:${GO_VERSION} AS builder
 WORKDIR /app
 COPY go.mod go.sum* ./
 RUN go mod download
-COPY . .
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
 ARG SERVICE
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/service ./cmd/${SERVICE}
 
