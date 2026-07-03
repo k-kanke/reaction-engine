@@ -43,8 +43,8 @@ flowchart TB
     gateway["Cloud Run<br/>WebSocket Gateway"]
     redisRecent[("Memorystore for Redis<br/>ZSET / HASH recent windows / session state / cooldown")]
     pubsub[("Pub/Sub<br/>feature-events topic")]
-    streamProcessor["Realtime Processor<br/>window aggregation / smoothing / cooldown"]
-    realtimeDecision["Realtime Decision Engine<br/>rules + lightweight model + policy"]
+    streamProcessor["Gateway Realtime Processor<br/>window aggregation / signal summary / cooldown"]
+    realtimeDecision["Realtime Decision Engine<br/>rules + decision log + policy"]
     feedbackApi["Feedback Delivery<br/>speaker hints / sidebar events"]
   end
 
@@ -68,7 +68,7 @@ flowchart TB
   subgraph dataPlatform["Data Platform"]
     postgres[("Cloud SQL for PostgreSQL<br/>sessions / participants / summaries / reports")]
     timeseries[("BigQuery optional<br/>analytics / evaluation")]
-    objectStorage[("Cloud Storage<br/>raw feature JSONL / frames / clips / artifacts")]
+    objectStorage[("Cloud Storage<br/>compact raw feature JSONL / signal summaries / decision logs / frames / clips / artifacts")]
     vectorStore[("Vector Store<br/>examples / report snippets / retrieval")]
     warehouse[("Analytics Warehouse<br/>cost / latency / quality metrics")]
   end
@@ -93,7 +93,7 @@ flowchart TB
   localState -->|features / events| realtimeClient
   realtimeClient --> gateway
   gateway -->|recent compact feature| redisRecent
-  gateway -->|full feature event| pubsub
+  gateway -->|compact raw feature + signal summary + decision log| pubsub
   redisRecent --> streamProcessor
   streamProcessor --> realtimeDecision
   realtimeDecision --> feedbackApi
@@ -113,8 +113,8 @@ flowchart TB
   mediaApi --> jobQueue
 
   pubsub --> durableWriter
-  durableWriter -->|raw feature JSONL| objectStorage
-  durableWriter -->|session summaries / feedback history| postgres
+  durableWriter -->|compact raw / signal summary / decision log JSONL| objectStorage
+  durableWriter -->|signal summaries / decision logs / feedback history| postgres
   durableWriter -.->|optional high-volume signals| timeseries
   durableWriter --> jobQueue
 
@@ -181,14 +181,14 @@ flowchart TB
   meet --> capture
   capture --> vision
   vision -->|特徴量イベント| redis
-  vision -->|同じイベントをappend| eventStream
+  vision -->|Gatewayで集計後にpublish| eventStream
   redis --> stream
   stream --> decision
   decision -->|即時フィードバック| sidebar
   sidebar --> presenter
 
   eventStream --> writer
-  writer -->|raw特徴量JSONL / summary| store
+  writer -->|compact raw / signal summary / decision log| store
   vision -->|代表フレーム/短いクリップ| store
   store --> analysis
   analysis -->|反応タイムライン/レポート| presenter
@@ -201,7 +201,7 @@ flowchart TB
 
 - 左上〜拡張: 発信者が Meet を開くと、拡張がタブ画面をキャプチャし、ブラウザ内（Edge）で顔・視線・動き・音声の特徴量を抽出する。画像そのものは基本的にサーバーに送らない。
 - リアルタイム判断: 特徴量イベントを Memorystore for Redis の直近 window に入れ、集計し、断定しすぎない軽いフィードバック（例:「反応が薄くなっている可能性」）を即座に発信者へ返す。
-- 蓄積・非同期分析: 同じ特徴量イベントを Pub/Sub に publish し、Cloud Run Durable Writer が Cloud Storage に raw JSONL、Cloud SQL に summary として保存する。会議後は保存済み特徴量、transcript、代表フレームを使って変化点検出・LLMレポート化を行う。
+- 蓄積・非同期分析: Gateway が作った compact raw feature、signal summary、decision log を Pub/Sub に publish し、Cloud Run Durable Writer が Cloud Storage に JSONL、Cloud SQL に summary / decision log として保存する。会議後は保存済み特徴量、transcript、代表フレームを使って変化点検出・LLMレポート化を行う。
 - 運用: プロンプト/モデル/しきい値は継続的に評価・更新され、リアルタイム判断と非同期分析の両方にフィードバックされる。
 
 ## Edge Vision Pipeline
@@ -259,15 +259,17 @@ sequenceDiagram
   loop every 100-1000ms
     Ext->>WS: feature_event(face_visible, gaze, motion, audio_level)
     WS->>Redis: ZADD recent window / HSET latest state / EXPIRE
-    WS->>PubSub: publish full feature event
+    WS->>Redis: read recent windows
+    WS->>WS: calculate signal summary / decision log
+    WS->>PubSub: publish compact raw feature + signal summary + decision log
     Redis-->>WS: recent window / cooldown state
     WS-->>Ext: feedback_event(optional)
   end
 
   loop batch
     Writer->>PubSub: pull / receive feature events
-    Writer->>Obj: append raw feature JSONL chunk
-    Writer->>DB: upsert session summaries / feedback history
+    Writer->>Obj: append compact raw / signal summary / decision log JSONL chunks
+    Writer->>DB: upsert signal summaries / decision logs / feedback history
     Writer->>PubSub: ack persisted events
   end
 
@@ -279,7 +281,7 @@ sequenceDiagram
   end
 
   API->>Worker: enqueue analysis job
-  Worker->>Obj: read raw feature JSONL / transcript / media refs
+  Worker->>Obj: read compact raw feature JSONL / signal summaries / transcript / media refs
   Worker->>API: analysis events / report
   API-->>Ext: report ready
 ```
@@ -303,7 +305,7 @@ Cloud Run WebSocket Gateway は `realtime_feature` を受け取ったら、1回�
      - topic: `feature-events`
      - subscription: `feature-events-durable-writer`
 
-Gateway は Cloud SQL や Cloud Storage へ同期保存しない。低遅延 path では Memorystore と Pub/Sub への軽い書き込みまでに留め、永続化は Cloud Run Durable Writer が batch で行う。
+Gateway は Cloud SQL や Cloud Storage へ同期保存しない。低遅延 path では Memorystore と Pub/Sub への軽い書き込みまでに留め、永続化は Cloud Run Durable Writer が batch で行う。リアルタイムの window 集計、signal summary、decision log 作成は Gateway 内で行う。
 
 ```text
 on realtime_feature:
@@ -315,16 +317,20 @@ on realtime_feature:
     HSET session:state:{session_id} latest_feature compact_payload latest_t_ms t_ms
     EXPIRE features:recent:{session_id} 3600
     EXPIRE session:state:{session_id} 3600
+  Realtime processing:
+    read 5s / 10s / 30s recent windows
+    calculate signal_summary
+    evaluate feedback decision with cooldown
   Pub/Sub:
-    publish feature-events full_payload
+    publish feature-events compact_raw_feature + signal_summary + decision_log
 ```
 
 ### 永続化タイミング
 
-- **feature 受信時**: Gateway が Memorystore recent に書き、Pub/Sub に full event を publish する。
-- **数秒単位または N events 単位**: Cloud Run Durable Writer が Pub/Sub から event を読み、raw feature JSONL を Cloud Storage に保存し、summary / feedback history を Cloud SQL に upsert する。
+- **feature 受信時**: Gateway が Memorystore recent に書き、signal summary / decision log を作り、Pub/Sub に compact raw feature + signal summary + decision log を publish する。
+- **数秒単位または N events 単位**: Cloud Run Durable Writer が Pub/Sub から event を読み、JSONL を Cloud Storage に保存し、signal summary / decision log / feedback history を Cloud SQL に upsert する。
 - **セッション終了時**: session status を `ended` にし、未保存 event を final flush し、post-session analysis job を enqueue する。
-- **後分析時**: Cloud Run Job は Cloud Storage の raw feature JSONL、transcript、代表フレーム/clip を読んで report を作る。
+- **後分析時**: Cloud Run Job は Cloud Storage の compact raw feature JSONL、signal summary、transcript、代表フレーム/clip を読んで report を作る。
 
 Durable Writer は Pub/Sub message を受け取り、保存成功後に ack する。保存前に worker が落ちた event は retry される。繰り返し失敗する message は dead-letter topic に送る。Pub/Sub は at-least-once delivery 前提なので、`event_id` を持たせ、Cloud SQL 側は冪等 upsert、Cloud Storage 側は重複許容または後分析時の dedupe を前提にする。
 
@@ -359,8 +365,8 @@ Durable Writer は Pub/Sub message を受け取り、保存成功後に ack す�
 - Pub/Sub は **永続化 worker への入口**。最終保存先ではない。
 - REST は **状態変更・確定データ・メディア参照用**。
 - Cloud Storage は **画像・短い動画・分析 artifact 用**。
-- Cloud Storage には **raw feature JSONL** も保存し、セッション後分析の source of truth にする。
-- Cloud SQL には画像本体や全 raw feature を入れず、session、summary、feedback history、report、`media_ref` と metadata を保存する。
+- Cloud Storage には **compact raw feature JSONL / signal summary / decision log** も保存し、セッション後分析の source of truth にする。
+- Cloud SQL には画像本体や compact raw feature 全件を入れず、session、signal summary、decision log、feedback history、report、`media_ref` と metadata を保存する。
 
 ## リアルタイム分析パス
 
@@ -370,21 +376,25 @@ flowchart LR
   ws["WebSocket"]
   recent[("Memorystore for Redis<br/>ZSET / HASH recent window / latest state")]
   window["Window Aggregation<br/>1s / 3s / 10s"]
+  summary["Signal Summary<br/>avg / delta / slope / duration"]
   state["Session State<br/>baseline / participant calibration"]
-  decision["Decision Engine<br/>rules + lightweight model"]
+  decision["Decision Engine<br/>rules + decision log"]
   policy["Feedback Policy<br/>confidence / cooldown / wording"]
   ui["Sidebar / Side Panel"]
 
   edge --> ws
   ws --> recent
   recent --> window
-  window --> state
+  window --> summary
+  summary --> state
   state --> decision
   decision --> policy
   policy --> ui
 ```
 
-リアルタイムパスは Memorystore for Redis の直近 window だけを見る。Cloud SQL や Cloud Storage を判定のたびに読まない。低遅延 feedback のために、直近 10秒/30秒程度の特徴量、session state、cooldown state を Memorystore に置く。
+リアルタイムパスは Cloud Run Gateway 内で処理する。Gateway は Memorystore for Redis の直近 window だけを読み、Cloud SQL や Cloud Storage を判定のたびに読まない。低遅延 feedback のために、直近 5秒/10秒/30秒程度の特徴量、session state、cooldown state を Memorystore に置く。
+
+Gateway は latest、window average、直前 window との差分、baseline 差、slope、低下/上昇の継続時間、confidence を signal summary として計算し、その結果から decision log と `feedback_event` を作る。リアルタイムでは LLM を基本的に使わず、rule + template + cooldown で返す。
 
 リアルタイムパスでは断定的な感情推定を避ける。出すべきなのは「退屈しています」ではなく、「一部の反応が薄くなっている可能性があります」「発話速度が上がっています」「間を置いて確認するとよさそうです」のような、発信者がすぐ行動に移せる表現。
 
@@ -394,8 +404,9 @@ flowchart LR
 flowchart LR
   stream["Pub/Sub<br/>feature-events topic"]
   writer["Cloud Run Durable Writer"]
-  events["Raw Feature JSONL<br/>Cloud Storage"]
-  summaries["Cloud SQL Summaries"]
+  events["Compact Raw Feature JSONL<br/>Cloud Storage"]
+  signalSummaries["Signal Summary JSONL / Cloud SQL"]
+  decisionLogs["Decision Log JSONL / Cloud SQL"]
   media["Representative Frames / Clips"]
   transcript["Transcript"]
   align["Timeline Alignment"]
@@ -408,9 +419,11 @@ flowchart LR
 
   stream --> writer
   writer --> events
-  writer --> summaries
+  writer --> signalSummaries
+  writer --> decisionLogs
   events --> align
-  summaries --> align
+  signalSummaries --> align
+  decisionLogs --> evidence
   media --> align
   transcript --> align
   align --> change
@@ -421,7 +434,7 @@ flowchart LR
   feedback --> eval
 ```
 
-セッション後分析では、Pub/Sub から Cloud Run Durable Writer が保存した raw feature JSONL を基本入力にする。リアルタイム判定用 Memorystore state は TTL で消える前提なので、後分析の source of truth にはしない。代表フレーム、発話前後の transcript、反応スコアの変化点をまとめて Vertex AI / Gemini に渡し、理由・根拠・確信度を生成する。
+セッション後分析では、Pub/Sub から Cloud Run Durable Writer が保存した compact raw feature JSONL、signal summary、decision log を基本入力にする。リアルタイム判定用 Memorystore state は TTL で消える前提なので、後分析の source of truth にはしない。代表フレーム、発話前後の transcript、反応スコアの変化点をまとめて Vertex AI / Gemini に渡し、理由・根拠・確信度を生成する。
 
 ## Chrome 拡張の責務
 
@@ -445,10 +458,10 @@ Chrome 拡張は最終形でも重要な分析コンポーネントになる。�
 - session lifecycle、role、consent、retention policy の管理
 - WebSocket gateway によるリアルタイムイベント受信
 - Memorystore for Redis ZSET / HASH への直近 window、latest state、cooldown state の保存
-- Pub/Sub への full feature event publish
+- Pub/Sub への compact raw feature / signal summary / decision log publish
 - window aggregation、baseline 補正、cooldown 制御
 - feedback policy による文言・頻度・確信度制御
-- Cloud Run Durable Writer による raw feature JSONL、summary、feedback history の永続化
+- Cloud Run Durable Writer による compact raw feature JSONL、signal summary、decision log、feedback history の永続化
 - 代表フレーム/短いクリップの保存先管理
 - 文字起こし、視覚ラベリング、変化点検出、LLM レポート生成
 - ユーザー修正の収集
@@ -575,8 +588,9 @@ Chrome 拡張は画像を扱う。ただし、常時サーバーへ転送する�
 | データ | 主な用途 | 通信 | 保存 |
 | --- | --- | --- | --- |
 | 顔 bbox / 視線 / 動き量などの特徴量 | リアルタイム判断 | WebSocket | Memorystore for Redis |
-| raw feature event | 後分析、再集計、監査 | Gateway -> Pub/Sub -> Durable Writer | Cloud Storage JSONL |
-| feature summary / feedback history | 画面表示、レポート、検索 | Durable Writer | Cloud SQL |
+| compact raw feature | 後分析、再集計、監査 | Gateway -> Pub/Sub -> Durable Writer | Cloud Storage JSONL |
+| signal summary | リアルタイム判断根拠、後分析 | Gateway -> Pub/Sub -> Durable Writer | Cloud Storage JSONL / Cloud SQL |
+| decision log / feedback history | 判断根拠、評価、レポート | Gateway -> Pub/Sub -> Durable Writer | Cloud Storage JSONL / Cloud SQL |
 | 代表フレーム | 後処理分析、根拠表示、評価 | REST + signed upload | Cloud Storage |
 | 短いクリップ | 詳細分析、デバッグ、ユーザー許可ありの再分析 | REST + signed upload | Cloud Storage |
 

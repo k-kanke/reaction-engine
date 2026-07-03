@@ -26,11 +26,12 @@
 Chrome 拡張から送られる `realtime_feature` を Cloud Run WebSocket Gateway で受け取り、以下を実現する。
 
 1. Memorystore for Redis に直近 window / latest state / cooldown を保存する。
-2. Pub/Sub topic `feature-events` に full event を publish する。
-3. Redis recent window から簡単な `feedback_event` を返す。
-4. Cloud Run Durable Writer が Pub/Sub event を読み、raw feature JSONL を Cloud Storage に保存する。
-5. session metadata / summary / feedback history を Cloud SQL for PostgreSQL に保存する。
-6. 後続の Cloud Run Jobs が raw JSONL と transcript からセッション後レポートを作れる状態にする。
+2. Gateway 内で 5s / 10s / 30s window の signal summary を計算する。
+3. Gateway 内で decision log を作り、簡単な `feedback_event` を返す。
+4. Pub/Sub topic `feature-events` に compact raw feature + signal summary + decision log を publish する。
+5. Cloud Run Durable Writer が Pub/Sub event を読み、JSONL を Cloud Storage に保存する。
+6. session metadata / signal summary / decision log / feedback history を Cloud SQL for PostgreSQL に保存する。
+7. 後続の Cloud Run Jobs が compact raw JSONL、signal summary、transcript からセッション後レポートを作れる状態にする。
 
 ## Phase 0: 前提整理
 
@@ -264,16 +265,18 @@ MVP では Google Cloud 実リソースなしでも最低限動く fallback を�
 3. payload schema validation を行う。
 4. `event_id` を採番する。
 5. `server_received_at_ms` を付与する。
-6. Redis recent state writer に渡す。
-7. Pub/Sub publisher に渡す。
-8. feedback decision を実行する。
-9. feedback があれば WebSocket に返す。
+6. compact raw feature に正規化する。
+7. Redis recent state writer に渡す。
+8. Redis recent window を読み、signal summary を計算する。
+9. feedback decision を実行し、decision log を作る。
+10. Pub/Sub publisher に compact raw feature + signal summary + decision log を渡す。
+11. feedback があれば WebSocket に返す。
 
 受け入れ条件:
 
 - 不正 JSON で gateway が落ちない。
 - schema validation error を log に出せる。
-- 正常 event で feedback decision まで到達する。
+- 正常 event で signal summary / feedback decision / Pub/Sub publish まで到達する。
 
 ### 3.3 ローカル互換を維持する
 
@@ -342,9 +345,67 @@ write:
 - TTL が設定される。
 - Redis 書き込み失敗時に gateway 全体が落ちない。
 
-## Phase 5: Pub/Sub publish
+## Phase 5: Signal summary and Pub/Sub publish
 
-### 5.1 Pub/Sub publisher adapter を作る
+### 5.1 realtime signal summary を作る
+
+場所:
+
+- `backend/src/realtime/window-aggregation.ts`
+- `backend/src/realtime/signal-summary.ts`
+
+計算する値:
+
+- latest
+- 5秒平均
+- 10秒平均
+- 30秒平均
+- 直前 window との差分
+- session baseline との差分
+- slope
+- low / high state の継続時間
+- confidence
+
+対象 signal:
+
+- `attention_score`
+- `motion_score`
+- `face_count`
+- `gaze_estimate`
+- `gestures.nod_count`
+- 将来: `audio_level`, `silence_ms`, `speaking_rate`
+
+受け入れ条件:
+
+- 1件の latest feature と Redis recent window から signal summary を作れる。
+- 欠損 signal があっても落ちない。
+- unit test で avg / delta / duration を確認できる。
+
+### 5.2 decision log を作る
+
+場所:
+
+- `backend/src/realtime/decision-log.ts`
+
+含める情報:
+
+- `event_id`
+- `session_id`
+- `t_ms`
+- `rule_version`
+- `signal_summary`
+- `feedback_type`
+- `reason_codes`
+- `confidence`
+- `cooldown_applied`
+- `feedback_emitted`
+
+受け入れ条件:
+
+- feedback が出ない場合も decision log を作れる。
+- 後から「なぜ feedback が出た/出なかったか」を追える。
+
+### 5.3 Pub/Sub publisher adapter を作る
 
 場所:
 
@@ -358,11 +419,11 @@ write:
 
 受け入れ条件:
 
-- gateway から full event を publish できる。
+- gateway から compact raw feature + signal summary + decision log を publish できる。
 - publish 失敗時は log に出る。
 - retry するか、gateway の response 方針を明記する。
 
-### 5.2 Pub/Sub message attributes を決める
+### 5.4 Pub/Sub message attributes を決める
 
 attributes:
 
@@ -397,7 +458,7 @@ attributes:
 
 受け入れ条件:
 
-- 直近 window から feedback が生成される。
+- signal summary から feedback が生成される。
 - cooldown が効く。
 - feedback message が短く行動可能な文言になっている。
 
@@ -443,10 +504,12 @@ attributes:
 
 - `backend/src/storage/feature-jsonl-writer.ts`
 
-path:
+paths:
 
 ```text
-gs://{FEATURE_BUCKET}/sessions/{session_id}/features/{yyyyMMdd-HHmmss}-{chunk_id}.jsonl
+gs://{FEATURE_BUCKET}/sessions/{session_id}/features/compact-raw/{yyyyMMdd-HHmmss}-{chunk_id}.jsonl
+gs://{FEATURE_BUCKET}/sessions/{session_id}/features/signal-summary/{yyyyMMdd-HHmmss}-{chunk_id}.jsonl
+gs://{FEATURE_BUCKET}/sessions/{session_id}/features/decision-log/{yyyyMMdd-HHmmss}-{chunk_id}.jsonl
 ```
 
 方針:
@@ -454,10 +517,11 @@ gs://{FEATURE_BUCKET}/sessions/{session_id}/features/{yyyyMMdd-HHmmss}-{chunk_id
 - Cloud Storage は append ではなく chunk file として保存する。
 - MVP では 1 message 1 JSONL file でもよい。
 - 次段階で batch chunk にする。
+- full face landmarks / face_parts は常時保存しない。
 
 受け入れ条件:
 
-- Pub/Sub event が Cloud Storage に JSONL として保存される。
+- Pub/Sub event の compact raw feature / signal summary / decision log が Cloud Storage に JSONL として保存される。
 - JSONL 1行が valid JSON。
 - `event_id` が含まれる。
 
@@ -467,23 +531,28 @@ gs://{FEATURE_BUCKET}/sessions/{session_id}/features/{yyyyMMdd-HHmmss}-{chunk_id
 
 - `backend/src/db/client.ts`
 - `backend/src/db/schema.ts`
+- `backend/src/db/repositories/signal-summary-repository.ts`
+- `backend/src/db/repositories/decision-log-repository.ts`
 - `backend/src/db/repositories/session-summary-repository.ts`
 
 最小テーブル:
 
 - `sessions`
 - `feedback_events`
+- `signal_summaries`
+- `decision_logs`
 - `session_summaries`
 - `processed_events`
 
 注意:
 
-- raw feature を全件 Cloud SQL に入れない。
+- compact raw feature を全件 Cloud SQL に入れない。
+- Cloud SQL には signal summary / decision log / feedback history を入れる。
 - `processed_events.event_id` で冪等性を担保する。
 
 受け入れ条件:
 
-- 同じ `event_id` を再処理しても summary が二重加算されない。
+- 同じ `event_id` を再処理しても signal summary / decision log / summary が二重保存されない。
 - DB 未設定時は writer が local JSONL だけで動ける fallback を用意する。
 
 ## Phase 8: Database migrations
@@ -546,11 +615,37 @@ session_summaries (
   max_face_count integer,
   updated_at timestamptz not null
 )
+
+signal_summaries (
+  event_id text primary key,
+  session_id text not null,
+  t_ms bigint not null,
+  attention_10s_avg double precision,
+  attention_delta_prev_10s double precision,
+  motion_10s_avg double precision,
+  motion_delta_prev_10s double precision,
+  low_duration_ms bigint,
+  confidence double precision,
+  created_at timestamptz not null
+)
+
+decision_logs (
+  event_id text primary key,
+  session_id text not null,
+  t_ms bigint not null,
+  rule_version text not null,
+  feedback_type text,
+  reason_codes jsonb not null,
+  confidence double precision,
+  cooldown_applied boolean not null,
+  feedback_emitted boolean not null,
+  created_at timestamptz not null
+)
 ```
 
 受け入れ条件:
 
-- Durable Writer が必要な最小情報を書ける。
+- Durable Writer が signal summary / decision log を書ける。
 - report 用の詳細 schema は後続 phase に回せる。
 
 ## Phase 9: Terraform MVP
@@ -648,11 +743,11 @@ entrypoints:
 
 1. Pub/Sub fallback を local file にする。
 2. writer を起動する。
-3. raw JSONL が local output に保存される。
+3. compact raw / signal summary / decision log JSONL が local output に保存される。
 
 受け入れ条件:
 
-- raw event が欠損なく JSONL に残る。
+- compact raw event と signal summary / decision log が欠損なく JSONL に残る。
 - `event_id` が入る。
 
 ## Phase 12: GCP dev smoke test
@@ -677,8 +772,8 @@ entrypoints:
 確認:
 
 - Pub/Sub subscription から message を受け取る。
-- Cloud Storage に JSONL ができる。
-- Cloud SQL に summary が入る。
+- Cloud Storage に compact raw / signal summary / decision log JSONL ができる。
+- Cloud SQL に signal summary / decision log / session summary が入る。
 - 成功時 ack される。
 
 受け入れ条件:
@@ -696,7 +791,7 @@ entrypoints:
 処理:
 
 1. `session_id` を受け取る。
-2. Cloud Storage の raw feature JSONL 一覧を取得する。
+2. Cloud Storage の compact raw feature JSONL と signal summary JSONL 一覧を取得する。
 3. event を読み込む。
 4. simple summary report を作る。
 5. Cloud SQL に report placeholder を保存する。
@@ -744,14 +839,15 @@ entrypoints:
 2. schemas
 3. Fastify WebSocket Gateway local only
 4. Redis recent state adapter with in-memory fallback
-5. Pub/Sub publisher with local fallback
-6. MVP feedback rules
-7. Durable Writer local JSONL
-8. Cloud Storage writer
-9. Cloud SQL schema + summary writer
-10. Terraform dev MVP
-11. Cloud Run deployment
-12. analysis job placeholder
+5. signal summary / decision log
+6. Pub/Sub publisher with local fallback
+7. MVP feedback rules
+8. Durable Writer local JSONL
+9. Cloud Storage writer
+10. Cloud SQL schema + signal summary / decision log writer
+11. Terraform dev MVP
+12. Cloud Run deployment
+13. analysis job placeholder
 
 ## Done の定義
 
@@ -760,9 +856,10 @@ MVP backend が done と言える状態:
 - Chrome extension から Cloud Run Gateway に WebSocket 接続できる。
 - `realtime_feature` が 1秒ごとに受信される。
 - Memorystore に recent state が入る。
-- Pub/Sub に full event が publish される。
+- Gateway が signal summary / decision log を生成する。
+- Pub/Sub に compact raw feature + signal summary + decision log が publish される。
 - feedback rule により `feedback_event` が返る。
 - Durable Writer が Pub/Sub event を Cloud Storage JSONL に保存する。
-- Cloud SQL に session summary / feedback history が保存される。
+- Cloud SQL に signal summary / decision log / session summary / feedback history が保存される。
 - session_id を指定して analysis job placeholder が report を作れる。
 - README に local / dev GCP の起動手順がある。

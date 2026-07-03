@@ -19,7 +19,7 @@ This backend is planned as:
 backend/
   src/
     gateway/        Cloud Run WebSocket Gateway
-    realtime/       Memorystore recent window, cooldown, feedback rules
+    realtime/       Memorystore windows, signal summaries, cooldown, feedback rules
     events/         Pub/Sub publisher/subscriber adapters and event envelopes
     writer/         Pub/Sub -> Cloud Storage / Cloud SQL durable writer
     storage/        Cloud Storage raw JSONL / frames / clips helpers
@@ -36,8 +36,8 @@ backend/
 
 ## Initial Service Split
 
-- `reaction-gateway`: WebSocket Gateway, Memorystore writes, Pub/Sub publish, feedback return.
-- `reaction-writer`: Pub/Sub consumer, Cloud Storage JSONL writer, Cloud SQL summary writer.
+- `reaction-gateway`: WebSocket Gateway, Memorystore writes, signal summary / decision log, Pub/Sub publish, feedback return.
+- `reaction-writer`: Pub/Sub consumer, Cloud Storage JSONL writer, Cloud SQL signal summary / decision log writer.
 - `reaction-analysis-job`: Cloud Run Job for post-session analysis.
 
-Keep raw high-frequency feature events out of Cloud SQL. Store raw events as JSONL chunks in Cloud Storage and put only metadata, summaries, feedback history, and reports in Cloud SQL.
+Keep high-frequency compact raw feature events out of Cloud SQL. Store compact raw features as JSONL chunks in Cloud Storage and put metadata, signal summaries, decision logs, feedback history, and reports in Cloud SQL.

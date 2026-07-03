@@ -15,10 +15,10 @@ Reaction Engine は、Google Meet 上の発表・商談・授業・社内共有�
 | Chrome Extension | Chrome MV3 | Meet 画面/音声取得、Edge Vision、feature event 送信 |
 | WebSocket Gateway | Cloud Run service | `realtime_feature` 受信、Redis/Pub/Sub への分岐、`feedback_event` 返却 |
 | Realtime state | Memorystore for Redis | 直近 window、latest state、feedback cooldown |
-| Durable event pipeline | Pub/Sub | full feature event を後続 worker に渡す durable queue |
+| Durable event pipeline | Pub/Sub | compact raw feature、signal summary、decision log を後続 worker に渡す durable queue |
 | Durable Writer | Cloud Run service / Cloud Run worker | Pub/Sub を購読し、Cloud Storage / Cloud SQL に保存 |
-| Raw feature storage | Cloud Storage | raw feature JSONL、代表フレーム、短いクリップ |
-| App database | Cloud SQL for PostgreSQL | session、participant、summary、feedback history、report |
+| Compact raw feature storage | Cloud Storage | compact raw feature JSONL、代表フレーム、短いクリップ |
+| App database | Cloud SQL for PostgreSQL | session、participant、signal summary、decision log、feedback history、report |
 | Post-session jobs | Cloud Run Jobs | セッション後分析、レポート生成 |
 | Transcript | Speech-to-Text | 発話の文字起こし |
 | LLM report | Vertex AI / Gemini | 反応タイムライン、改善提案、レポート生成 |
@@ -42,13 +42,13 @@ flowchart TB
   subgraph realtime["Realtime Path"]
     gateway["Cloud Run<br/>WebSocket Gateway"]
     redis[("Memorystore for Redis<br/>ZSET/HASH recent state")]
-    decision["Realtime Decision<br/>window集計・rule・cooldown"]
+    decision["Gateway Realtime Decision<br/>window集計・signal summary・rule・cooldown"]
   end
 
   subgraph durable["Durable / Async Path"]
     pubsub["Pub/Sub<br/>feature-events topic"]
     writer["Cloud Run Durable Writer<br/>batch persist / retry"]
-    storage[("Cloud Storage<br/>raw feature JSONL / frames / clips")]
+    storage[("Cloud Storage<br/>compact raw feature JSONL / signal summaries / decision logs / frames / clips")]
     cloudsql[("Cloud SQL for PostgreSQL<br/>sessions / summaries / reports")]
     jobs["Cloud Run Jobs<br/>post-session analysis"]
     stt["Speech-to-Text"]
@@ -61,16 +61,16 @@ flowchart TB
   capture --> edge
   edge -->|realtime_feature / WebSocket| gateway
 
-  gateway -->|compact feature| redis
+  gateway -->|compact raw feature| redis
   redis --> decision
   decision -->|feedback_event| gateway
   gateway --> sidebar
   sidebar --> presenter
 
-  gateway -->|full feature event| pubsub
+  gateway -->|compact raw feature + signal summary + decision log| pubsub
   pubsub --> writer
   writer -->|raw JSONL| storage
-  writer -->|summary / feedback history| cloudsql
+  writer -->|signal summary / decision log / feedback history| cloudsql
   writer -.->|optional load jobs| bq
 
   storage --> jobs
@@ -97,15 +97,15 @@ Chrome 拡張はリアルタイム分析の一次処理を担当する。
 
 ## Cloud Run WebSocket Gateway
 
-Cloud Run Gateway は Chrome 拡張から WebSocket で `realtime_feature` を受け取り、1回の ingest で2つの経路に流す。
+Cloud Run Gateway は Chrome 拡張から WebSocket で `realtime_feature` を受け取り、リアルタイムの軽量なシステム処理まで担当する。
 
 1. **Memorystore for Redis**
-   - compact feature を保存する
+   - compact raw feature を保存する
    - 直近 window / latest state / cooldown に使う
    - リアルタイム feedback の判定で読む
 
 2. **Pub/Sub**
-   - full feature event を publish する
+   - compact raw feature、signal summary、decision log を publish する
    - Durable Writer / 後分析 pipeline へ渡す
    - Gateway は Cloud Storage や Cloud SQL へ同期保存しない
 
@@ -122,8 +122,13 @@ on realtime_feature:
     EXPIRE features:recent:{session_id} 3600
     EXPIRE session:state:{session_id} 3600
 
+  Realtime processing:
+    read 5s / 10s / 30s recent windows
+    calculate signal_summary
+    evaluate feedback decision with cooldown
+
   Pub/Sub:
-    publish topic feature-events with full_payload
+    publish topic feature-events with compact_raw_feature + signal_summary + decision_log
 ```
 
 Cloud Run の WebSocket は long-running request なので、request timeout と reconnect を前提にする。接続先 Cloud Run instance が変わっても問題ないよう、session state は instance memory ではなく Memorystore / Pub/Sub 側に置く。
@@ -171,15 +176,15 @@ Pub/Sub message:
 ```json
 {
   "event_id": "evt_123",
-  "type": "realtime_feature",
+  "type": "realtime_analysis_event",
   "schema_version": 1,
   "session_id": "sess_123",
   "t_ms": 1783067121751,
   "server_received_at_ms": 1783067121800,
   "payload": {
-    "meeting_provider": "google_meet",
-    "source": "chrome_side_panel",
-    "features": {}
+    "compact_raw_feature": {},
+    "signal_summary": {},
+    "decision_log": {}
   }
 }
 ```
@@ -188,15 +193,15 @@ Pub/Sub は最終保存先ではない。Cloud Run Durable Writer が subscribe 
 
 ## Durable Writer
 
-Durable Writer は Cloud Run service または Cloud Run worker として動かす。Pub/Sub subscription から feature event を受け取り、後分析用データとして保存する。
+Durable Writer は Cloud Run service または Cloud Run worker として動かす。Pub/Sub subscription から realtime analysis event を受け取り、後分析用データとして保存する。
 
 処理:
 
 1. Pub/Sub から message を受け取る
 2. `event_id` で冪等性を確保する
 3. session_id ごとに batch / buffer する
-4. raw feature event を JSONL として Cloud Storage に保存する
-5. session summary / feedback history を Cloud SQL に upsert する
+4. compact raw feature と signal summary / decision log を JSONL として Cloud Storage に保存する
+5. signal summary / decision log / feedback history を Cloud SQL に upsert する
 6. 保存成功後に Pub/Sub message を ack する
 7. 保存失敗時は nack / retry、繰り返し失敗は dead-letter topic に送る
 
@@ -204,13 +209,17 @@ Durable Writer は Cloud Run service または Cloud Run worker として動か�
 
 ```text
 Cloud Storage:
-  gs://reaction-engine-sessions/sessions/{session_id}/features/part-0001.jsonl
+  gs://reaction-engine-sessions/sessions/{session_id}/features/compact-raw/part-0001.jsonl
+  gs://reaction-engine-sessions/sessions/{session_id}/features/signal-summary/part-0001.jsonl
+  gs://reaction-engine-sessions/sessions/{session_id}/features/decision-log/part-0001.jsonl
   gs://reaction-engine-sessions/sessions/{session_id}/frames/...
   gs://reaction-engine-sessions/sessions/{session_id}/clips/...
 
 Cloud SQL for PostgreSQL:
   sessions
   participants
+  signal_summaries
+  decision_logs
   session_summaries
   feedback_events
   reports
@@ -220,7 +229,7 @@ Cloud Storage の JSONL は append ではなく、一定件数/一定時間ご�
 
 ## リアルタイム分析
 
-リアルタイム判定は Memorystore for Redis の直近 window だけを見る。Cloud SQL や Cloud Storage を判定のたびに読まない。
+リアルタイム判定は Cloud Run Gateway 内で行う。Gateway は Memorystore for Redis の直近 window だけを見る。Cloud SQL や Cloud Storage を判定のたびに読まない。
 
 入力:
 
@@ -232,6 +241,18 @@ Cloud Storage の JSONL は append ではなく、一定件数/一定時間ご�
 - `head_pose_estimate`
 - `gestures`
 - 将来: `audio_level`, `silence_ms`, `speaking_rate`
+
+Gateway で計算する signal summary:
+
+- latest
+- 5秒平均
+- 10秒平均
+- 直前 window との差分
+- session baseline との差分
+- slope
+- low / high state の継続時間
+- confidence
+- cooldown state
 
 出力:
 
@@ -251,13 +272,17 @@ Cloud Storage の JSONL は append ではなく、一定件数/一定時間ご�
 
 フィードバックは断定的な感情推定にしない。発表者がすぐ取れる小さい行動に落とす。
 
+リアルタイムでは LLM を基本的に使わない。低遅延・低コスト・安定性を優先し、rule + template + cooldown で `feedback_event` を返す。
+
 ## セッション後分析
 
-セッション後分析は、Memorystore state ではなく Durable Writer が保存した Cloud Storage の raw feature JSONL を基本入力にする。
+セッション後分析は、Memorystore state ではなく Durable Writer が保存した Cloud Storage の compact raw feature JSONL と signal summary / decision log を基本入力にする。
 
 入力:
 
-- Cloud Storage の raw feature JSONL
+- Cloud Storage の compact raw feature JSONL
+- Cloud Storage / Cloud SQL の signal summary
+- Cloud Storage / Cloud SQL の decision log
 - transcript chunk
 - feedback history
 - session summary
@@ -330,8 +355,9 @@ MVP では transcript を必須にしない。後分析の品質を上げる段�
 | --- | --- | --- |
 | 直近 feature window | リアルタイム判定 | Memorystore for Redis ZSET |
 | latest session state | realtime state / reconnect | Memorystore for Redis HASH |
-| full feature event | writer への処理待ち | Pub/Sub |
-| raw feature JSONL | 後分析 source of truth | Cloud Storage |
+| compact raw feature | 再集計・後分析 source of truth | Pub/Sub -> Cloud Storage |
+| signal summary | リアルタイム判断根拠・後分析 | Pub/Sub -> Cloud Storage / Cloud SQL |
+| decision log | feedback の根拠・評価 | Pub/Sub -> Cloud Storage / Cloud SQL |
 | session metadata | lifecycle / consent / role | Cloud SQL for PostgreSQL |
 | session summary | レポート・一覧表示 | Cloud SQL for PostgreSQL |
 | feedback history | UI / 評価 / report | Cloud SQL for PostgreSQL |
@@ -343,12 +369,13 @@ MVP では transcript を必須にしない。後分析の品質を上げる段�
 1. Chrome 拡張の feature event を安定化する
 2. Cloud Run WebSocket Gateway を実装する
 3. Memorystore for Redis に recent state を保存する
-4. Pub/Sub topic `feature-events` に full event を publish する
-5. Redis recent window から簡単な `feedback_event` を返す
-6. Cloud Run Durable Writer で Pub/Sub から raw JSONL を Cloud Storage に保存する
-7. Cloud SQL に session metadata / summary / feedback history を保存する
-8. session end で Cloud Run Job を起動する
-9. raw JSONL + transcript からセッション後レポートを生成する
+4. Gateway 内で signal summary と decision log を作る
+5. Memorystore recent window から簡単な `feedback_event` を返す
+6. Pub/Sub topic `feature-events` に compact raw feature + signal summary + decision log を publish する
+7. Cloud Run Durable Writer で Pub/Sub から JSONL を Cloud Storage に保存する
+8. Cloud SQL に session metadata / signal summary / decision log / feedback history を保存する
+9. session end で Cloud Run Job を起動する
+10. compact raw JSONL + signal summary + transcript からセッション後レポートを生成する
 
 ## 技術選定
 
@@ -374,5 +401,6 @@ MVP では transcript を必須にしない。後分析の品質を上げる段�
 - Cloud Run instance memory に session state を置かない。状態は Memorystore / Cloud SQL / Cloud Storage に逃がす。
 - Pub/Sub は at-least-once delivery 前提なので、Durable Writer は `event_id` で冪等にする。
 - Cloud Storage JSONL は chunk file として保存し、後分析時に `event_id` で dedupe する。
-- Cloud SQL に raw feature を全件 insert しない。Cloud SQL は metadata、summary、report、feedback history を持つ。
+- Cloud SQL に compact raw feature を全件 insert しない。Cloud SQL は metadata、signal summary、decision log、report、feedback history を持つ。
+- full face landmarks / face_parts は常時保存しない。debug mode、sampling、anomaly segment、明示的な consent がある場合だけ保存する。
 - BigQuery は MVP では必須ではない。セッション横断分析や評価が必要になった段階で追加する。
