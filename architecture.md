@@ -6,6 +6,26 @@ Reaction Engine は、Google Meet 上の発表・商談・授業・社内共有�
 
 重要な設計原則は、**動画や画像を常時サーバーへ送らない**こと。Chrome 拡張内で映像・音声を特徴量に変換し、サーバーには特徴量イベント、transcript、必要最小限の代表フレーム/短いクリップだけを送る。
 
+このアーキテクチャは Google Cloud の managed services を中心に構成する。
+
+## Google Cloud サービス対応表
+
+| 論理コンポーネント | Google Cloud サービス | 役割 |
+| --- | --- | --- |
+| Chrome Extension | Chrome MV3 | Meet 画面/音声取得、Edge Vision、feature event 送信 |
+| WebSocket Gateway | Cloud Run service | `realtime_feature` 受信、Redis/Pub/Sub への分岐、`feedback_event` 返却 |
+| Realtime state | Memorystore for Redis | 直近 window、latest state、feedback cooldown |
+| Durable event pipeline | Pub/Sub | full feature event を後続 worker に渡す durable queue |
+| Durable Writer | Cloud Run service / Cloud Run worker | Pub/Sub を購読し、Cloud Storage / Cloud SQL に保存 |
+| Raw feature storage | Cloud Storage | raw feature JSONL、代表フレーム、短いクリップ |
+| App database | Cloud SQL for PostgreSQL | session、participant、summary、feedback history、report |
+| Post-session jobs | Cloud Run Jobs | セッション後分析、レポート生成 |
+| Transcript | Speech-to-Text | 発話の文字起こし |
+| LLM report | Vertex AI / Gemini | 反応タイムライン、改善提案、レポート生成 |
+| Analytics optional | BigQuery | セッション横断分析、評価、集計 |
+| Secrets | Secret Manager | DB password、API keys、署名鍵 |
+| Observability | Cloud Logging / Cloud Monitoring | logs、metrics、alerts、latency/cost 監視 |
+
 ## 全体像
 
 ```mermaid
@@ -19,57 +39,75 @@ flowchart TB
     sidebar["Sidebar UI<br/>スコア・フィードバック表示"]
   end
 
-  subgraph realtime["Realtime Backend"]
-    gateway["WebSocket Gateway"]
-    redisRecent[("Redis ZSET / HASH<br/>recent window / latest state / cooldown")]
-    redisStream[("Redis Stream<br/>durable event pipeline")]
+  subgraph realtime["Realtime Path"]
+    gateway["Cloud Run<br/>WebSocket Gateway"]
+    redis[("Memorystore for Redis<br/>ZSET/HASH recent state")]
     decision["Realtime Decision<br/>window集計・rule・cooldown"]
   end
 
-  subgraph durable["Durable / Async"]
-    writer["Durable Writer<br/>batch persist / XACK / retry"]
-    objectStorage[("Object Storage<br/>raw feature JSONL / frames / clips")]
-    postgres[("Postgres<br/>sessions / summaries / reports")]
-    workers["Post-session Workers<br/>transcript・変化点検出・LLMレポート"]
+  subgraph durable["Durable / Async Path"]
+    pubsub["Pub/Sub<br/>feature-events topic"]
+    writer["Cloud Run Durable Writer<br/>batch persist / retry"]
+    storage[("Cloud Storage<br/>raw feature JSONL / frames / clips")]
+    cloudsql[("Cloud SQL for PostgreSQL<br/>sessions / summaries / reports")]
+    jobs["Cloud Run Jobs<br/>post-session analysis"]
+    stt["Speech-to-Text"]
+    vertex["Vertex AI / Gemini"]
+    bq[("BigQuery optional<br/>analytics / evaluation")]
   end
 
   presenter --> meet
   meet --> capture
   capture --> edge
-  edge -->|realtime_feature| gateway
-  gateway -->|compact event| redisRecent
-  gateway -->|full event| redisStream
-  redisRecent --> decision
+  edge -->|realtime_feature / WebSocket| gateway
+
+  gateway -->|compact feature| redis
+  redis --> decision
   decision -->|feedback_event| gateway
   gateway --> sidebar
   sidebar --> presenter
 
-  redisStream --> writer
-  writer --> objectStorage
-  writer --> postgres
-  objectStorage --> workers
-  postgres --> workers
-  workers --> postgres
+  gateway -->|full feature event| pubsub
+  pubsub --> writer
+  writer -->|raw JSONL| storage
+  writer -->|summary / feedback history| cloudsql
+  writer -.->|optional load jobs| bq
+
+  storage --> jobs
+  cloudsql --> jobs
+  jobs --> stt
+  jobs --> vertex
+  jobs -->|report| cloudsql
 ```
 
 ## Chrome 拡張の責務
 
-Chrome 拡張は、リアルタイム分析の一次処理を担当する。
+Chrome 拡張はリアルタイム分析の一次処理を担当する。
 
 - Google Meet の画面/タブ/音声をユーザー同意のもと取得する
 - `video -> canvas -> detector -> tracker -> features` の流れで特徴量を抽出する
 - MediaPipe Face Detector / Face Landmarker で顔 bbox と顔ランドマークを取得する
 - motion score、簡易 head pose、簡易 gaze、簡易 attention score、nod gesture を生成する
 - 将来的に audio level、silence、speaking rate などを生成する
-- `realtime_feature` を WebSocket で Gateway に送る
-- サーバーからの `feedback_event` を sidebar に表示する
+- `realtime_feature` を WebSocket で Cloud Run Gateway に送る
+- Gateway からの `feedback_event` を sidebar に表示する
 - 代表フレーム/短いクリップが必要な場合だけ upload 経路を使う
 
 現状は Meet DOM の参加者名・タイル ID との紐づけ、音声特徴量、本格的な視線推定は未実装。
 
-## Realtime Gateway
+## Cloud Run WebSocket Gateway
 
-Realtime Gateway は Chrome 拡張から WebSocket で `realtime_feature` を受け取り、1回の ingest で2つの Redis 経路に流す。
+Cloud Run Gateway は Chrome 拡張から WebSocket で `realtime_feature` を受け取り、1回の ingest で2つの経路に流す。
+
+1. **Memorystore for Redis**
+   - compact feature を保存する
+   - 直近 window / latest state / cooldown に使う
+   - リアルタイム feedback の判定で読む
+
+2. **Pub/Sub**
+   - full feature event を publish する
+   - Durable Writer / 後分析 pipeline へ渡す
+   - Gateway は Cloud Storage や Cloud SQL へ同期保存しない
 
 ```text
 on realtime_feature:
@@ -83,16 +121,16 @@ on realtime_feature:
     HSET session:state:{session_id} latest_feature compact_payload latest_t_ms t_ms
     EXPIRE features:recent:{session_id} 3600
     EXPIRE session:state:{session_id} 3600
-    XADD features:stream * event_id ... payload full_payload
+
+  Pub/Sub:
+    publish topic feature-events with full_payload
 ```
 
-Gateway は Postgres や Object Storage へ同期保存しない。低遅延 path では Redis への軽い書き込みまでに留める。
+Cloud Run の WebSocket は long-running request なので、request timeout と reconnect を前提にする。接続先 Cloud Run instance が変わっても問題ないよう、session state は instance memory ではなく Memorystore / Pub/Sub 側に置く。
 
-## Redis の役割
+## Memorystore for Redis
 
-### Redis ZSET / HASH
-
-リアルタイム判定用の短期 state。
+Memorystore for Redis はリアルタイム判定用の短期 state として使う。
 
 主な key:
 
@@ -105,53 +143,72 @@ feedback:cooldown:{session_id}
 用途:
 
 - 直近 10秒/30秒の feature window
-- 最新 feature state
-- session status
+- latest feature state
+- reconnect 時の session state
 - feedback cooldown
 - baseline / smoothing 用の一時状態
 
 TTL で消える前提。セッション後分析の source of truth にはしない。
 
-### Redis Stream
+## Pub/Sub
 
-Durable Writer へ渡す処理待ち event log。
+Pub/Sub は durable event pipeline として使う。Redis Stream の代わりに、Google Cloud managed service としての Pub/Sub を採用する。
 
-主な key:
+Topic:
 
 ```text
-features:stream
+feature-events
 ```
 
-用途:
+Subscription:
 
-- full `realtime_feature` の append
-- Durable Writer の batch 読み取り
-- worker 失敗時の pending / retry
+```text
+feature-events-durable-writer
+```
 
-Redis Stream は最終保存先ではない。writer が Object Storage / Postgres に保存した後、`XACK` する。
+Pub/Sub message:
+
+```json
+{
+  "event_id": "evt_123",
+  "type": "realtime_feature",
+  "schema_version": 1,
+  "session_id": "sess_123",
+  "t_ms": 1783067121751,
+  "server_received_at_ms": 1783067121800,
+  "payload": {
+    "meeting_provider": "google_meet",
+    "source": "chrome_side_panel",
+    "features": {}
+  }
+}
+```
+
+Pub/Sub は最終保存先ではない。Cloud Run Durable Writer が subscribe し、保存成功後に ack する。失敗時は retry / dead-letter topic を使う。
 
 ## Durable Writer
 
-Durable Writer は Redis Stream から event を読み、後分析用データとして保存する。
+Durable Writer は Cloud Run service または Cloud Run worker として動かす。Pub/Sub subscription から feature event を受け取り、後分析用データとして保存する。
 
 処理:
 
-1. `XREADGROUP` で `features:stream` を batch 読みする
-2. session_id ごとに event を group する
-3. raw feature event を JSONL として Object Storage に保存する
-4. session summary / feedback history を Postgres に upsert する
-5. 保存成功後に `XACK` する
-6. worker failure 時は `XAUTOCLAIM` で pending event を回収する
+1. Pub/Sub から message を受け取る
+2. `event_id` で冪等性を確保する
+3. session_id ごとに batch / buffer する
+4. raw feature event を JSONL として Cloud Storage に保存する
+5. session summary / feedback history を Cloud SQL に upsert する
+6. 保存成功後に Pub/Sub message を ack する
+7. 保存失敗時は nack / retry、繰り返し失敗は dead-letter topic に送る
 
 保存先:
 
 ```text
-Object Storage:
-  sessions/{session_id}/features/part-0001.jsonl
-  sessions/{session_id}/frames/...
-  sessions/{session_id}/clips/...
+Cloud Storage:
+  gs://reaction-engine-sessions/sessions/{session_id}/features/part-0001.jsonl
+  gs://reaction-engine-sessions/sessions/{session_id}/frames/...
+  gs://reaction-engine-sessions/sessions/{session_id}/clips/...
 
-Postgres:
+Cloud SQL for PostgreSQL:
   sessions
   participants
   session_summaries
@@ -159,11 +216,11 @@ Postgres:
   reports
 ```
 
-`event_id` を使って冪等に扱う。Object Storage の JSONL は重複許容にするか、後分析時に `event_id` で dedupe する。
+Cloud Storage の JSONL は append ではなく、一定件数/一定時間ごとの chunk file として作る。重複は `event_id` で後分析時に dedupe できるようにする。
 
 ## リアルタイム分析
 
-リアルタイム判定は Redis の直近 window だけを見る。RDB や Object Storage を判定のたびに読まない。
+リアルタイム判定は Memorystore for Redis の直近 window だけを見る。Cloud SQL や Cloud Storage を判定のたびに読まない。
 
 入力:
 
@@ -196,11 +253,11 @@ Postgres:
 
 ## セッション後分析
 
-セッション後分析は、Redis state ではなく Durable Writer が保存した raw feature JSONL を基本入力にする。
+セッション後分析は、Memorystore state ではなく Durable Writer が保存した Cloud Storage の raw feature JSONL を基本入力にする。
 
 入力:
 
-- Object Storage の raw feature JSONL
+- Cloud Storage の raw feature JSONL
 - transcript chunk
 - feedback history
 - session summary
@@ -208,11 +265,25 @@ Postgres:
 
 処理:
 
-1. feature timeline と transcript を timestamp で align する
-2. attention / motion / gaze / audio の変化点を検出する
-3. 変化点前後の発話内容と代表フレームを evidence としてまとめる
-4. LLM で report / coaching suggestion を生成する
-5. report を Postgres に保存する
+1. Cloud Run Job を session end で起動する
+2. feature timeline と transcript を timestamp で align する
+3. attention / motion / gaze / audio の変化点を検出する
+4. 変化点前後の発話内容と代表フレームを evidence としてまとめる
+5. Vertex AI / Gemini で report / coaching suggestion を生成する
+6. report を Cloud SQL に保存する
+7. 必要に応じて BigQuery に評価・分析用データを export する
+
+## Speech-to-Text / Transcript
+
+MVP では transcript を必須にしない。後分析の品質を上げる段階で Speech-to-Text を追加する。
+
+候補:
+
+- 会議音声または録音ファイルを Cloud Storage に保存
+- Cloud Run Job から Speech-to-Text の asynchronous recognition を実行
+- transcript chunk を Cloud SQL または Cloud Storage JSONL に保存
+
+リアルタイム字幕が必要になった場合は Streaming Speech-to-Text を検討する。ただし初期 MVP では feature event と反応変化の保存を優先する。
 
 ## データ契約
 
@@ -255,39 +326,53 @@ Postgres:
 
 ## 保存方針
 
-| データ | 用途 | 保存先 |
+| データ | 用途 | Google Cloud 保存先 |
 | --- | --- | --- |
-| 直近 feature window | リアルタイム判定 | Redis ZSET |
-| latest session state | realtime state / reconnect | Redis HASH |
-| full feature event | writer への処理待ち | Redis Stream |
-| raw feature JSONL | 後分析 source of truth | Object Storage |
-| session metadata | lifecycle / consent / role | Postgres |
-| session summary | レポート・一覧表示 | Postgres |
-| feedback history | UI / 評価 / report | Postgres |
-| 代表フレーム/短いクリップ | evidence / 詳細分析 | Object Storage |
+| 直近 feature window | リアルタイム判定 | Memorystore for Redis ZSET |
+| latest session state | realtime state / reconnect | Memorystore for Redis HASH |
+| full feature event | writer への処理待ち | Pub/Sub |
+| raw feature JSONL | 後分析 source of truth | Cloud Storage |
+| session metadata | lifecycle / consent / role | Cloud SQL for PostgreSQL |
+| session summary | レポート・一覧表示 | Cloud SQL for PostgreSQL |
+| feedback history | UI / 評価 / report | Cloud SQL for PostgreSQL |
+| 代表フレーム/短いクリップ | evidence / 詳細分析 | Cloud Storage |
+| 横断分析用データ | analytics / evaluation | BigQuery optional |
 
 ## MVP 実装順
 
 1. Chrome 拡張の feature event を安定化する
-2. Realtime Gateway を WebSocket server として実装する
-3. Redis ZSET / HASH に recent state を保存する
-4. Redis Stream に full event を append する
+2. Cloud Run WebSocket Gateway を実装する
+3. Memorystore for Redis に recent state を保存する
+4. Pub/Sub topic `feature-events` に full event を publish する
 5. Redis recent window から簡単な `feedback_event` を返す
-6. Durable Writer で Redis Stream から raw JSONL を保存する
-7. session end で final flush / post-session job enqueue する
-8. raw JSONL + transcript からセッション後レポートを生成する
+6. Cloud Run Durable Writer で Pub/Sub から raw JSONL を Cloud Storage に保存する
+7. Cloud SQL に session metadata / summary / feedback history を保存する
+8. session end で Cloud Run Job を起動する
+9. raw JSONL + transcript からセッション後レポートを生成する
 
 ## 技術選定
 
 - Extension: Chrome MV3
 - Edge Vision: MediaPipe Tasks Vision
 - Realtime Transport: WebSocket
-- Realtime State: Redis ZSET / HASH
-- Event Stream: Redis Streams
-- Durable Writer: Redis Stream consumer group
-- Durable Storage: Object Storage JSONL
-- App DB: Postgres
-- Post-session Workers: Node.js または Python
-- LLM Report: Gemini / OpenAI などの LLM
+- WebSocket Gateway: Cloud Run
+- Realtime State: Memorystore for Redis
+- Durable Event Pipeline: Pub/Sub
+- Durable Writer: Cloud Run service / worker
+- Durable Storage: Cloud Storage JSONL
+- App DB: Cloud SQL for PostgreSQL
+- Post-session Workers: Cloud Run Jobs
+- Transcript: Speech-to-Text
+- LLM Report: Vertex AI / Gemini
+- Analytics: BigQuery optional
+- Observability: Cloud Logging / Cloud Monitoring
+- Secrets: Secret Manager
 
-将来イベント量が増えた場合、Redis Stream は SQS / PubSub / Kafka / Redpanda に差し替え可能。MVP では Redis ひとつで recent state と stream を両方扱う。
+## 設計上の注意
+
+- Cloud Run WebSocket は timeout / reconnect を前提にする。
+- Cloud Run instance memory に session state を置かない。状態は Memorystore / Cloud SQL / Cloud Storage に逃がす。
+- Pub/Sub は at-least-once delivery 前提なので、Durable Writer は `event_id` で冪等にする。
+- Cloud Storage JSONL は chunk file として保存し、後分析時に `event_id` で dedupe する。
+- Cloud SQL に raw feature を全件 insert しない。Cloud SQL は metadata、summary、report、feedback history を持つ。
+- BigQuery は MVP では必須ではない。セッション横断分析や評価が必要になった段階で追加する。

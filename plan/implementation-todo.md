@@ -233,21 +233,21 @@ WebSocket で受け取った `feedback_event` を log だけでなく、発表�
 
 ## P2: バックエンド・分析基盤
 
-### 7. Realtime Gateway + Redis 保存経路の最小実装
+### 7. Cloud Run Realtime Gateway + Memorystore / Pub/Sub 経路の最小実装
 
 目的:
-現在のログサーバーを、`realtime_feature` を受け取り、Redis recent state と Redis Stream に保存し、簡単な `feedback_event` を返せる gateway に発展させる。
+現在のログサーバーを、`realtime_feature` を受け取り、Memorystore for Redis の recent state と Pub/Sub に保存し、簡単な `feedback_event` を返せる gateway に発展させる。
 
 触るファイル:
 - `scripts/ws-log-server.cjs`
 - 必要なら `package.json`
 
 実装方針:
-- Redis client を追加する。MVP では Redis が未設定なら in-memory fallback でもよい。
+- Redis client と Pub/Sub publisher を追加する。MVP では Redis / Pub/Sub が未設定なら in-memory fallback でもよい。
 - 受信した feature に `event_id` と `server_received_at_ms` を付ける。
 - `features:recent:{session_id}` に compact payload を `ZADD` する。
 - `session:state:{session_id}` に latest feature を `HSET` する。
-- `features:stream` に full payload を `XADD` する。
+- Pub/Sub topic `feature-events` に full payload を publish する。
 - Redis recent window は `ZREMRANGEBYSCORE` と `EXPIRE` で保持量を制御する。
 - 直近 10秒程度の window で簡単な rule を作る。
   - face_count が 0 に近い
@@ -258,33 +258,33 @@ WebSocket で受け取った `feedback_event` を log だけでなく、発表�
 受け入れ条件:
 - `node scripts/ws-log-server.cjs` で起動できる。
 - extension から feature を送ると console に記録される。
-- Redis が設定されている場合、recent ZSET / state HASH / Stream に event が保存される。
-- Redis が未設定または接続失敗の場合でも、ローカル開発用の in-memory 処理で最低限動く。
+- Redis / Pub/Sub が設定されている場合、recent ZSET / state HASH / Pub/Sub topic に event が保存される。
+- Redis / Pub/Sub が未設定または接続失敗の場合でも、ローカル開発用の in-memory 処理で最低限動く。
 - 条件に応じて sidebar が feedback を受け取れる。
 - `npm run check` が通る。
 
-### 8. Durable Writer の最小実装
+### 8. Cloud Run Durable Writer の最小実装
 
 目的:
-Redis Stream に append された `realtime_feature` を batch で読み、後分析用の raw feature JSONL と summary を保存する。
+Pub/Sub に publish された `realtime_feature` を読み、後分析用の raw feature JSONL と summary を保存する。
 
 触るファイル:
 - 追加候補: `scripts/durable-writer.cjs`
 - 必要なら `package.json`
 
 実装方針:
-- Redis Stream consumer group `durable-writers` を作成する。
-- `XREADGROUP` で `features:stream` から event を batch 読みする。
-- session_id ごとに group し、まずはローカルファイルまたは将来の Object Storage 相当へ JSONL chunk として保存する。
-- 保存成功後に `XACK` する。
-- worker 再起動時に pending event を `XAUTOCLAIM` で回収できる設計にする。
+- Pub/Sub subscription `feature-events-durable-writer` を作成する。
+- Pub/Sub から event を pull または push で受け取る。
+- session_id ごとに group し、まずはローカルファイルまたは将来の Cloud Storage 相当へ JSONL chunk として保存する。
+- 保存成功後に Pub/Sub message を ack する。
+- 失敗時は retry し、繰り返し失敗する message は dead-letter topic に送れる設計にする。
 - `event_id` で重複処理を許容できるようにする。
 
 受け入れ条件:
-- Redis Stream に入った event を writer が読み取れる。
+- Pub/Sub に入った event を writer が読み取れる。
 - JSONL として raw event が保存される。
-- 保存成功した event は `XACK` される。
-- writer が途中で落ちても pending event を再処理できる設計メモまたは実装がある。
+- 保存成功した event は ack される。
+- writer が途中で落ちても Pub/Sub retry で再処理できる設計メモまたは実装がある。
 - `npm run check` が通る。
 
 ### 9. Session / Ingest API の設計と stub
@@ -303,15 +303,15 @@ Redis Stream に append された `realtime_feature` を batch で読み、後�
 - `GET /sessions/:session_id/report`
 - `realtime_feature` schema
 - `feedback_event` schema
-- Redis key design
-- Redis Stream event envelope
-- Durable Writer の保存先と ack/retry 方針
+- Memorystore key design
+- Pub/Sub event envelope
+- Cloud Run Durable Writer の保存先と ack/retry/dead-letter 方針
 - privacy / retention 前提
 
 受け入れ条件:
 - Chrome extension の event payload と矛盾しない schema がある。
 - 画像本体を常時送らない方針が明記されている。
-- リアルタイム判定用 Redis state と後分析用 raw JSONL の役割が分かれている。
+- リアルタイム判定用 Memorystore state と後分析用 raw JSONL の役割が分かれている。
 
 ### 10. セッション後分析の設計
 
