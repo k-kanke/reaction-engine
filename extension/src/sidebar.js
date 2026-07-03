@@ -127,7 +127,7 @@ async function createMediaPipeFaceLandmarker() {
       },
       runningMode: "VIDEO",
       numFaces: 4,
-      outputFaceBlendshapes: false,
+      outputFaceBlendshapes: true,
       minFaceDetectionConfidence: 0.45,
       minFacePresenceConfidence: 0.45,
       minTrackingConfidence: 0.45
@@ -137,7 +137,16 @@ async function createMediaPipeFaceLandmarker() {
       modelVersion: "mediapipe-face-landmarker-v1",
       detect(source, timestampMs) {
         const result = landmarker.detectForVideo(source, timestampMs);
-        return result.faceLandmarks.map((landmarks) => buildFacePartsFromLandmarks(landmarks));
+        return result.faceLandmarks.map((landmarks, i) => {
+          const parts = buildFacePartsFromLandmarks(landmarks);
+          const blendshapes = result.faceBlendshapes?.[i]?.categories;
+          if (blendshapes) {
+            parts.blendshapes = Object.fromEntries(
+              blendshapes.map((b) => [b.categoryName, round(b.score)])
+            );
+          }
+          return parts;
+        });
       }
     };
   } catch (error) {
@@ -329,6 +338,8 @@ function buildFacePartsFromLandmarks(landmarks) {
   const mouth = summarizeLandmarkGroup(landmarks, [61, 291, 13, 14]);
   const nose = summarizeLandmarkGroup(landmarks, [1, 4, 98, 327]);
   const headPose = estimateHeadPose(landmarks);
+  const iris = estimateIris(landmarks);
+  const gazeFromIris = iris ? estimateGazeFromIris(iris) : null;
 
   return {
     face_bbox,
@@ -344,9 +355,66 @@ function buildFacePartsFromLandmarks(landmarks) {
     },
     mouth_openness: round(mouthOpenness(mouth, face_bbox)),
     head_pose_estimate: headPose,
-    gaze_estimate: estimateGazeFromHeadPose(headPose),
+    iris,
+    gaze_estimate: gazeFromIris ?? estimateGazeFromHeadPose(headPose),
     landmark_count: landmarks.length
   };
+}
+
+function estimateIris(landmarks) {
+  // Iris landmarks: left 468-472 (468=center), right 473-477 (473=center)
+  // Eye corner landmarks: left inner 133, outer 33; right inner 362, outer 263
+  const leftCenter = landmarks[468];
+  const rightCenter = landmarks[473];
+  if (!leftCenter || !rightCenter) return null;
+
+  const leftInner = landmarks[133];
+  const leftOuter = landmarks[33];
+  const rightInner = landmarks[362];
+  const rightOuter = landmarks[263];
+  if (!leftInner || !leftOuter || !rightInner || !rightOuter) return null;
+
+  // Iris position ratio within eye (0=outer corner, 1=inner corner)
+  const leftRatioX = (leftCenter.x - leftOuter.x) / Math.max(0.001, leftInner.x - leftOuter.x);
+  const rightRatioX = (rightCenter.x - rightOuter.x) / Math.max(0.001, rightInner.x - rightOuter.x);
+
+  const leftTop = landmarks[159];
+  const leftBottom = landmarks[145];
+  const rightTop = landmarks[386];
+  const rightBottom = landmarks[374];
+
+  const leftRatioY = (leftTop && leftBottom)
+    ? (leftCenter.y - leftTop.y) / Math.max(0.001, leftBottom.y - leftTop.y)
+    : 0.5;
+  const rightRatioY = (rightTop && rightBottom)
+    ? (rightCenter.y - rightTop.y) / Math.max(0.001, rightBottom.y - rightTop.y)
+    : 0.5;
+
+  return {
+    left: {
+      center: { x: round(leftCenter.x), y: round(leftCenter.y), z: round(leftCenter.z ?? 0) },
+      ratio_x: round(clamp(leftRatioX, 0, 1)),
+      ratio_y: round(clamp(leftRatioY, 0, 1))
+    },
+    right: {
+      center: { x: round(rightCenter.x), y: round(rightCenter.y), z: round(rightCenter.z ?? 0) },
+      ratio_x: round(clamp(rightRatioX, 0, 1)),
+      ratio_y: round(clamp(rightRatioY, 0, 1))
+    },
+    avg_ratio_x: round(clamp((leftRatioX + rightRatioX) / 2, 0, 1)),
+    avg_ratio_y: round(clamp((leftRatioY + rightRatioY) / 2, 0, 1))
+  };
+}
+
+function estimateGazeFromIris(iris) {
+  const x = iris.avg_ratio_x;
+  const y = iris.avg_ratio_y;
+  if (x > 0.35 && x < 0.65 && y > 0.3 && y < 0.7) return "screen";
+  if (x <= 0.35) return "left";
+  if (x >= 0.65) return "right";
+  if (y <= 0.3) return "up";
+  if (y >= 0.7) return "down";
+  return "unknown";
 }
 
 function bboxFromLandmarks(landmarks) {
@@ -682,6 +750,8 @@ function buildFeatures(faces, motionScore) {
       mouth_openness: face.parts?.mouth_openness ?? null,
       head_pose_estimate: face.parts?.head_pose_estimate ?? null,
       gaze_estimate: face.parts?.gaze_estimate ?? "unknown",
+      iris: face.parts?.iris ?? null,
+      blendshapes: face.parts?.blendshapes ?? null,
       landmark_count: face.parts?.landmark_count ?? 0,
       gestures: faceGestures.find((item) => item.audience_id === face.audience_id)?.gestures ?? {
         nod_count: 0,
