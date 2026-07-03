@@ -1139,7 +1139,8 @@ function drawDebugFrame(faces, features) {
     );
     ctx.fillStyle = "#34a853";
     ctx.font = "12px system-ui, sans-serif";
-    ctx.fillText(face.audience_id, face.x * PREVIEW_WIDTH, Math.max(14, face.y * PREVIEW_HEIGHT - 6));
+    const label = face.participant_name || face.audience_id;
+    ctx.fillText(label, face.x * PREVIEW_WIDTH, Math.max(14, face.y * PREVIEW_HEIGHT - 6));
     drawFacePartPoints(face.parts?.face_parts);
   }
 
