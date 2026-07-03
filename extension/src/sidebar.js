@@ -64,6 +64,7 @@ let frameCanvas = null;
 let captureStartTs = 0;
 let audioContext = null;
 let micStream = null;
+let micRequestError = null;
 let vadTimer = null;
 const vad = {
   self: createVadState(),
@@ -217,6 +218,19 @@ function createNativeFaceDetector() {
 async function startCapture() {
   try {
     setStatus("Requesting capture");
+    // マイク要求を画面共有と "同じクリック操作の中" で同時に開始する。
+    // 後追いで呼ぶと side panel では許可プロンプトが dismiss されやすいため、
+    // クリック直下(awaitより前)で getUserMedia を発火させて安定化する。
+    // 失敗しても画面共有は続行できるよう catch でエラーだけ retain。
+    micRequestError = null;
+    micStream = null;
+    const micPromise = navigator.mediaDevices
+      .getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+      .catch((error) => {
+        micRequestError = error;
+        return null;
+      });
+
     stream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         frameRate: { ideal: 15, max: 30 },
@@ -225,6 +239,8 @@ async function startCapture() {
       },
       audio: true
     });
+
+    micStream = await micPromise;
 
     elements.sourceVideo.srcObject = stream;
     await elements.sourceVideo.play();
@@ -1022,16 +1038,27 @@ async function setupAudioAnalysis(displayStream) {
     sendDiagnostic("audio_status", "other(tab) no audio track — 「タブの音声を共有」未チェックの可能性");
   }
 
-  // 自分 = マイク（AEC on で相手声のかぶりを消す）。失敗してもタブ音声は生かす
+  // 自分 = マイク。startCapture がクリック直下で取得済み。ここでは接続のみ。
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-    });
-    const micSrc = audioContext.createMediaStreamSource(micStream);
-    vad.self.analyser = makeAnalyser(micSrc);
-    sendDiagnostic("audio_status", "self(mic) VAD enabled");
-  } catch (error) {
-    sendDiagnostic("audio_init_error", `self(mic) failed: ${error.name} ${error.message}`);
+    const perm = await navigator.permissions.query({ name: "microphone" });
+    sendDiagnostic("audio_status", `mic permission: ${perm.state}`);
+  } catch {
+    // permissions API 非対応環境は無視
+  }
+
+  if (micStream) {
+    try {
+      const micSrc = audioContext.createMediaStreamSource(micStream);
+      vad.self.analyser = makeAnalyser(micSrc);
+      sendDiagnostic("audio_status", "self(mic) VAD enabled");
+    } catch (error) {
+      sendDiagnostic("audio_init_error", `self(mic) connect failed: ${error.name} ${error.message}`);
+    }
+  } else {
+    const reason = micRequestError
+      ? `${micRequestError.name} ${micRequestError.message}`
+      : "no mic stream";
+    sendDiagnostic("audio_init_error", `self(mic) failed: ${reason}（chrome://settings/content/microphone を確認）`);
   }
 }
 
