@@ -39,6 +39,8 @@ Reaction Engine は、Google Meet 上の発表・商談・授業・社内共有�
 - 全体フィードバックフロー: セッション後の保存・集計・レポート生成を行う
 - 画像処理フロー: baseline 用 screenshot を扱い、個人差補正の基準値を作る
 
+画像処理フローで作った `participant_baselines` は、リアルタイムフローと全体フィードバックフローの両方で使う。baseline frame そのものを常時使い回すのではなく、画像処理フローで基準値に変換してから参照する。
+
 ```mermaid
 flowchart TB
   presenter["発表者"]
@@ -101,9 +103,9 @@ flowchart TB
   mediaApi -->|baseline_capture_completed| baselinePubsub
   baselinePubsub --> baselineJob
   baselineJob -->|read baseline frames / manifest| baselineStorage
-  storage -.->|read same-window feature summaries| baselineJob
   baselineJob -->|participant_baselines| cloudsql
-  cloudsql -.->|baseline cache source| gateway
+  baselineJob -.->|baseline cache| redis
+  cloudsql -.->|baseline source| gateway
 
   storage --> jobs
   cloudsql --> jobs
@@ -114,6 +116,75 @@ flowchart TB
   style baselineImage fill:#fff7cc,stroke:#facc15,stroke-width:2px,color:#111827
   classDef baselineNode fill:#fffbeb,stroke:#f59e0b,stroke-width:1px,color:#111827
   class mediaApi,baselineStorage,baselinePubsub,baselineJob baselineNode
+```
+
+## 概要データフロー
+
+この図は、実装サービス名ではなく役割名で見たデータフロー。詳細な Google Cloud 構成を見る前に、どのデータがどのフローで使われるかを把握するための図。
+
+```mermaid
+flowchart TB
+  user["発表者"]
+  meeting["オンライン会議"]
+  extension["ブラウザ拡張<br/>画面・音声取得"]
+  feature["特徴量抽出<br/>顔・姿勢・視線・動き・音声"]
+
+  subgraph realtimeFlow["リアルタイムフロー"]
+    direction TB
+    realtimeServer["リアルタイム受信サーバー"]
+    temporaryState["短期状態ストア<br/>直近ウィンドウ・演算結果・抑制状態"]
+    compute["システム演算層<br/>変化率・平均との差分・判定材料"]
+    realtimeDecision["即時判定<br/>ルール・抑制・文言選択"]
+    presenterFeedback["発表中フィードバック"]
+  end
+
+  subgraph imageFlow["画像処理フロー"]
+    direction TB
+    imageUpload["画像アップロード受付"]
+    imageStore["基準画像ストレージ"]
+    baselineWorker["基準値作成ワーカー"]
+    baselineData["参加者基準値<br/>個人差補正データ"]
+  end
+
+  subgraph overallFlow["全体フィードバックフロー"]
+    direction TB
+    eventQueue["分析イベントキュー"]
+    durableWriter["永続化ワーカー"]
+    durableStore["分析データ保管<br/>特徴量・判定根拠・履歴"]
+    reportWorker["セッション後分析ワーカー"]
+    report["全体フィードバック<br/>時系列・改善提案・レポート"]
+  end
+
+  user --> meeting
+  meeting --> extension
+  extension --> feature
+
+  feature -->|特徴量イベント| realtimeServer
+  realtimeServer --> temporaryState
+  temporaryState -->|直近ウィンドウ参照| compute
+  compute -->|演算結果・抑制状態更新| temporaryState
+  compute --> realtimeDecision
+  realtimeDecision --> presenterFeedback
+  presenterFeedback --> user
+
+  compute -->|要約済み分析イベント| eventQueue
+  eventQueue --> durableWriter
+  durableWriter --> durableStore
+  durableStore --> reportWorker
+  reportWorker --> report
+  report --> user
+
+  extension -->|基準画像| imageUpload
+  imageUpload --> imageStore
+  imageUpload -->|処理開始イベント| baselineWorker
+  imageStore --> baselineWorker
+  baselineWorker --> baselineData
+  baselineData -.->|個人差補正| compute
+  baselineData -.->|基準値補正| reportWorker
+
+  style imageFlow fill:#fff7cc,stroke:#facc15,stroke-width:2px,color:#111827
+  style realtimeFlow fill:#eef6ff,stroke:#60a5fa,stroke-width:2px,color:#111827
+  style overallFlow fill:#f0fdf4,stroke:#22c55e,stroke-width:2px,color:#111827
 ```
 
 ## Chrome 拡張の責務
@@ -203,8 +274,9 @@ Cloud Run Gateway は Chrome 拡張から WebSocket で `realtime_feature` を�
 
 1. **Memorystore for Redis**
    - compact raw feature を保存する
-   - 直近 window / latest state / cooldown に使う
+   - 直近 window / latest state / computed state / cooldown に使う
    - リアルタイム feedback の判定で読む
+   - 物理的に別の短期 state store を増やすのではなく、同じ Redis 内で key を分ける
 
 2. **Pub/Sub**
    - compact raw feature、signal summary、decision log を publish する
@@ -226,9 +298,12 @@ on realtime_feature:
 
   Realtime processing:
     read 5s / 10s / 30s recent windows
+    read baseline / cooldown / latest computed state
     calculate signal_summary
     create decision_log
     evaluate feedback decision with cooldown
+    HSET session:computed:{session_id} latest_signal_summary latest_decision_log
+    HSET feedback:cooldown:{session_id} feedback_type last_emitted_at_ms
 
   Pub/Sub:
     publish topic feature-events with compact_raw_feature + signal_summary + decision_log
@@ -265,6 +340,7 @@ Memorystore for Redis はリアルタイム判定用の短期 state として使
 ```text
 features:recent:{session_id}
 session:state:{session_id}
+session:computed:{session_id}
 feedback:cooldown:{session_id}
 ```
 
@@ -272,9 +348,12 @@ feedback:cooldown:{session_id}
 
 - 直近 10秒/30秒の feature window
 - latest feature state
+- latest signal summary / latest decision log
 - reconnect 時の session state
 - feedback cooldown
 - baseline / smoothing 用の一時状態
+
+`features:recent:*` は演算前の直近 window、`session:computed:*` は演算後のリアルタイム参照 state、`feedback:cooldown:*` は同じ feedback を出しすぎないための抑制 state。どれも同じ Memorystore for Redis の key であり、別の短期状態ストアを追加するわけではない。
 
 TTL で消える前提。セッション後分析の source of truth にはしない。
 
@@ -375,24 +454,25 @@ Cloud Storage の JSONL は append ではなく、一定件数/一定時間ご�
 
 ## Baseline Calibration Job
 
-Baseline Calibration Job は Cloud Run Jobs として動かす。session 開始直後の baseline frames と同じ時間帯の compact raw feature / signal summary をまとめて読み、参加者または face track ごとの baseline を作る。
+Baseline Calibration Job は Cloud Run Jobs として動かす。session 開始直後の baseline frames / manifest を読み、参加者または face track ごとの `participant_baselines` を作る。
+
+`participant_baselines` は画像処理フローの出力であり、リアルタイムフローと全体フィードバックフローの両方から参照される。
 
 入力:
 
 - `baseline-calibration-events`
 - Cloud Storage の baseline frames
 - Cloud Storage の baseline manifest
-- Cloud Storage の compact raw feature JSONL
-- Cloud Storage / Cloud SQL の signal summary
+- 必要に応じて Cloud SQL の同時間帯 signal summary
 
 処理:
 
 1. `session_id` と baseline capture window を受け取る。
 2. baseline frames と manifest を読む。
-3. 同じ時間帯の compact raw feature / signal summary を読む。
+3. 必要なら同じ時間帯の signal summary を Cloud SQL から補助情報として読む。
 4. `audience_id` / `tile_id` / `face_track_id` ごとに baseline を計算する。
 5. `participant_baselines` を Cloud SQL に保存する。
-6. 必要なら `session:baseline:{session_id}` として Memorystore に cache する。
+6. リアルタイム補正用に `session:baseline:{session_id}` として Memorystore に cache する。
 
 保存する baseline 例:
 
