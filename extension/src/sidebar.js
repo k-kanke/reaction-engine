@@ -37,6 +37,7 @@ let stream = null;
 let analysisTimer = null;
 let eventTimer = null;
 let previousFrame = null;
+let analysisRunning = false;
 let latestFeatures = createEmptyFeatures();
 let ws = null;
 let faceDetectorBackend = null;
@@ -230,21 +231,28 @@ function stopCapture() {
 }
 
 async function runAnalysisFrame() {
-  const video = elements.sourceVideo;
-  if (!video.videoWidth || !video.videoHeight) return;
+  if (analysisRunning) return;
+  analysisRunning = true;
 
-  ctx.drawImage(video, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+  try {
+    const video = elements.sourceVideo;
+    if (!video.videoWidth || !video.videoHeight) return;
 
-  const imageData = ctx.getImageData(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
-  const motionScore = calculateMotionScore(imageData);
-  previousFrame = imageData;
+    ctx.drawImage(video, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
 
-  const faces = await analyzeFaces();
-  const trackedFaces = updateTracks(faces);
-  updateGestureHistory(trackedFaces);
-  latestFeatures = buildFeatures(trackedFaces, motionScore);
-  drawDebugFrame(trackedFaces, latestFeatures);
-  updateMetrics(latestFeatures);
+    const imageData = ctx.getImageData(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    const motionScore = calculateMotionScore(imageData);
+    previousFrame = imageData;
+
+    const faces = await analyzeFaces();
+    const trackedFaces = updateTracks(faces);
+    updateGestureHistory(trackedFaces);
+    latestFeatures = buildFeatures(trackedFaces, motionScore);
+    drawDebugFrame(trackedFaces, latestFeatures);
+    updateMetrics(latestFeatures);
+  } finally {
+    analysisRunning = false;
+  }
 }
 
 async function detectFaces() {
