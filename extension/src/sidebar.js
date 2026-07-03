@@ -26,6 +26,7 @@ const elements = {
   sourceVideo: document.getElementById("sourceVideo"),
   startButton: document.getElementById("startButton"),
   stopButton: document.getElementById("stopButton"),
+  micPermButton: document.getElementById("micPermButton"),
   eventLog: document.getElementById("eventLog"),
   videoFile: document.getElementById("videoFile"),
   uploadPlayButton: document.getElementById("uploadPlayButton"),
@@ -87,6 +88,7 @@ initEdgeVision();
 
 elements.startButton.addEventListener("click", startCapture);
 elements.stopButton.addEventListener("click", stopCapture);
+elements.micPermButton.addEventListener("click", openMicPermission);
 elements.connectButton.addEventListener("click", toggleWebSocket);
 elements.videoFile.addEventListener("change", handleVideoFileSelect);
 elements.uploadPlayButton.addEventListener("click", startVideoFileAnalysis);
@@ -213,6 +215,12 @@ function createNativeFaceDetector() {
     logEvent({ type: "native_face_detector_error", message: error.message });
     return null;
   }
+}
+
+function openMicPermission() {
+  // side panel からは getUserMedia の許可プロンプトが出せないため、
+  // 通常タブで一度だけ許可を取得する（許可は拡張オリジンに保存され再利用される）。
+  chrome.tabs.create({ url: chrome.runtime.getURL("src/permission.html") });
 }
 
 async function startCapture() {

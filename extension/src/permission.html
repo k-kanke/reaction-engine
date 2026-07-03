@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <title>マイクの許可 - Reaction Engine</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, sans-serif;
+        max-width: 480px;
+        margin: 40px auto;
+        padding: 0 16px;
+        line-height: 1.7;
+        color: #202124;
+      }
+      button {
+        font-size: 16px;
+        padding: 10px 22px;
+        cursor: pointer;
+        border-radius: 6px;
+        border: 1px solid #1a73e8;
+        background: #1a73e8;
+        color: #fff;
+      }
+      #status {
+        margin-top: 18px;
+        font-weight: bold;
+        white-space: pre-wrap;
+      }
+      .ok {
+        color: #188038;
+      }
+      .err {
+        color: #c5221f;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>🎤 マイクの許可</h2>
+    <p>
+      Reaction Engine が「自分の声」を解析するためにマイクを使います。side panel
+      からは許可プロンプトが正しく出せないため、この通常タブで一度だけ許可してください。
+    </p>
+    <p>一度許可すれば、以降は side panel の Start Capture で自動的に使えます。</p>
+    <button id="grant">マイクを許可する</button>
+    <p id="status"></p>
+    <script src="permission.js"></script>
+  </body>
+</html>
