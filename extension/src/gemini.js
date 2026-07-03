@@ -29,7 +29,7 @@ Output a JSON object with this structure:
   }
 }
 
-Analyze facial expressions, body language, gaze direction, nodding, and any visible reactions. Be specific about timing.
+The video is sampled at 1 frame per second. Analyze every second of the video. For each participant, report their facial expressions, body language, gaze direction, nodding, and any visible reactions. Be specific about timing (use MM:SS format).
 Respond ONLY with the JSON object, no markdown fences.`;
 
 export async function analyzeVideoWithGemini(apiKey, videoFile, onProgress) {
