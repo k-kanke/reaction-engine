@@ -44,6 +44,7 @@ let faceLandmarkerBackend = null;
 let tracks = [];
 let trackHistory = new Map();
 let nextTrackId = 1;
+let latestTileSnapshot = null;
 
 elements.sessionId.textContent = sessionId;
 restoreSettings();
@@ -52,6 +53,13 @@ initEdgeVision();
 elements.startButton.addEventListener("click", startCapture);
 elements.stopButton.addEventListener("click", stopCapture);
 elements.connectButton.addEventListener("click", toggleWebSocket);
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === "meet_tile_snapshot") {
+    latestTileSnapshot = message;
+    logEvent(message);
+  }
+});
 
 async function restoreSettings() {
   const stored = await chrome.storage.local.get(["wsUrl"]);

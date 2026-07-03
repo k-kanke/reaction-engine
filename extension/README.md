@@ -14,6 +14,7 @@ Google Meet 用の Chrome 拡張 MVP です。sidebar から画面キャプチ�
 - `attention_score` の暫定算出
 - 1秒ごとの `realtime_feature` 生成
 - WebSocket URL が設定されている場合の event 送信
+- Google Meet DOM からの参加者タイル候補抽出(`meet_tile_snapshot`)
 
 ## ロード手順
 
@@ -84,6 +85,28 @@ ws://localhost:8787/realtime
   }
 }
 ```
+
+## Meet タイル抽出
+
+Google Meet ページの content script が `MutationObserver` と定期スキャンで参加者タイル候補を抽出し、以下のような `meet_tile_snapshot` を side panel へ送ります。side panel の Feature Events ログで最新の snapshot を確認できます。
+
+```json
+{
+  "type": "meet_tile_snapshot",
+  "t_ms": 1780000000000,
+  "tiles": [
+    {
+      "tile_id": "tile_1",
+      "participant_name": "山田 太郎",
+      "tile_bbox_viewport": { "x": 100, "y": 120, "w": 320, "h": 180 },
+      "is_speaking_candidate": false,
+      "source": "meet_dom"
+    }
+  ]
+}
+```
+
+class name には依存せず、`role` / `aria-label` / 表示テキスト / `video` 要素との近傍関係 / `getBoundingClientRect()` を組み合わせた heuristic で候補を作っています。Meet の DOM 構造が変わると `participant_name` が取得できないことがありますが、その場合も `tile_bbox_viewport` のみの候補として扱われ、画面キャプチャの顔解析には影響しません。
 
 ## 注意
 
