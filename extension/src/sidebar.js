@@ -349,10 +349,7 @@ async function runAnalysisFrame() {
     const motionScore = calculateMotionScore(imageData);
     previousFrame = imageData;
 
-    // Create ImageBitmap for MediaPipe — avoids WebGL context issues in side panel
-    const bitmap = await createImageBitmap(canvas);
-    const faces = await analyzeFaces(bitmap);
-    bitmap.close();
+    const faces = await analyzeWithTileCrop();
     const trackedFaces = updateTracks(faces);
     updateGestureHistory(trackedFaces);
     latestFeatures = buildFeatures(trackedFaces, motionScore);
@@ -360,6 +357,105 @@ async function runAnalysisFrame() {
     updateMetrics(latestFeatures);
   } finally {
     analysisRunning = false;
+  }
+}
+
+async function analyzeWithTileCrop() {
+  const tiles = latestTileSnapshot?.tiles;
+  if (!tiles?.length) {
+    // No tile info — run detection on the full frame
+    const bitmap = await createImageBitmap(canvas);
+    const faces = await analyzeFaces(bitmap);
+    bitmap.close();
+    return faces;
+  }
+
+  // Scale tile viewport coords to canvas coords
+  const video = elements.sourceVideo;
+  const scaleX = PREVIEW_WIDTH / video.videoWidth;
+  const scaleY = PREVIEW_HEIGHT / video.videoHeight;
+
+  const allFaces = [];
+
+  for (const tile of tiles) {
+    const tb = tile.tile_bbox_viewport;
+    const cx = Math.round(tb.x * scaleX);
+    const cy = Math.round(tb.y * scaleY);
+    const cw = Math.round(tb.w * scaleX);
+    const ch = Math.round(tb.h * scaleY);
+
+    if (cw < 30 || ch < 30) continue;
+
+    let tileBitmap;
+    try {
+      tileBitmap = await createImageBitmap(canvas, cx, cy, cw, ch);
+    } catch {
+      continue;
+    }
+
+    const tileFaces = await analyzeFaces(tileBitmap);
+    tileBitmap.close();
+
+    // Map tile-local normalized coords back to full-frame normalized coords
+    for (const face of tileFaces) {
+      const tileNormX = cx / PREVIEW_WIDTH;
+      const tileNormY = cy / PREVIEW_HEIGHT;
+      const tileNormW = cw / PREVIEW_WIDTH;
+      const tileNormH = ch / PREVIEW_HEIGHT;
+
+      face.x = tileNormX + face.x * tileNormW;
+      face.y = tileNormY + face.y * tileNormH;
+      face.w = face.w * tileNormW;
+      face.h = face.h * tileNormH;
+      face.tile_id = tile.tile_id;
+      face.participant_name = tile.participant_name ?? null;
+
+      if (face.parts) {
+        remapPartsToFullFrame(face.parts, tileNormX, tileNormY, tileNormW, tileNormH);
+      }
+
+      allFaces.push(face);
+    }
+  }
+
+  return allFaces;
+}
+
+function remapPartsToFullFrame(parts, offX, offY, scaleW, scaleH) {
+  // Remap face_bbox
+  if (parts.face_bbox) {
+    parts.face_bbox.x = offX + parts.face_bbox.x * scaleW;
+    parts.face_bbox.y = offY + parts.face_bbox.y * scaleH;
+    parts.face_bbox.w = parts.face_bbox.w * scaleW;
+    parts.face_bbox.h = parts.face_bbox.h * scaleH;
+  }
+
+  // Remap face part landmark points
+  if (parts.face_parts) {
+    for (const partKey of Object.keys(parts.face_parts)) {
+      const group = parts.face_parts[partKey];
+      if (group?.points) {
+        for (const p of group.points) {
+          p.x = round(offX + p.x * scaleW);
+          p.y = round(offY + p.y * scaleH);
+        }
+        if (group.center) {
+          group.center.x = round(offX + group.center.x * scaleW);
+          group.center.y = round(offY + group.center.y * scaleH);
+        }
+      }
+    }
+  }
+
+  // Remap iris centers
+  if (parts.iris) {
+    for (const side of ["left", "right"]) {
+      if (parts.iris[side]?.center) {
+        parts.iris[side].center.x = round(offX + parts.iris[side].center.x * scaleW);
+        parts.iris[side].center.y = round(offY + parts.iris[side].center.y * scaleH);
+      }
+    }
+    // ratio_x / ratio_y are relative within the eye, no remap needed
   }
 }
 
@@ -985,6 +1081,8 @@ function buildFeatures(faces, motionScore) {
     face_count: faces.length,
     face_tracks: faces.map((face) => ({
       audience_id: face.audience_id,
+      tile_id: face.tile_id ?? null,
+      participant_name: face.participant_name ?? null,
       face_bbox: {
         x: round(face.x),
         y: round(face.y),
