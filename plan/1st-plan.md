@@ -41,7 +41,9 @@ flowchart TB
 
   subgraph realtimeBackend["Realtime Backend"]
     gateway["Realtime Gateway<br/>WebSocket"]
-    streamProcessor["Stream Processor<br/>window aggregation / smoothing / cooldown"]
+    redisRecent[("Redis ZSET / HASH<br/>recent windows / session state / cooldown")]
+    redisStream[("Redis Stream<br/>durable event pipeline")]
+    streamProcessor["Realtime Processor<br/>window aggregation / smoothing / cooldown"]
     realtimeDecision["Realtime Decision Engine<br/>rules + lightweight model + policy"]
     feedbackApi["Feedback Delivery<br/>speaker hints / sidebar events"]
   end
@@ -54,7 +56,8 @@ flowchart TB
   end
 
   subgraph asyncPlatform["Async Analysis Platform"]
-    queue["Event Queue / Job Queue"]
+    durableWriter["Durable Writer<br/>batch persist / ack / retry"]
+    jobQueue["Job Queue<br/>post-session jobs"]
     transcriptWorker["Transcript Worker<br/>ASR / diarization / alignment"]
     visionWorker["Vision Worker<br/>high accuracy labeling / representative frames"]
     changeWorker["Change Point Worker<br/>reaction delta / anomaly detection"]
@@ -63,9 +66,9 @@ flowchart TB
   end
 
   subgraph dataPlatform["Data Platform"]
-    postgres[("Postgres<br/>sessions / participants / events / reports")]
-    timeseries[("Time-series Store<br/>signals / scores / windows")]
-    objectStorage[("Object Storage<br/>frames / short clips / artifacts")]
+    postgres[("Postgres<br/>sessions / participants / summaries / reports")]
+    timeseries[("Time-series Store optional<br/>ClickHouse / TimescaleDB")]
+    objectStorage[("Object Storage<br/>raw feature JSONL / frames / clips / artifacts")]
     vectorStore[("Vector Store<br/>examples / report snippets / retrieval")]
     warehouse[("Analytics Warehouse<br/>cost / latency / quality metrics")]
   end
@@ -89,7 +92,9 @@ flowchart TB
 
   localState -->|features / events| realtimeClient
   realtimeClient --> gateway
-  gateway --> streamProcessor
+  gateway -->|recent compact feature| redisRecent
+  gateway -->|full feature event| redisStream
+  redisRecent --> streamProcessor
   streamProcessor --> realtimeDecision
   realtimeDecision --> feedbackApi
   feedbackApi --> gateway
@@ -98,18 +103,23 @@ flowchart TB
   sidebar -->|feedback / controls| presenter
 
   content --> sessionApi
-  localState -->|feature batches / transcript chunks| ingestApi
+  localState -->|transcript chunks / lifecycle events| ingestApi
   uploadClient -->|selected frames / short clips| mediaApi
 
   sessionApi --> postgres
   ingestApi --> postgres
-  ingestApi --> timeseries
   mediaApi --> objectStorage
-  ingestApi --> queue
-  mediaApi --> queue
+  ingestApi --> jobQueue
+  mediaApi --> jobQueue
 
-  queue --> transcriptWorker
-  queue --> visionWorker
+  redisStream --> durableWriter
+  durableWriter -->|raw feature JSONL| objectStorage
+  durableWriter -->|session summaries / feedback history| postgres
+  durableWriter -.->|optional high-volume signals| timeseries
+  durableWriter --> jobQueue
+
+  jobQueue --> transcriptWorker
+  jobQueue --> visionWorker
   transcriptWorker --> changeWorker
   visionWorker --> changeWorker
   changeWorker --> llmWorker
@@ -153,12 +163,15 @@ flowchart TB
   end
 
   subgraph realtime["リアルタイム判断"]
+    redis["Redis<br/>直近window・状態・cooldown"]
     stream["集計・平滑化"]
     decision["判断エンジン<br/>ルール+軽量モデル"]
   end
 
   subgraph platform["蓄積・非同期分析"]
-    store[("イベント/メディア保存")]
+    eventStream["Redis Stream<br/>永続化workerへの入口"]
+    writer["Durable Writer<br/>batch保存・retry"]
+    store[("Object Storage / Postgres")]
     analysis["文字起こし・変化点検出・LLMレポート生成"]
   end
 
@@ -167,12 +180,16 @@ flowchart TB
   presenter --> meet
   meet --> capture
   capture --> vision
-  vision -->|特徴量イベント| stream
+  vision -->|特徴量イベント| redis
+  vision -->|同じイベントをappend| eventStream
+  redis --> stream
   stream --> decision
   decision -->|即時フィードバック| sidebar
   sidebar --> presenter
 
-  vision -->|特徴量/代表フレーム| store
+  eventStream --> writer
+  writer -->|raw特徴量JSONL / summary| store
+  vision -->|代表フレーム/短いクリップ| store
   store --> analysis
   analysis -->|反応タイムライン/レポート| presenter
 
@@ -183,8 +200,8 @@ flowchart TB
 **読み方**
 
 - 左上〜拡張: 発信者が Meet を開くと、拡張がタブ画面をキャプチャし、ブラウザ内（Edge）で顔・視線・動き・音声の特徴量を抽出する。画像そのものは基本的にサーバーに送らない。
-- リアルタイム判断: 特徴量イベントを集計し、断定しすぎない軽いフィードバック（例:「反応が薄くなっている可能性」）を即座に発信者へ返す。
-- 蓄積・非同期分析: 特徴量や代表フレームだけをサーバーに送り、会議後にまとめて文字起こし・変化点検出・LLMでレポート化する。
+- リアルタイム判断: 特徴量イベントを Redis の直近 window に入れ、集計し、断定しすぎない軽いフィードバック（例:「反応が薄くなっている可能性」）を即座に発信者へ返す。
+- 蓄積・非同期分析: 同じ特徴量イベントを Redis Stream に append し、Durable Writer が raw JSONL / summary として保存する。会議後は保存済み特徴量、transcript、代表フレームを使って変化点検出・LLMレポート化を行う。
 - 運用: プロンプト/モデル/しきい値は継続的に評価・更新され、リアルタイム判断と非同期分析の両方にフィードバックされる。
 
 ## Edge Vision Pipeline
@@ -227,8 +244,12 @@ flowchart LR
 sequenceDiagram
   participant Ext as Chrome Extension
   participant WS as Realtime Gateway
+  participant Redis as Redis Recent<br/>ZSET/HASH
+  participant Stream as Redis Stream
+  participant Writer as Durable Writer
   participant API as Core API
   participant Obj as Object Storage
+  participant DB as Postgres
   participant Worker as Analysis Workers
 
   Ext->>API: POST /sessions
@@ -237,7 +258,17 @@ sequenceDiagram
   Ext->>WS: connect(session_id)
   loop every 100-1000ms
     Ext->>WS: feature_event(face_visible, gaze, motion, audio_level)
+    WS->>Redis: ZADD recent window / HSET latest state / EXPIRE
+    WS->>Stream: XADD full feature event
+    Redis-->>WS: recent window / cooldown state
     WS-->>Ext: feedback_event(optional)
+  end
+
+  loop batch
+    Writer->>Stream: XREADGROUP feature events
+    Writer->>Obj: append raw feature JSONL chunk
+    Writer->>DB: upsert session summaries / feedback history
+    Writer->>Stream: XACK persisted events
   end
 
   loop selected frames
@@ -248,9 +279,53 @@ sequenceDiagram
   end
 
   API->>Worker: enqueue analysis job
+  Worker->>Obj: read raw feature JSONL / transcript / media refs
   Worker->>API: analysis events / report
   API-->>Ext: report ready
 ```
+
+### リアルタイム特徴量の保存方針
+
+Realtime Gateway は `realtime_feature` を受け取ったら、1回の ingest で2つの経路に流す。
+
+1. **Redis ZSET / HASH**
+   - 目的: リアルタイム feedback のための直近 window、最新状態、cooldown。
+   - 保存期間: 数分から数時間。TTL で消える前提。
+   - 例:
+     - `features:recent:{session_id}`: timestamp score の ZSET
+     - `session:state:{session_id}`: latest feature / status の HASH
+     - `feedback:cooldown:{session_id}`: feedback 種別ごとの cooldown HASH
+
+2. **Redis Stream**
+   - 目的: Durable Writer / 後分析 worker へ渡す処理待ち event log。
+   - 保存期間: writer が保存済みになるまでの短中期。無限保存先にはしない。
+   - 例:
+     - `features:stream`: `XADD` で full event を append
+     - consumer group: `durable-writers`
+
+Gateway は Postgres や Object Storage へ同期保存しない。低遅延 path では Redis への軽い書き込みまでに留め、永続化は Durable Writer が batch で行う。
+
+```text
+on realtime_feature:
+  validate payload
+  assign event_id
+  Redis pipeline:
+    ZADD features:recent:{session_id} t_ms compact_payload
+    ZREMRANGEBYSCORE features:recent:{session_id} -inf now-60000
+    HSET session:state:{session_id} latest_feature compact_payload latest_t_ms t_ms
+    EXPIRE features:recent:{session_id} 3600
+    EXPIRE session:state:{session_id} 3600
+    XADD features:stream * event_id ... payload full_payload
+```
+
+### 永続化タイミング
+
+- **feature 受信時**: Gateway が Redis recent と Redis Stream に書く。
+- **数秒単位または N events 単位**: Durable Writer が Redis Stream を batch で読み、raw feature JSONL を Object Storage に保存し、summary / feedback history を Postgres に upsert する。
+- **セッション終了時**: session status を `ended` にし、未保存 event を final flush し、post-session analysis job を enqueue する。
+- **後分析時**: Worker は Object Storage の raw feature JSONL、transcript、代表フレーム/clip を読んで report を作る。
+
+Durable Writer は `XREADGROUP` で読み、保存成功後に `XACK` する。保存前に worker が落ちた event は pending に残るため、別 worker が `XAUTOCLAIM` で回収する。再処理に備えて `event_id` を持たせ、Postgres 側は冪等 upsert、Object Storage 側は重複許容または後分析時の dedupe を前提にする。
 
 ### WebSocket で送るもの
 
@@ -279,9 +354,12 @@ sequenceDiagram
 ### 原則
 
 - WebSocket は **低遅延イベント用**。
+- Redis ZSET / HASH は **リアルタイム判定用の短期 state**。
+- Redis Stream は **永続化 worker への入口**。最終保存先ではない。
 - REST は **状態変更・確定データ・メディア参照用**。
 - Object Storage は **画像・短い動画・分析 artifact 用**。
-- DB には画像本体を入れず、`media_ref` と metadata を保存する。
+- Object Storage には **raw feature JSONL** も保存し、セッション後分析の source of truth にする。
+- DB には画像本体や全 raw feature を入れず、session、summary、feedback history、report、`media_ref` と metadata を保存する。
 
 ## リアルタイム分析パス
 
@@ -289,6 +367,7 @@ sequenceDiagram
 flowchart LR
   edge["Edge Vision / Audio Features"]
   ws["WebSocket"]
+  recent[("Redis ZSET / HASH<br/>recent window / latest state")]
   window["Window Aggregation<br/>1s / 3s / 10s"]
   state["Session State<br/>baseline / participant calibration"]
   decision["Decision Engine<br/>rules + lightweight model"]
@@ -296,12 +375,15 @@ flowchart LR
   ui["Sidebar / Side Panel"]
 
   edge --> ws
-  ws --> window
+  ws --> recent
+  recent --> window
   window --> state
   state --> decision
   decision --> policy
   policy --> ui
 ```
+
+リアルタイムパスは Redis の直近 window だけを見る。RDB や Object Storage を判定のたびに読まない。低遅延 feedback のために、直近 10秒/30秒程度の特徴量、session state、cooldown state を Redis に置く。
 
 リアルタイムパスでは断定的な感情推定を避ける。出すべきなのは「退屈しています」ではなく、「一部の反応が薄くなっている可能性があります」「発話速度が上がっています」「間を置いて確認するとよさそうです」のような、発信者がすぐ行動に移せる表現。
 
@@ -309,7 +391,10 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  events["Time-series Events"]
+  stream["Redis Stream<br/>feature events"]
+  writer["Durable Writer"]
+  events["Raw Feature JSONL<br/>Object Storage"]
+  summaries["Postgres Summaries"]
   media["Representative Frames / Clips"]
   transcript["Transcript"]
   align["Timeline Alignment"]
@@ -320,7 +405,11 @@ flowchart LR
   feedback["User Correction"]
   eval["Evaluation Dataset"]
 
+  stream --> writer
+  writer --> events
+  writer --> summaries
   events --> align
+  summaries --> align
   media --> align
   transcript --> align
   align --> change
@@ -331,7 +420,7 @@ flowchart LR
   feedback --> eval
 ```
 
-セッション後分析では、リアルタイム中に捨てた情報を必要に応じて補う。代表フレーム、発話前後の transcript、反応スコアの変化点をまとめて Gemini に渡し、理由・根拠・確信度を生成する。
+セッション後分析では、Redis Stream から Durable Writer が保存した raw feature JSONL を基本入力にする。リアルタイム判定用 Redis state は TTL で消える前提なので、後分析の source of truth にはしない。代表フレーム、発話前後の transcript、反応スコアの変化点をまとめて Gemini に渡し、理由・根拠・確信度を生成する。
 
 ## Chrome 拡張の責務
 
@@ -354,8 +443,11 @@ Chrome 拡張は最終形でも重要な分析コンポーネントになる。�
 
 - session lifecycle、role、consent、retention policy の管理
 - WebSocket gateway によるリアルタイムイベント受信
+- Redis ZSET / HASH への直近 window、latest state、cooldown state の保存
+- Redis Stream への full feature event append
 - window aggregation、baseline 補正、cooldown 制御
 - feedback policy による文言・頻度・確信度制御
+- Durable Writer による raw feature JSONL、summary、feedback history の永続化
 - 代表フレーム/短いクリップの保存先管理
 - 文字起こし、視覚ラベリング、変化点検出、LLM レポート生成
 - ユーザー修正の収集
@@ -387,9 +479,12 @@ Chrome 拡張は最終形でも重要な分析コンポーネントになる。�
 
 ```json
 {
+  "event_id": "evt_123",
   "type": "realtime_feature",
+  "schema_version": 1,
   "session_id": "sess_123",
   "t_ms": 12345,
+  "server_received_at_ms": 12380,
   "audience_id": "aud_2",
   "tile_bbox": { "x": 112, "y": 240, "w": 320, "h": 180 },
   "face_bbox": { "x": 174, "y": 265, "w": 82, "h": 92 },
@@ -403,6 +498,8 @@ Chrome 拡張は最終形でも重要な分析コンポーネントになる。�
   "client_model_version": "edge-vision-v1"
 }
 ```
+
+`event_id` は Gateway 側で採番する。Redis Stream から Durable Writer が再処理する可能性があるため、永続化側は `event_id` で冪等に扱う。`t_ms` は client event time、`server_received_at_ms` は Gateway 受信時刻として分ける。
 
 ### 3. Media Reference
 
@@ -476,7 +573,9 @@ Chrome 拡張は画像を扱う。ただし、常時サーバーへ転送する�
 
 | データ | 主な用途 | 通信 | 保存 |
 | --- | --- | --- | --- |
-| 顔 bbox / 視線 / 動き量などの特徴量 | リアルタイム判断 | WebSocket | Time-series store |
+| 顔 bbox / 視線 / 動き量などの特徴量 | リアルタイム判断 | WebSocket | Redis ZSET / HASH |
+| raw feature event | 後分析、再集計、監査 | Gateway -> Redis Stream -> Durable Writer | Object Storage JSONL |
+| feature summary / feedback history | 画面表示、レポート、検索 | Durable Writer | Postgres |
 | 代表フレーム | 後処理分析、根拠表示、評価 | REST + signed upload | Object Storage |
 | 短いクリップ | 詳細分析、デバッグ、ユーザー許可ありの再分析 | REST + signed upload | Object Storage |
 
@@ -488,10 +587,13 @@ WebSocket で画像バイナリを送ること自体は可能。ただし、低�
 - Capture: `chrome.tabCapture`, `getDisplayMedia`, Web Audio API
 - Edge Vision: MediaPipe Tasks Vision, ONNX Runtime Web, WebGPU/WASM backend
 - Realtime: WebSocket
+- Realtime State: Redis ZSET / HASH
+- Event Stream: Redis Streams（MVP）; 将来は SQS / Pub/Sub / Kafka / Redpanda に差し替え可能
 - Core API: FastAPI または Node.js/Fastify
-- Queue: Cloud Tasks / Pub/Sub / BullMQ / Celery
+- Durable Writer: Redis Stream consumer group + batch persist + retry / `XACK`
+- Job Queue: Redis Stream / BullMQ / Cloud Tasks / Pub/Sub
 - DB: Postgres
-- Time-series: TimescaleDB, ClickHouse, BigQuery など
+- Time-series: MVP では Object Storage JSONL + Postgres summary。高頻度検索が必要になったら TimescaleDB / ClickHouse / BigQuery など
 - Object Storage: GCS / S3 互換
 - Analysis Workers: Python
 - Transcription: Whisper 系 API またはクラウド ASR
