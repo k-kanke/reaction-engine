@@ -26,7 +26,11 @@ const elements = {
   sourceVideo: document.getElementById("sourceVideo"),
   startButton: document.getElementById("startButton"),
   stopButton: document.getElementById("stopButton"),
-  eventLog: document.getElementById("eventLog")
+  eventLog: document.getElementById("eventLog"),
+  videoFile: document.getElementById("videoFile"),
+  uploadPlayButton: document.getElementById("uploadPlayButton"),
+  uploadStopButton: document.getElementById("uploadStopButton"),
+  uploadControls: document.querySelector(".upload-controls")
 };
 
 const canvas = elements.preview;
@@ -54,6 +58,9 @@ initEdgeVision();
 elements.startButton.addEventListener("click", startCapture);
 elements.stopButton.addEventListener("click", stopCapture);
 elements.connectButton.addEventListener("click", toggleWebSocket);
+elements.videoFile.addEventListener("change", handleVideoFileSelect);
+elements.uploadPlayButton.addEventListener("click", startVideoFileAnalysis);
+elements.uploadStopButton.addEventListener("click", stopVideoFileAnalysis);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "meet_tile_snapshot") {
@@ -219,6 +226,7 @@ function stopCapture() {
 
   stream = null;
   elements.sourceVideo.srcObject = null;
+  elements.sourceVideo.src = "";
   elements.startButton.disabled = false;
   elements.stopButton.disabled = true;
   previousFrame = null;
@@ -228,6 +236,91 @@ function stopCapture() {
   updateMetrics(latestFeatures);
   drawEmptyPreview();
   setStatus(ws ? "Connected" : "Idle", ws ? "active" : "");
+}
+
+let videoFileUrl = null;
+
+function handleVideoFileSelect() {
+  const file = elements.videoFile.files[0];
+  if (!file) {
+    elements.uploadControls.style.display = "none";
+    return;
+  }
+  elements.uploadControls.style.display = "";
+  elements.uploadPlayButton.disabled = false;
+  elements.uploadStopButton.disabled = true;
+  logEvent({ type: "video_file_selected", message: file.name });
+}
+
+async function startVideoFileAnalysis() {
+  const file = elements.videoFile.files[0];
+  if (!file) return;
+
+  // Stop any live capture first
+  stopCapture();
+
+  if (videoFileUrl) URL.revokeObjectURL(videoFileUrl);
+  videoFileUrl = URL.createObjectURL(file);
+
+  const video = elements.sourceVideo;
+  video.srcObject = null;
+  video.src = videoFileUrl;
+  video.currentTime = 0;
+
+  sessionId = createSessionId();
+  elements.sessionId.textContent = sessionId;
+
+  try {
+    await video.play();
+  } catch (error) {
+    logEvent({ type: "video_file_error", message: error.message });
+    return;
+  }
+
+  previousFrame = null;
+  tracks = [];
+  trackHistory = new Map();
+  nextTrackId = 1;
+
+  elements.uploadPlayButton.disabled = true;
+  elements.uploadStopButton.disabled = false;
+  elements.startButton.disabled = true;
+
+  video.addEventListener("ended", stopVideoFileAnalysis, { once: true });
+
+  analysisTimer = window.setInterval(runAnalysisFrame, ANALYSIS_INTERVAL_MS);
+  eventTimer = window.setInterval(sendFeatureEvent, EVENT_INTERVAL_MS);
+  setStatus("Analyzing file", "active");
+  logEvent({ type: "video_file_started", message: file.name });
+}
+
+function stopVideoFileAnalysis() {
+  if (analysisTimer) window.clearInterval(analysisTimer);
+  if (eventTimer) window.clearInterval(eventTimer);
+  analysisTimer = null;
+  eventTimer = null;
+
+  const video = elements.sourceVideo;
+  video.pause();
+  video.removeEventListener("ended", stopVideoFileAnalysis);
+
+  if (videoFileUrl) {
+    URL.revokeObjectURL(videoFileUrl);
+    videoFileUrl = null;
+  }
+
+  video.src = "";
+  elements.uploadPlayButton.disabled = false;
+  elements.uploadStopButton.disabled = true;
+  elements.startButton.disabled = false;
+  previousFrame = null;
+  tracks = [];
+  trackHistory = new Map();
+  latestFeatures = createEmptyFeatures();
+  updateMetrics(latestFeatures);
+  drawEmptyPreview();
+  setStatus(ws ? "Connected" : "Idle", ws ? "active" : "");
+  logEvent({ type: "video_file_stopped" });
 }
 
 async function runAnalysisFrame() {
