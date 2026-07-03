@@ -37,6 +37,7 @@ let stream = null;
 let analysisTimer = null;
 let eventTimer = null;
 let previousFrame = null;
+let analysisRunning = false;
 let latestFeatures = createEmptyFeatures();
 let ws = null;
 let faceDetectorBackend = null;
@@ -230,72 +231,64 @@ function stopCapture() {
 }
 
 async function runAnalysisFrame() {
-  const video = elements.sourceVideo;
-  if (!video.videoWidth || !video.videoHeight) return;
+  if (analysisRunning) return;
+  analysisRunning = true;
 
-  ctx.drawImage(video, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+  try {
+    const video = elements.sourceVideo;
+    if (!video.videoWidth || !video.videoHeight) return;
 
-  const imageData = ctx.getImageData(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
-  const motionScore = calculateMotionScore(imageData);
-  previousFrame = imageData;
+    ctx.drawImage(video, 0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
 
-  const faces = await analyzeFaces();
-  const trackedFaces = updateTracks(faces);
-  updateGestureHistory(trackedFaces);
-  latestFeatures = buildFeatures(trackedFaces, motionScore);
-  drawDebugFrame(trackedFaces, latestFeatures);
-  updateMetrics(latestFeatures);
+    const imageData = ctx.getImageData(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    const motionScore = calculateMotionScore(imageData);
+    previousFrame = imageData;
+
+    // Create ImageBitmap for MediaPipe — avoids WebGL context issues in side panel
+    const bitmap = await createImageBitmap(canvas);
+    const faces = await analyzeFaces(bitmap);
+    bitmap.close();
+    const trackedFaces = updateTracks(faces);
+    updateGestureHistory(trackedFaces);
+    latestFeatures = buildFeatures(trackedFaces, motionScore);
+    drawDebugFrame(trackedFaces, latestFeatures);
+    updateMetrics(latestFeatures);
+  } finally {
+    analysisRunning = false;
+  }
 }
 
-async function detectFaces() {
+async function detectFaces(bitmap) {
   if (!faceDetectorBackend) return [];
 
   try {
-    return await faceDetectorBackend.detect(canvas, performance.now());
+    return await faceDetectorBackend.detect(bitmap, performance.now());
   } catch (error) {
     logEvent({ type: "face_detection_error", message: error.message });
     return [];
   }
 }
 
-async function detectFaceParts() {
+async function detectFaceParts(bitmap) {
   if (!faceLandmarkerBackend) return [];
 
   try {
-    return faceLandmarkerBackend.detect(canvas, performance.now());
+    return faceLandmarkerBackend.detect(bitmap, performance.now());
   } catch (error) {
     logEvent({ type: "face_landmarker_error", message: error.message });
     return [];
   }
 }
 
-async function analyzeFaces() {
-  const [faces, faceParts] = await Promise.all([
-    detectFaces(),
-    detectFaceParts()
-  ]);
-
-  if (!faceParts.length) return faces;
-  if (!faces.length) return faceParts.map((parts) => ({ ...parts.face_bbox, parts }));
-
-  const unmatchedPartIndexes = new Set(faceParts.map((_, index) => index));
-  const enrichedFaces = faces.map((face) => {
-    const matchIndex = findClosestFacePartIndex(face, faceParts, unmatchedPartIndexes);
-    if (matchIndex === null) return face;
-
-    unmatchedPartIndexes.delete(matchIndex);
-    return {
-      ...face,
-      parts: faceParts[matchIndex]
-    };
-  });
-
-  for (const index of unmatchedPartIndexes) {
-    const parts = faceParts[index];
-    enrichedFaces.push({ ...parts.face_bbox, parts });
+async function analyzeFaces(bitmap) {
+  // FaceLandmarker alone provides bbox + landmarks + blendshapes + iris.
+  // Only fall back to FaceDetector when FaceLandmarker is unavailable.
+  if (faceLandmarkerBackend) {
+    const faceParts = await detectFaceParts(bitmap);
+    return faceParts.map((parts) => ({ ...parts.face_bbox, parts }));
   }
 
-  return enrichedFaces;
+  return detectFaces(bitmap);
 }
 
 function normalizeNativeFace(box) {
@@ -316,20 +309,6 @@ function normalizeMediaPipeFace(box) {
   };
 }
 
-function findClosestFacePartIndex(face, faceParts, candidateIndexes) {
-  let bestIndex = null;
-  let bestDistance = Number.POSITIVE_INFINITY;
-
-  for (const index of candidateIndexes) {
-    const distance = bboxCenterDistance(face, faceParts[index].face_bbox);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      bestIndex = index;
-    }
-  }
-
-  return bestDistance < 0.22 ? bestIndex : null;
-}
 
 function buildFacePartsFromLandmarks(landmarks) {
   const face_bbox = bboxFromLandmarks(landmarks);
@@ -657,6 +636,43 @@ function pruneTrackHistory(now) {
   }
 }
 
+function computeAttentionScore(faces, motionScore, gaze) {
+  if (!faces.length) return clamp(0.1 + motionScore * 0.15, 0, 1);
+
+  // Base: face visible
+  let score = 0.4;
+
+  // Gaze: looking at screen is a strong attention signal
+  if (gaze === "screen") score += 0.3;
+  else if (gaze === "left" || gaze === "right") score += 0.1;
+
+  // Eye openness: average across faces (closed eyes = low attention)
+  const eyeScores = faces
+    .map((f) => f.parts?.eye_openness)
+    .filter(Boolean)
+    .map((e) => (e.left + e.right) / 2);
+  if (eyeScores.length) {
+    const avgEyeOpen = eyeScores.reduce((a, b) => a + b, 0) / eyeScores.length;
+    score += clamp(avgEyeOpen * 0.15, 0, 0.15);
+  }
+
+  // Blendshapes: engagement signals (smile, brow raise, eye squint)
+  const blendscores = faces.map((f) => f.parts?.blendshapes).filter(Boolean);
+  if (blendscores.length) {
+    const avg = (key) =>
+      blendscores.reduce((sum, b) => sum + (b[key] ?? 0), 0) / blendscores.length;
+    const engagement =
+      avg("mouthSmileLeft") * 0.3 +
+      avg("mouthSmileRight") * 0.3 +
+      avg("browInnerUp") * 0.2 +
+      avg("eyeSquintLeft") * 0.1 +
+      avg("eyeSquintRight") * 0.1;
+    score += clamp(engagement * 0.15, 0, 0.15);
+  }
+
+  return clamp(score, 0, 1);
+}
+
 function detectNodGesture(audienceId) {
   const history = trackHistory.get(audienceId) ?? [];
   if (history.length < 5) {
@@ -725,8 +741,8 @@ function pitchRange(samples, startIndex, endIndex) {
 
 function buildFeatures(faces, motionScore) {
   const faceVisible = faces.length > 0;
-  const attentionScore = clamp((faceVisible ? 0.55 : 0.2) + motionScore * 0.35, 0, 1);
   const firstGaze = faces.find((face) => face.parts?.gaze_estimate)?.parts.gaze_estimate;
+  const attentionScore = computeAttentionScore(faces, motionScore, firstGaze);
   const faceGestures = faces.map((face) => ({
     audience_id: face.audience_id,
     gestures: detectNodGesture(face.audience_id)
