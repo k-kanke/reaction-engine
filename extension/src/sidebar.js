@@ -127,7 +127,7 @@ async function createMediaPipeFaceLandmarker() {
       },
       runningMode: "VIDEO",
       numFaces: 4,
-      outputFaceBlendshapes: false,
+      outputFaceBlendshapes: true,
       minFaceDetectionConfidence: 0.45,
       minFacePresenceConfidence: 0.45,
       minTrackingConfidence: 0.45
@@ -137,7 +137,16 @@ async function createMediaPipeFaceLandmarker() {
       modelVersion: "mediapipe-face-landmarker-v1",
       detect(source, timestampMs) {
         const result = landmarker.detectForVideo(source, timestampMs);
-        return result.faceLandmarks.map((landmarks) => buildFacePartsFromLandmarks(landmarks));
+        return result.faceLandmarks.map((landmarks, i) => {
+          const parts = buildFacePartsFromLandmarks(landmarks);
+          const blendshapes = result.faceBlendshapes?.[i]?.categories;
+          if (blendshapes) {
+            parts.blendshapes = Object.fromEntries(
+              blendshapes.map((b) => [b.categoryName, round(b.score)])
+            );
+          }
+          return parts;
+        });
       }
     };
   } catch (error) {
@@ -682,6 +691,7 @@ function buildFeatures(faces, motionScore) {
       mouth_openness: face.parts?.mouth_openness ?? null,
       head_pose_estimate: face.parts?.head_pose_estimate ?? null,
       gaze_estimate: face.parts?.gaze_estimate ?? "unknown",
+      blendshapes: face.parts?.blendshapes ?? null,
       landmark_count: face.parts?.landmark_count ?? 0,
       gestures: faceGestures.find((item) => item.audience_id === face.audience_id)?.gestures ?? {
         nod_count: 0,
