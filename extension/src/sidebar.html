@@ -57,6 +57,17 @@
       </section>
 
       <section class="section">
+        <label for="videoFile">録画ファイルを解析</label>
+        <div class="row">
+          <input id="videoFile" type="file" accept="video/*">
+        </div>
+        <div class="upload-controls row" style="display:none">
+          <button id="uploadPlayButton" type="button" class="primary">再生 &amp; 解析</button>
+          <button id="uploadStopButton" type="button" disabled>停止</button>
+        </div>
+      </section>
+
+      <section class="section">
         <h2>Feature Events</h2>
         <ol id="eventLog" class="event-log"></ol>
       </section>

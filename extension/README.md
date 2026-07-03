@@ -108,6 +108,23 @@ Google Meet ページの content script が `MutationObserver` と定期スキ�
 
 class name には依存せず、`role` / `aria-label` / 表示テキスト / `video` 要素との近傍関係 / `getBoundingClientRect()` を組み合わせた heuristic で候補を作っています。Meet の DOM 構造が変わると `participant_name` が取得できないことがありますが、その場合も `tile_bbox_viewport` のみの候補として扱われ、画面キャプチャの顔解析には影響しません。
 
+## トラブルシューティング
+
+### 顔が認識されない / `activeTexture` エラーが出る
+
+Chrome のハードウェアアクセラレーションが無効だと、MediaPipe が内部で使用する WebGL コンテキストを作成できず、顔検出が動作しません。Feature Events に以下のようなエラーが繰り返し表示されます。
+
+```
+{"type":"face_landmarker_error","message":"Cannot read properties of undefined (reading 'activeTexture')"}
+```
+
+**対処方法:**
+
+1. `chrome://settings/system` を開く。
+2. **「ハードウェア アクセラレーションが使用可能な場合は使用する」** を ON にする。
+3. Chrome を完全に再起動する（すべてのウィンドウを閉じて開き直す）。
+4. `chrome://gpu` を開き、**WebGL** が `Hardware accelerated` になっていることを確認する。
+
 ## 注意
 
 - MVP では本格的な視線推定や人物同一性 tracking は未実装です。

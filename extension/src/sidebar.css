@@ -167,6 +167,17 @@ input {
   padding: 0;
 }
 
+input[type="file"] {
+  border: none;
+  padding: 0;
+  min-height: auto;
+  font-size: 12px;
+}
+
+.upload-controls {
+  margin-top: 8px;
+}
+
 .event-log li {
   background: #f2f4f7;
   border-radius: 6px;
