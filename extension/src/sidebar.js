@@ -6,8 +6,8 @@ import {
 
 const ANALYSIS_INTERVAL_MS = 250;
 const EVENT_INTERVAL_MS = 1000;
-const PREVIEW_WIDTH = 640;
-const PREVIEW_HEIGHT = 360;
+let PREVIEW_WIDTH = 640;
+let PREVIEW_HEIGHT = 360;
 const MEDIAPIPE_MODEL_PATH = "models/blaze_face_short_range.tflite";
 const MEDIAPIPE_LANDMARKER_MODEL_PATH = "models/face_landmarker.task";
 const GESTURE_HISTORY_MS = 3500;
@@ -107,7 +107,7 @@ async function createMediaPipeFaceDetector() {
         delegate: "CPU"
       },
       runningMode: "VIDEO",
-      minDetectionConfidence: 0.45
+      minDetectionConfidence: 0.3
     });
 
     return {
@@ -136,9 +136,9 @@ async function createMediaPipeFaceLandmarker() {
       runningMode: "VIDEO",
       numFaces: 4,
       outputFaceBlendshapes: true,
-      minFaceDetectionConfidence: 0.45,
-      minFacePresenceConfidence: 0.45,
-      minTrackingConfidence: 0.45
+      minFaceDetectionConfidence: 0.2,
+      minFacePresenceConfidence: 0.2,
+      minTrackingConfidence: 0.2
     });
 
     return {
@@ -277,6 +277,10 @@ async function startVideoFileAnalysis() {
     return;
   }
 
+  // Use the video's native resolution for maximum face detection accuracy
+  setAnalysisResolution(video.videoWidth, video.videoHeight);
+  logEvent({ type: "video_file_resolution", message: `${video.videoWidth}x${video.videoHeight}` });
+
   previousFrame = null;
   tracks = [];
   trackHistory = new Map();
@@ -292,6 +296,13 @@ async function startVideoFileAnalysis() {
   eventTimer = window.setInterval(sendFeatureEvent, EVENT_INTERVAL_MS);
   setStatus("Analyzing file", "active");
   logEvent({ type: "video_file_started", message: file.name });
+}
+
+function setAnalysisResolution(w, h) {
+  PREVIEW_WIDTH = w;
+  PREVIEW_HEIGHT = h;
+  canvas.width = w;
+  canvas.height = h;
 }
 
 function stopVideoFileAnalysis() {
@@ -310,6 +321,7 @@ function stopVideoFileAnalysis() {
   }
 
   video.src = "";
+  setAnalysisResolution(640, 360);
   elements.uploadPlayButton.disabled = false;
   elements.uploadStopButton.disabled = true;
   elements.startButton.disabled = false;
@@ -337,10 +349,7 @@ async function runAnalysisFrame() {
     const motionScore = calculateMotionScore(imageData);
     previousFrame = imageData;
 
-    // Create ImageBitmap for MediaPipe — avoids WebGL context issues in side panel
-    const bitmap = await createImageBitmap(canvas);
-    const faces = await analyzeFaces(bitmap);
-    bitmap.close();
+    const faces = await analyzeWithTileCrop();
     const trackedFaces = updateTracks(faces);
     updateGestureHistory(trackedFaces);
     latestFeatures = buildFeatures(trackedFaces, motionScore);
@@ -348,6 +357,105 @@ async function runAnalysisFrame() {
     updateMetrics(latestFeatures);
   } finally {
     analysisRunning = false;
+  }
+}
+
+async function analyzeWithTileCrop() {
+  const tiles = latestTileSnapshot?.tiles;
+  if (!tiles?.length) {
+    // No tile info — run detection on the full frame
+    const bitmap = await createImageBitmap(canvas);
+    const faces = await analyzeFaces(bitmap);
+    bitmap.close();
+    return faces;
+  }
+
+  // Scale tile viewport coords to canvas coords
+  const video = elements.sourceVideo;
+  const scaleX = PREVIEW_WIDTH / video.videoWidth;
+  const scaleY = PREVIEW_HEIGHT / video.videoHeight;
+
+  const allFaces = [];
+
+  for (const tile of tiles) {
+    const tb = tile.tile_bbox_viewport;
+    const cx = Math.round(tb.x * scaleX);
+    const cy = Math.round(tb.y * scaleY);
+    const cw = Math.round(tb.w * scaleX);
+    const ch = Math.round(tb.h * scaleY);
+
+    if (cw < 30 || ch < 30) continue;
+
+    let tileBitmap;
+    try {
+      tileBitmap = await createImageBitmap(canvas, cx, cy, cw, ch);
+    } catch {
+      continue;
+    }
+
+    const tileFaces = await analyzeFaces(tileBitmap);
+    tileBitmap.close();
+
+    // Map tile-local normalized coords back to full-frame normalized coords
+    for (const face of tileFaces) {
+      const tileNormX = cx / PREVIEW_WIDTH;
+      const tileNormY = cy / PREVIEW_HEIGHT;
+      const tileNormW = cw / PREVIEW_WIDTH;
+      const tileNormH = ch / PREVIEW_HEIGHT;
+
+      face.x = tileNormX + face.x * tileNormW;
+      face.y = tileNormY + face.y * tileNormH;
+      face.w = face.w * tileNormW;
+      face.h = face.h * tileNormH;
+      face.tile_id = tile.tile_id;
+      face.participant_name = tile.participant_name ?? null;
+
+      if (face.parts) {
+        remapPartsToFullFrame(face.parts, tileNormX, tileNormY, tileNormW, tileNormH);
+      }
+
+      allFaces.push(face);
+    }
+  }
+
+  return allFaces;
+}
+
+function remapPartsToFullFrame(parts, offX, offY, scaleW, scaleH) {
+  // Remap face_bbox
+  if (parts.face_bbox) {
+    parts.face_bbox.x = offX + parts.face_bbox.x * scaleW;
+    parts.face_bbox.y = offY + parts.face_bbox.y * scaleH;
+    parts.face_bbox.w = parts.face_bbox.w * scaleW;
+    parts.face_bbox.h = parts.face_bbox.h * scaleH;
+  }
+
+  // Remap face part landmark points
+  if (parts.face_parts) {
+    for (const partKey of Object.keys(parts.face_parts)) {
+      const group = parts.face_parts[partKey];
+      if (group?.points) {
+        for (const p of group.points) {
+          p.x = round(offX + p.x * scaleW);
+          p.y = round(offY + p.y * scaleH);
+        }
+        if (group.center) {
+          group.center.x = round(offX + group.center.x * scaleW);
+          group.center.y = round(offY + group.center.y * scaleH);
+        }
+      }
+    }
+  }
+
+  // Remap iris centers
+  if (parts.iris) {
+    for (const side of ["left", "right"]) {
+      if (parts.iris[side]?.center) {
+        parts.iris[side].center.x = round(offX + parts.iris[side].center.x * scaleW);
+        parts.iris[side].center.y = round(offY + parts.iris[side].center.y * scaleH);
+      }
+    }
+    // ratio_x / ratio_y are relative within the eye, no remap needed
   }
 }
 
@@ -405,8 +513,9 @@ function normalizeMediaPipeFace(box) {
 
 function buildFacePartsFromLandmarks(landmarks) {
   const face_bbox = bboxFromLandmarks(landmarks);
-  const leftEye = summarizeLandmarkGroup(landmarks, [33, 133, 159, 145]);
-  const rightEye = summarizeLandmarkGroup(landmarks, [362, 263, 386, 374]);
+  // MediaPipe uses subject's perspective: landmarks 33-area = subject's RIGHT, 362-area = subject's LEFT
+  const leftEye = summarizeLandmarkGroup(landmarks, [362, 263, 386, 374]);
+  const rightEye = summarizeLandmarkGroup(landmarks, [33, 133, 159, 145]);
   const mouth = summarizeLandmarkGroup(landmarks, [61, 291, 13, 14]);
   const nose = summarizeLandmarkGroup(landmarks, [1, 4, 98, 327]);
   const headPose = estimateHeadPose(landmarks);
@@ -434,26 +543,33 @@ function buildFacePartsFromLandmarks(landmarks) {
 }
 
 function estimateIris(landmarks) {
-  // Iris landmarks: left 468-472 (468=center), right 473-477 (473=center)
-  // Eye corner landmarks: left inner 133, outer 33; right inner 362, outer 263
+  // Subject's perspective (MediaPipe convention):
+  //   LEFT iris: 468-472 (468=center), LEFT eye corners: outer 263, inner 362
+  //   RIGHT iris: 473-477 (473=center), RIGHT eye corners: outer 33, inner 133
   const leftCenter = landmarks[468];
   const rightCenter = landmarks[473];
   if (!leftCenter || !rightCenter) return null;
 
-  const leftInner = landmarks[133];
-  const leftOuter = landmarks[33];
-  const rightInner = landmarks[362];
-  const rightOuter = landmarks[263];
+  const leftOuter = landmarks[263];
+  const leftInner = landmarks[362];
+  const rightOuter = landmarks[33];
+  const rightInner = landmarks[133];
   if (!leftInner || !leftOuter || !rightInner || !rightOuter) return null;
 
-  // Iris position ratio within eye (0=outer corner, 1=inner corner)
-  const leftRatioX = (leftCenter.x - leftOuter.x) / Math.max(0.001, leftInner.x - leftOuter.x);
-  const rightRatioX = (rightCenter.x - rightOuter.x) / Math.max(0.001, rightInner.x - rightOuter.x);
+  // Iris position ratio within eye (0=outer corner, 1=inner corner).
+  // 左右で目頭/目尻の x 順が逆(左目 inner>outer, 右目 inner<outer)なので、
+  // 分母を正の下限に潰すと右目が壊れる。符号を保ったまま 0 割りだけ避ける。
+  const signedDenomX = (inner, outer) => {
+    const d = inner.x - outer.x;
+    return Math.abs(d) < 0.001 ? (d < 0 ? -0.001 : 0.001) : d;
+  };
+  const leftRatioX = (leftCenter.x - leftOuter.x) / signedDenomX(leftInner, leftOuter);
+  const rightRatioX = (rightCenter.x - rightOuter.x) / signedDenomX(rightInner, rightOuter);
 
-  const leftTop = landmarks[159];
-  const leftBottom = landmarks[145];
-  const rightTop = landmarks[386];
-  const rightBottom = landmarks[374];
+  const leftTop = landmarks[386];
+  const leftBottom = landmarks[374];
+  const rightTop = landmarks[159];
+  const rightBottom = landmarks[145];
 
   const leftRatioY = (leftTop && leftBottom)
     ? (leftCenter.y - leftTop.y) / Math.max(0.001, leftBottom.y - leftTop.y)
@@ -729,41 +845,157 @@ function pruneTrackHistory(now) {
   }
 }
 
-function computeAttentionScore(faces, motionScore, gaze) {
-  if (!faces.length) return clamp(0.1 + motionScore * 0.15, 0, 1);
+// --- room_engagement (§8-1): 2軸・ベースライン相対 ---
+// 設計判断:
+//  - attention（注意）と valence（感情価）を分離。1本のスコアに混ぜると
+//    「画面を見なくなった(gaze↓)が笑った(smile↑)」で打ち消し合い情報が消える。
+//  - 絶対値でなくベースライン相対。平常値が人・会議で違うため。
+//  - brow_down は意味が割れる(集中/困惑/不満)ので数値に入れず brow_flag で別持ち→LLMが文脈解釈。
+//  - 個人baselineは持たない(§3.1)。mean のみ相対、variance/min は瞬間分布。
+const ENGAGEMENT_WARMUP_SAMPLES = 40; // 開始~30-60秒は基準を較正するだけ
+const ENGAGEMENT_EWMA_ALPHA = 0.03; // 較正後の緩やかなドリフト
+const ENGAGEMENT_WARMUP_ALPHA = 0.15; // 較正中は速く基準へ寄せる
+const NOD_SCORE_THRESHOLD = 0.5; // これを超えたら「頷いている」
+const BROW_FLAG_MARGIN = 0.15; // 基準+マージン超で brow_flag（重みは仮値）
 
-  // Base: face visible
-  let score = 0.4;
+const engagementBaseline = {
+  gazeScreenRatio: null,
+  nodRatio: null,
+  eyeOpen: null,
+  smile: null,
+  browDown: null,
+  samples: 0
+};
 
-  // Gaze: looking at screen is a strong attention signal
-  if (gaze === "screen") score += 0.3;
-  else if (gaze === "left" || gaze === "right") score += 0.1;
+function updateBaseline(key, value, warming) {
+  const b = engagementBaseline;
+  if (b[key] == null) {
+    b[key] = value;
+    return;
+  }
+  const alpha = warming ? ENGAGEMENT_WARMUP_ALPHA : ENGAGEMENT_EWMA_ALPHA;
+  b[key] = b[key] + alpha * (value - b[key]);
+}
 
-  // Eye openness: average across faces (closed eyes = low attention)
-  const eyeScores = faces
-    .map((f) => f.parts?.eye_openness)
-    .filter(Boolean)
-    .map((e) => (e.left + e.right) / 2);
-  if (eyeScores.length) {
-    const avgEyeOpen = eyeScores.reduce((a, b) => a + b, 0) / eyeScores.length;
-    score += clamp(avgEyeOpen * 0.15, 0, 0.15);
+function faceGazeIsScreen(face) {
+  return face.parts?.gaze_estimate === "screen";
+}
+
+function faceEyeOpen(face) {
+  const e = face.parts?.eye_openness;
+  return e ? (e.left + e.right) / 2 : null;
+}
+
+function faceSmile(face) {
+  const b = face.parts?.blendshapes;
+  if (!b) return null;
+  return ((b.mouthSmileLeft ?? 0) + (b.mouthSmileRight ?? 0)) / 2;
+}
+
+function faceBrowDown(face) {
+  const b = face.parts?.blendshapes;
+  if (!b) return null;
+  return ((b.browDownLeft ?? 0) + (b.browDownRight ?? 0)) / 2;
+}
+
+function computeRoomEngagement(faces, nodByFace) {
+  const visible = faces.length;
+  const warming = engagementBaseline.samples < ENGAGEMENT_WARMUP_SAMPLES;
+
+  if (!visible) {
+    // 見えている顔ゼロ = 部分観測。dropと誤読しないよう中立を返す
+    return {
+      attention_mean: 0,
+      attention_variance: 0,
+      attention_min: 0,
+      valence_mean: 0,
+      brow_flag: false,
+      gaze_screen_ratio: 0,
+      nod_ratio: 0,
+      visible_faces: 0,
+      calibrating: warming,
+      attention_raw: 0
+    };
   }
 
-  // Blendshapes: engagement signals (smile, brow raise, eye squint)
-  const blendscores = faces.map((f) => f.parts?.blendshapes).filter(Boolean);
-  if (blendscores.length) {
-    const avg = (key) =>
-      blendscores.reduce((sum, b) => sum + (b[key] ?? 0), 0) / blendscores.length;
-    const engagement =
-      avg("mouthSmileLeft") * 0.3 +
-      avg("mouthSmileRight") * 0.3 +
-      avg("browInnerUp") * 0.2 +
-      avg("eyeSquintLeft") * 0.1 +
-      avg("eyeSquintRight") * 0.1;
-    score += clamp(engagement * 0.15, 0, 0.15);
+  // per-face 瞬間 attention（variance/min 用。個人baselineは持たない=§3.1）
+  const perFaceAttention = faces.map((face) => {
+    const gaze = faceGazeIsScreen(face) ? 1 : 0;
+    const nodScore = nodByFace.get(face.audience_id)?.nod_score ?? 0;
+    const nod = nodScore > NOD_SCORE_THRESHOLD ? 1 : 0;
+    const eye = clamp(faceEyeOpen(face) ?? 0, 0, 1);
+    return 0.5 * gaze + 0.3 * nod + 0.2 * eye;
+  });
+  const attnRawMean =
+    perFaceAttention.reduce((a, b) => a + b, 0) / perFaceAttention.length;
+  const attnVariance =
+    perFaceAttention.reduce((a, b) => a + (b - attnRawMean) ** 2, 0) /
+    perFaceAttention.length;
+  const attnMin = Math.min(...perFaceAttention);
+
+  // 集約 raw ratio（ベースライン相対の mean 用。全員の割合。§3.1）
+  const gazeRatio = faces.filter(faceGazeIsScreen).length / visible;
+  const nodRatio =
+    faces.filter(
+      (f) => (nodByFace.get(f.audience_id)?.nod_score ?? 0) > NOD_SCORE_THRESHOLD
+    ).length / visible;
+  const eyeVals = faces.map(faceEyeOpen).filter((v) => v != null);
+  const eyeOpen = eyeVals.length
+    ? eyeVals.reduce((a, b) => a + b, 0) / eyeVals.length
+    : 0;
+  const smileVals = faces.map(faceSmile).filter((v) => v != null);
+  const smile = smileVals.length
+    ? smileVals.reduce((a, b) => a + b, 0) / smileVals.length
+    : 0;
+  const browVals = faces.map(faceBrowDown).filter((v) => v != null);
+  const browDown = browVals.length
+    ? browVals.reduce((a, b) => a + b, 0) / browVals.length
+    : 0;
+
+  // ベースライン更新（1フレーム=1サンプル）
+  updateBaseline("gazeScreenRatio", gazeRatio, warming);
+  updateBaseline("nodRatio", nodRatio, warming);
+  updateBaseline("eyeOpen", eyeOpen, warming);
+  updateBaseline("smile", smile, warming);
+  updateBaseline("browDown", browDown, warming);
+  engagementBaseline.samples += 1;
+
+  if (warming) {
+    // 較正中: 基準未確定なので偏差は0固定、calibrating を立てる
+    return {
+      attention_mean: 0,
+      attention_variance: round(attnVariance),
+      attention_min: 0,
+      valence_mean: 0,
+      brow_flag: false,
+      gaze_screen_ratio: round(gazeRatio),
+      nod_ratio: round(nodRatio),
+      visible_faces: visible,
+      calibrating: true,
+      attention_raw: round(attnRawMean)
+    };
   }
 
-  return clamp(score, 0, 1);
+  // ベースライン相対の合成（重みは仮値・後で実データ調整）
+  const dGaze = gazeRatio - engagementBaseline.gazeScreenRatio;
+  const dNod = nodRatio - engagementBaseline.nodRatio;
+  const dEye = eyeOpen - engagementBaseline.eyeOpen;
+  const attentionMean = 0.5 * dGaze + 0.3 * dNod + 0.2 * dEye;
+  const valenceMean = smile - engagementBaseline.smile;
+  const browFlag = browDown > engagementBaseline.browDown + BROW_FLAG_MARGIN;
+
+  return {
+    attention_mean: round(attentionMean),
+    attention_variance: round(attnVariance),
+    attention_min: round(attnMin),
+    valence_mean: round(valenceMean),
+    brow_flag: browFlag,
+    gaze_screen_ratio: round(gazeRatio),
+    nod_ratio: round(nodRatio),
+    visible_faces: visible,
+    calibrating: false,
+    attention_raw: round(attnRawMean)
+  };
 }
 
 function detectNodGesture(audienceId) {
@@ -835,19 +1067,22 @@ function pitchRange(samples, startIndex, endIndex) {
 function buildFeatures(faces, motionScore) {
   const faceVisible = faces.length > 0;
   const firstGaze = faces.find((face) => face.parts?.gaze_estimate)?.parts.gaze_estimate;
-  const attentionScore = computeAttentionScore(faces, motionScore, firstGaze);
   const faceGestures = faces.map((face) => ({
     audience_id: face.audience_id,
     gestures: detectNodGesture(face.audience_id)
   }));
+  const nodByFace = new Map(faceGestures.map((g) => [g.audience_id, g.gestures]));
   const totalNodCount = faceGestures.reduce((sum, item) => sum + item.gestures.nod_count, 0);
   const maxNodScore = faceGestures.reduce((max, item) => Math.max(max, item.gestures.nod_score), 0);
+  const engagement = computeRoomEngagement(faces, nodByFace);
 
   return {
     face_visible: faceVisible,
     face_count: faces.length,
     face_tracks: faces.map((face) => ({
       audience_id: face.audience_id,
+      tile_id: face.tile_id ?? null,
+      participant_name: face.participant_name ?? null,
       face_bbox: {
         x: round(face.x),
         y: round(face.y),
@@ -868,7 +1103,18 @@ function buildFeatures(faces, motionScore) {
       }
     })),
     motion_score: round(motionScore),
-    attention_score: round(attentionScore),
+    attention_score: engagement.attention_raw, // 旧UI互換: 瞬間rawの平均
+    room_engagement: {
+      attention_mean: engagement.attention_mean,
+      attention_variance: engagement.attention_variance,
+      attention_min: engagement.attention_min,
+      valence_mean: engagement.valence_mean,
+      brow_flag: engagement.brow_flag,
+      gaze_screen_ratio: engagement.gaze_screen_ratio,
+      nod_ratio: engagement.nod_ratio,
+      visible_faces: engagement.visible_faces,
+      calibrating: engagement.calibrating
+    },
     gaze_estimate: faceVisible ? firstGaze ?? "unknown" : "not_visible",
     gestures: {
       nod_count: totalNodCount,
@@ -893,7 +1139,8 @@ function drawDebugFrame(faces, features) {
     );
     ctx.fillStyle = "#34a853";
     ctx.font = "12px system-ui, sans-serif";
-    ctx.fillText(face.audience_id, face.x * PREVIEW_WIDTH, Math.max(14, face.y * PREVIEW_HEIGHT - 6));
+    const label = face.participant_name || face.audience_id;
+    ctx.fillText(label, face.x * PREVIEW_WIDTH, Math.max(14, face.y * PREVIEW_HEIGHT - 6));
     drawFacePartPoints(face.parts?.face_parts);
   }
 
