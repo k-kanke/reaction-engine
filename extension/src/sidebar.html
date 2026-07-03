@@ -54,6 +54,7 @@
       <section class="section controls">
         <button id="startButton" type="button" class="primary">Start Capture</button>
         <button id="stopButton" type="button" disabled>Stop</button>
+        <button id="micPermButton" type="button">🎤 マイクを許可</button>
       </section>
 
       <section class="section">
@@ -68,7 +69,26 @@
       </section>
 
       <section class="section">
+        <h2>Gemini 分析</h2>
+        <div class="row">
+          <input id="geminiApiKey" type="password" placeholder="Gemini API Key">
+          <button id="saveApiKeyButton" type="button">保存</button>
+        </div>
+        <button id="geminiAnalyzeButton" type="button" class="primary" style="margin-top:8px;width:100%" disabled>録画を Gemini で分析</button>
+        <p id="geminiStatus" class="hint"></p>
+        <pre id="geminiResult" class="gemini-result" style="display:none"></pre>
+      </section>
+
+      <section class="section">
+        <h2>統合レポート</h2>
+        <button id="unifiedReportButton" type="button" class="primary" style="width:100%" disabled>リアルタイム + Gemini 統合レポート生成</button>
+        <p id="unifiedReportStatus" class="hint"></p>
+        <div id="unifiedReport" class="unified-report" style="display:none"></div>
+      </section>
+
+      <section class="section">
         <h2>Feature Events</h2>
+        <button id="exportButton" type="button">セッションデータをエクスポート</button>
         <ol id="eventLog" class="event-log"></ol>
       </section>
     </main>

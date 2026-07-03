@@ -3,6 +3,7 @@ import {
   FaceLandmarker,
   FilesetResolver
 } from "../vendor/mediapipe/vision_bundle.mjs";
+import { analyzeVideoWithGemini } from "./gemini.js";
 
 const ANALYSIS_INTERVAL_MS = 250;
 const EVENT_INTERVAL_MS = 1000;
@@ -26,11 +27,21 @@ const elements = {
   sourceVideo: document.getElementById("sourceVideo"),
   startButton: document.getElementById("startButton"),
   stopButton: document.getElementById("stopButton"),
+  micPermButton: document.getElementById("micPermButton"),
   eventLog: document.getElementById("eventLog"),
+  exportButton: document.getElementById("exportButton"),
+  geminiApiKey: document.getElementById("geminiApiKey"),
+  saveApiKeyButton: document.getElementById("saveApiKeyButton"),
+  geminiAnalyzeButton: document.getElementById("geminiAnalyzeButton"),
+  geminiStatus: document.getElementById("geminiStatus"),
+  geminiResult: document.getElementById("geminiResult"),
   videoFile: document.getElementById("videoFile"),
   uploadPlayButton: document.getElementById("uploadPlayButton"),
   uploadStopButton: document.getElementById("uploadStopButton"),
-  uploadControls: document.querySelector(".upload-controls")
+  uploadControls: document.querySelector(".upload-controls"),
+  unifiedReportButton: document.getElementById("unifiedReportButton"),
+  unifiedReportStatus: document.getElementById("unifiedReportStatus"),
+  unifiedReport: document.getElementById("unifiedReport")
 };
 
 const canvas = elements.preview;
@@ -51,16 +62,51 @@ let trackHistory = new Map();
 let nextTrackId = 1;
 let latestTileSnapshot = null;
 
+// --- 音声VAD (§4-1): ローカルのみ。相手=タブ音声, 自分=マイク(AEC) ---
+const VAD_INTERVAL_MS = 100; // VADサンプリング間隔
+const VAD_RMS_THRESHOLD = 0.02; // 発話判定のRMS閾値（仮値・後で実データ調整）
+const SPEECH_WINDOW_MS = 5000; // speech_ratio を出す移動窓
+// --- 代表フレーム取得 (§2.2 LLM定期パス用): 最初5分・30秒ごと ---
+const FRAME_CAPTURE_INTERVAL_MS = 30000; // 30秒ごと
+const FRAME_CAPTURE_DURATION_MS = 5 * 60 * 1000; // 最初の5分だけ
+const FRAME_CAPTURE_WIDTH = 480; // 縮小送信（プライバシー/帯域配慮）
+let frameTimer = null;
+let frameCanvas = null;
+let captureStartTs = 0;
+let audioContext = null;
+let micStream = null;
+let micRequestError = null;
+let vadTimer = null;
+const vad = {
+  self: createVadState(),
+  other: createVadState()
+};
+
+function createVadState() {
+  return {
+    analyser: null,
+    buf: null,
+    speaking: false,
+    lastSpeechTs: 0,
+    history: [] // {t, speaking} 直近 SPEECH_WINDOW_MS 分
+  };
+}
+
 elements.sessionId.textContent = sessionId;
 restoreSettings();
 initEdgeVision();
 
 elements.startButton.addEventListener("click", startCapture);
 elements.stopButton.addEventListener("click", stopCapture);
+elements.micPermButton.addEventListener("click", openMicPermission);
 elements.connectButton.addEventListener("click", toggleWebSocket);
 elements.videoFile.addEventListener("change", handleVideoFileSelect);
 elements.uploadPlayButton.addEventListener("click", startVideoFileAnalysis);
 elements.uploadStopButton.addEventListener("click", stopVideoFileAnalysis);
+elements.exportButton.addEventListener("click", downloadSessionJson);
+elements.saveApiKeyButton.addEventListener("click", saveGeminiApiKey);
+elements.geminiAnalyzeButton.addEventListener("click", runGeminiAnalysis);
+elements.unifiedReportButton.addEventListener("click", generateUnifiedReport);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "meet_tile_snapshot") {
@@ -185,9 +231,28 @@ function createNativeFaceDetector() {
   }
 }
 
+function openMicPermission() {
+  // side panel からは getUserMedia の許可プロンプトが出せないため、
+  // 通常タブで一度だけ許可を取得する（許可は拡張オリジンに保存され再利用される）。
+  chrome.tabs.create({ url: chrome.runtime.getURL("src/permission.html") });
+}
+
 async function startCapture() {
   try {
     setStatus("Requesting capture");
+    // マイク要求を画面共有と "同じクリック操作の中" で同時に開始する。
+    // 後追いで呼ぶと side panel では許可プロンプトが dismiss されやすいため、
+    // クリック直下(awaitより前)で getUserMedia を発火させて安定化する。
+    // 失敗しても画面共有は続行できるよう catch でエラーだけ retain。
+    micRequestError = null;
+    micStream = null;
+    const micPromise = navigator.mediaDevices
+      .getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
+      .catch((error) => {
+        micRequestError = error;
+        return null;
+      });
+
     stream = await navigator.mediaDevices.getDisplayMedia({
       video: {
         frameRate: { ideal: 15, max: 30 },
@@ -197,6 +262,8 @@ async function startCapture() {
       audio: true
     });
 
+    micStream = await micPromise;
+
     elements.sourceVideo.srcObject = stream;
     await elements.sourceVideo.play();
 
@@ -205,8 +272,14 @@ async function startCapture() {
     elements.stopButton.disabled = false;
     previousFrame = null;
 
+    setupAudioAnalysis(stream);
+
     analysisTimer = window.setInterval(runAnalysisFrame, ANALYSIS_INTERVAL_MS);
     eventTimer = window.setInterval(sendFeatureEvent, EVENT_INTERVAL_MS);
+    vadTimer = window.setInterval(sampleVad, VAD_INTERVAL_MS);
+    captureStartTs = Date.now();
+    captureFrame(); // 開始直後に1枚
+    frameTimer = window.setInterval(captureFrame, FRAME_CAPTURE_INTERVAL_MS);
     setStatus("Capturing", "active");
   } catch (error) {
     setStatus("Capture failed", "error");
@@ -217,8 +290,13 @@ async function startCapture() {
 function stopCapture() {
   if (analysisTimer) window.clearInterval(analysisTimer);
   if (eventTimer) window.clearInterval(eventTimer);
+  if (vadTimer) window.clearInterval(vadTimer);
+  if (frameTimer) window.clearInterval(frameTimer);
   analysisTimer = null;
   eventTimer = null;
+  vadTimer = null;
+  frameTimer = null;
+  teardownAudioAnalysis();
 
   if (stream) {
     for (const track of stream.getTracks()) track.stop();
@@ -250,6 +328,7 @@ function handleVideoFileSelect() {
   elements.uploadPlayButton.disabled = false;
   elements.uploadStopButton.disabled = true;
   logEvent({ type: "video_file_selected", message: file.name });
+  updateGeminiButton();
 }
 
 async function startVideoFileAnalysis() {
@@ -360,29 +439,134 @@ async function runAnalysisFrame() {
   }
 }
 
+function detectGridTiles(imageData, width, height) {
+  const data = imageData.data;
+  const DARK_THRESHOLD = 35;
+  const GAP_MIN_PX = 3;
+  const TILE_MIN_PX = 60;
+
+  // Scan each row: compute average brightness
+  function rowBrightness(y) {
+    let sum = 0;
+    const step = 4;
+    for (let x = 0; x < width; x += step) {
+      const i = (y * width + x) * 4;
+      sum += (data[i] + data[i + 1] + data[i + 2]) / 3;
+    }
+    return sum / (width / step);
+  }
+
+  // Scan each column: compute average brightness
+  function colBrightness(x) {
+    let sum = 0;
+    const step = 4;
+    for (let y = 0; y < height; y += step) {
+      const i = (y * width + x) * 4;
+      sum += (data[i] + data[i + 1] + data[i + 2]) / 3;
+    }
+    return sum / (height / step);
+  }
+
+  // Find dark bands (gaps between tiles)
+  function findGaps(brightnessFn, length) {
+    const gaps = [];
+    let inGap = false;
+    let gapStart = 0;
+
+    for (let i = 0; i < length; i++) {
+      const dark = brightnessFn(i) < DARK_THRESHOLD;
+      if (dark && !inGap) {
+        gapStart = i;
+        inGap = true;
+      } else if (!dark && inGap) {
+        if (i - gapStart >= GAP_MIN_PX) {
+          gaps.push({ start: gapStart, end: i });
+        }
+        inGap = false;
+      }
+    }
+    if (inGap && length - gapStart >= GAP_MIN_PX) {
+      gaps.push({ start: gapStart, end: length });
+    }
+    return gaps;
+  }
+
+  const hGaps = findGaps(rowBrightness, height);
+  const vGaps = findGaps(colBrightness, width);
+
+  // Convert gaps to tile edges
+  function gapsToEdges(gaps, length) {
+    const edges = [0];
+    for (const gap of gaps) {
+      const mid = Math.round((gap.start + gap.end) / 2);
+      if (mid > TILE_MIN_PX && mid < length - TILE_MIN_PX) {
+        edges.push(mid);
+      }
+    }
+    edges.push(length);
+    return edges;
+  }
+
+  const yEdges = gapsToEdges(hGaps, height);
+  const xEdges = gapsToEdges(vGaps, width);
+
+  // Need at least a 2-tile grid to be useful
+  if (xEdges.length < 3 && yEdges.length < 3) return [];
+
+  const tiles = [];
+  for (let row = 0; row < yEdges.length - 1; row++) {
+    for (let col = 0; col < xEdges.length - 1; col++) {
+      const x = xEdges[col];
+      const y = yEdges[row];
+      const w = xEdges[col + 1] - x;
+      const h = yEdges[row + 1] - y;
+
+      if (w < TILE_MIN_PX || h < TILE_MIN_PX) continue;
+
+      tiles.push({
+        tile_id: `grid_${tiles.length + 1}`,
+        participant_name: null,
+        tile_bbox_viewport: { x, y, w, h },
+        source: "grid_detect"
+      });
+    }
+  }
+
+  return tiles;
+}
+
 async function analyzeWithTileCrop() {
-  const tiles = latestTileSnapshot?.tiles;
+  let tiles = latestTileSnapshot?.tiles;
+
+  // For recorded video files (no live tile data), auto-detect grid
   if (!tiles?.length) {
-    // No tile info — run detection on the full frame
+    const imageData = ctx.getImageData(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    tiles = detectGridTiles(imageData, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+  }
+
+  if (!tiles?.length) {
+    // No tiles detected — run detection on the full frame
     const bitmap = await createImageBitmap(canvas);
     const faces = await analyzeFaces(bitmap);
     bitmap.close();
     return faces;
   }
 
-  // Scale tile viewport coords to canvas coords
+  // Scale tile coords to canvas coords
+  // Live tiles use viewport coords (need scaling), detected tiles use canvas coords directly
   const video = elements.sourceVideo;
-  const scaleX = PREVIEW_WIDTH / video.videoWidth;
-  const scaleY = PREVIEW_HEIGHT / video.videoHeight;
+  const isLiveTile = latestTileSnapshot?.tiles?.length > 0;
+  const scaleX = isLiveTile ? PREVIEW_WIDTH / video.videoWidth : 1;
+  const scaleY = isLiveTile ? PREVIEW_HEIGHT / video.videoHeight : 1;
 
   const allFaces = [];
 
   for (const tile of tiles) {
     const tb = tile.tile_bbox_viewport;
-    const cx = Math.round(tb.x * scaleX);
-    const cy = Math.round(tb.y * scaleY);
-    const cw = Math.round(tb.w * scaleX);
-    const ch = Math.round(tb.h * scaleY);
+    const cx = Math.max(0, Math.round(tb.x * scaleX));
+    const cy = Math.max(0, Math.round(tb.y * scaleY));
+    const cw = Math.min(Math.round(tb.w * scaleX), PREVIEW_WIDTH - cx);
+    const ch = Math.min(Math.round(tb.h * scaleY), PREVIEW_HEIGHT - cy);
 
     if (cw < 30 || ch < 30) continue;
 
@@ -1064,6 +1248,143 @@ function pitchRange(samples, startIndex, endIndex) {
   return Math.max(...pitches) - Math.min(...pitches);
 }
 
+async function setupAudioAnalysis(displayStream) {
+  const startTs = Date.now();
+  vad.self.lastSpeechTs = startTs;
+  vad.other.lastSpeechTs = startTs;
+
+  try {
+    audioContext = new AudioContext();
+    if (audioContext.state === "suspended") await audioContext.resume();
+    sendDiagnostic("audio_status", `AudioContext state=${audioContext.state}`);
+  } catch (error) {
+    sendDiagnostic("audio_init_error", `AudioContext failed: ${error.name} ${error.message}`);
+    return;
+  }
+
+  // 相手 = タブ音声（getDisplayMedia の audio トラックを流用。スピーカー前のデジタル音声）
+  const audioTracks = displayStream.getAudioTracks();
+  if (audioTracks[0]) {
+    try {
+      const src = audioContext.createMediaStreamSource(new MediaStream([audioTracks[0]]));
+      vad.other.analyser = makeAnalyser(src);
+      sendDiagnostic("audio_status", "other(tab) VAD enabled");
+    } catch (error) {
+      sendDiagnostic("audio_init_error", `other(tab) failed: ${error.name} ${error.message}`);
+    }
+  } else {
+    sendDiagnostic("audio_status", "other(tab) no audio track — 「タブの音声を共有」未チェックの可能性");
+  }
+
+  // 自分 = マイク。startCapture がクリック直下で取得済み。ここでは接続のみ。
+  try {
+    const perm = await navigator.permissions.query({ name: "microphone" });
+    sendDiagnostic("audio_status", `mic permission: ${perm.state}`);
+  } catch {
+    // permissions API 非対応環境は無視
+  }
+
+  if (micStream) {
+    try {
+      const micSrc = audioContext.createMediaStreamSource(micStream);
+      vad.self.analyser = makeAnalyser(micSrc);
+      sendDiagnostic("audio_status", "self(mic) VAD enabled");
+    } catch (error) {
+      sendDiagnostic("audio_init_error", `self(mic) connect failed: ${error.name} ${error.message}`);
+    }
+  } else {
+    const reason = micRequestError
+      ? `${micRequestError.name} ${micRequestError.message}`
+      : "no mic stream";
+    sendDiagnostic("audio_init_error", `self(mic) failed: ${reason}（chrome://settings/content/microphone を確認）`);
+  }
+}
+
+function makeAnalyser(sourceNode) {
+  const analyser = audioContext.createAnalyser();
+  analyser.fftSize = 512;
+  sourceNode.connect(analyser);
+  return analyser;
+}
+
+function teardownAudioAnalysis() {
+  if (micStream) {
+    for (const t of micStream.getTracks()) t.stop();
+  }
+  micStream = null;
+  if (audioContext) audioContext.close().catch(() => {});
+  audioContext = null;
+  vad.self = createVadState();
+  vad.other = createVadState();
+}
+
+function computeRms(state) {
+  if (!state.buf) state.buf = new Uint8Array(state.analyser.fftSize);
+  state.analyser.getByteTimeDomainData(state.buf);
+  let sum = 0;
+  for (let i = 0; i < state.buf.length; i++) {
+    const v = (state.buf[i] - 128) / 128; // -1..1 に正規化
+    sum += v * v;
+  }
+  return Math.sqrt(sum / state.buf.length);
+}
+
+function sampleVad() {
+  const now = Date.now();
+  const cutoff = now - SPEECH_WINDOW_MS;
+  for (const key of ["self", "other"]) {
+    const s = vad[key];
+    if (!s.analyser) continue;
+    const speaking = computeRms(s) > VAD_RMS_THRESHOLD;
+    if (speaking) s.lastSpeechTs = now;
+    s.speaking = speaking;
+    s.history.push({ t: now, speaking });
+    while (s.history.length && s.history[0].t < cutoff) s.history.shift();
+  }
+}
+
+function buildSpeechFeatures() {
+  const now = Date.now();
+  const perSource = (key) => {
+    const s = vad[key];
+    if (!s.analyser) return null; // 音源が無い（例: タブ音声を共有していない）
+    const total = s.history.length;
+    const speakingCount = s.history.reduce((n, h) => n + (h.speaking ? 1 : 0), 0);
+    return {
+      speaking: s.speaking,
+      pause_ms: s.speaking ? 0 : Math.round(now - s.lastSpeechTs),
+      speech_ratio: total ? round(speakingCount / total) : 0
+    };
+  };
+  return { self: perSource("self"), other: perSource("other") };
+}
+
+function captureFrame() {
+  const video = elements.sourceVideo;
+  if (!video || !video.videoWidth) return;
+
+  // 最初5分を過ぎたら自動停止
+  if (Date.now() - captureStartTs > FRAME_CAPTURE_DURATION_MS) {
+    if (frameTimer) window.clearInterval(frameTimer);
+    frameTimer = null;
+    sendDiagnostic("frame_capture_done", "5分経過: 代表フレーム取得を終了");
+    return;
+  }
+
+  if (!frameCanvas) frameCanvas = document.createElement("canvas");
+  const w = FRAME_CAPTURE_WIDTH;
+  const h = Math.round((video.videoHeight / video.videoWidth) * w) || 270;
+  frameCanvas.width = w;
+  frameCanvas.height = h;
+  frameCanvas.getContext("2d").drawImage(video, 0, 0, w, h);
+  const dataUrl = frameCanvas.toDataURL("image/jpeg", 0.5);
+
+  // 画像本体はWSへ（UIログには要約のみ＝肥大化回避）
+  const event = { type: "frame_capture", t_ms: Date.now(), w, h, image: dataUrl };
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
+  logEvent({ type: "frame_capture", t_ms: event.t_ms, message: `frame ${w}x${h} ~${Math.round(dataUrl.length / 1024)}KB` });
+}
+
 function buildFeatures(faces, motionScore) {
   const faceVisible = faces.length > 0;
   const firstGaze = faces.find((face) => face.parts?.gaze_estimate)?.parts.gaze_estimate;
@@ -1115,6 +1436,7 @@ function buildFeatures(faces, motionScore) {
       visible_faces: engagement.visible_faces,
       calibrating: engagement.calibrating
     },
+    speech: buildSpeechFeatures(),
     gaze_estimate: faceVisible ? firstGaze ?? "unknown" : "not_visible",
     gestures: {
       nod_count: totalNodCount,
@@ -1170,6 +1492,12 @@ function drawEmptyPreview() {
   ctx.fillRect(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
 }
 
+function sendDiagnostic(type, message) {
+  const event = { type, message, t_ms: Date.now() };
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
+  logEvent(event);
+}
+
 function sendFeatureEvent() {
   const event = {
     type: "realtime_feature",
@@ -1184,6 +1512,7 @@ function sendFeatureEvent() {
     ws.send(JSON.stringify(event));
   }
 
+  storeFeatureEvent(event);
   logEvent(event);
 }
 
@@ -1258,6 +1587,7 @@ function createEmptyFeatures() {
     face_tracks: [],
     motion_score: 0,
     attention_score: 0,
+    speech: { self: null, other: null },
     gaze_estimate: "not_visible",
     gestures: {
       nod_count: 0,
@@ -1268,6 +1598,450 @@ function createEmptyFeatures() {
       face_landmarker: null
     }
   };
+}
+
+// --- Gemini Analysis ---
+
+let geminiApiKeyStored = null;
+let latestGeminiResult = null;
+
+async function restoreGeminiApiKey() {
+  // Try config.local.js first (hardcoded key for dev convenience)
+  try {
+    const config = await import("./config.local.js");
+    if (config.GEMINI_API_KEY) {
+      geminiApiKeyStored = config.GEMINI_API_KEY;
+      elements.geminiApiKey.value = "••••••••";
+      updateGeminiButton();
+      logEvent({ type: "gemini_api_key_loaded", source: "config.local.js" });
+      return;
+    }
+  } catch {
+    // config.local.js not found or empty — fall through to chrome.storage
+  }
+
+  const stored = await chrome.storage.local.get(["geminiApiKey"]);
+  if (stored.geminiApiKey) {
+    geminiApiKeyStored = stored.geminiApiKey;
+    elements.geminiApiKey.value = "••••••••";
+    updateGeminiButton();
+  }
+}
+restoreGeminiApiKey();
+
+async function saveGeminiApiKey() {
+  const key = elements.geminiApiKey.value.trim();
+  if (!key || key === "••••••••") return;
+  await chrome.storage.local.set({ geminiApiKey: key });
+  geminiApiKeyStored = key;
+  elements.geminiApiKey.value = "••••••••";
+  updateGeminiButton();
+  logEvent({ type: "gemini_api_key_saved" });
+}
+
+function updateGeminiButton() {
+  const hasKey = !!geminiApiKeyStored;
+  const hasFile = !!elements.videoFile.files[0];
+  elements.geminiAnalyzeButton.disabled = !(hasKey && hasFile);
+}
+
+async function runGeminiAnalysis() {
+  const file = elements.videoFile.files[0];
+  if (!file || !geminiApiKeyStored) return;
+
+  elements.geminiAnalyzeButton.disabled = true;
+  elements.geminiResult.style.display = "none";
+  elements.geminiStatus.textContent = "Starting...";
+
+  try {
+    const result = await analyzeVideoWithGemini(
+      geminiApiKeyStored,
+      file,
+      (status) => { elements.geminiStatus.textContent = status; }
+    );
+
+    latestGeminiResult = result;
+    elements.geminiResult.textContent = JSON.stringify(result, null, 2);
+    elements.geminiResult.style.display = "";
+    elements.geminiStatus.textContent = "Analysis complete";
+    logEvent({ type: "gemini_analysis_complete", participant_count: result.participants?.length ?? 0 });
+    updateUnifiedReportButton();
+  } catch (error) {
+    elements.geminiStatus.textContent = `Error: ${error.message}`;
+    logEvent({ type: "gemini_analysis_error", message: error.message });
+  } finally {
+    updateGeminiButton();
+  }
+}
+
+// --- Unified Report ---
+
+function updateUnifiedReportButton() {
+  // Enable when we have session data OR gemini result
+  const hasGemini = !!latestGeminiResult;
+  elements.unifiedReportButton.disabled = !hasGemini;
+}
+
+async function generateUnifiedReport() {
+  elements.unifiedReportButton.disabled = true;
+  elements.unifiedReportStatus.textContent = "レポート生成中...";
+
+  try {
+    const events = await exportSessionData(sessionId);
+    const featureEvents = events.filter((e) => e.type === "realtime_feature");
+    const gemini = latestGeminiResult;
+
+    const report = buildUnifiedReport(featureEvents, gemini);
+    renderUnifiedReport(report);
+    elements.unifiedReportStatus.textContent = "";
+    elements.unifiedReport.style.display = "";
+    logEvent({ type: "unified_report_generated", participants: report.participants.length });
+  } catch (error) {
+    elements.unifiedReportStatus.textContent = `Error: ${error.message}`;
+    logEvent({ type: "unified_report_error", message: error.message });
+  } finally {
+    updateUnifiedReportButton();
+  }
+}
+
+function buildUnifiedReport(featureEvents, gemini) {
+  // Aggregate per-participant stats from realtime data
+  const participantStats = new Map();
+  let totalFrames = 0;
+
+  for (const event of featureEvents) {
+    const features = event.features;
+    if (!features) continue;
+    totalFrames++;
+
+    for (const track of features.face_tracks ?? []) {
+      const id = track.participant_name || track.audience_id;
+      if (!participantStats.has(id)) {
+        participantStats.set(id, {
+          id,
+          participant_name: track.participant_name,
+          audience_id: track.audience_id,
+          frames: 0,
+          gaze_screen: 0,
+          total_eye_openness: 0,
+          total_mouth_openness: 0,
+          total_nod_score: 0,
+          nod_events: 0,
+          total_smile: 0,
+          smile_frames: 0,
+          total_brow_down: 0,
+          brow_frames: 0,
+          gaze_directions: { screen: 0, left: 0, right: 0, up: 0, down: 0, unknown: 0 },
+          attention_scores: [],
+          t_start: event.t_ms,
+          t_end: event.t_ms
+        });
+      }
+
+      const stats = participantStats.get(id);
+      stats.frames++;
+      stats.t_end = event.t_ms;
+
+      if (track.gaze_estimate === "screen") stats.gaze_screen++;
+      stats.gaze_directions[track.gaze_estimate] = (stats.gaze_directions[track.gaze_estimate] ?? 0) + 1;
+
+      if (track.eye_openness) {
+        stats.total_eye_openness += (track.eye_openness.left + track.eye_openness.right) / 2;
+      }
+      stats.total_mouth_openness += track.mouth_openness ?? 0;
+      stats.total_nod_score += track.gestures?.nod_score ?? 0;
+      stats.nod_events += track.gestures?.nod_count ?? 0;
+
+      const smile = track.blendshapes
+        ? ((track.blendshapes.mouthSmileLeft ?? 0) + (track.blendshapes.mouthSmileRight ?? 0)) / 2
+        : null;
+      if (smile != null) {
+        stats.total_smile += smile;
+        stats.smile_frames++;
+      }
+      const browDown = track.blendshapes
+        ? ((track.blendshapes.browDownLeft ?? 0) + (track.blendshapes.browDownRight ?? 0)) / 2
+        : null;
+      if (browDown != null) {
+        stats.total_brow_down += browDown;
+        stats.brow_frames++;
+      }
+    }
+  }
+
+  // Room-level aggregation
+  const roomEngagementTimeline = featureEvents
+    .filter((e) => e.features?.room_engagement)
+    .map((e) => ({
+      t_ms: e.t_ms,
+      ...e.features.room_engagement,
+      motion: e.features.motion_score,
+      face_count: e.features.face_count
+    }));
+
+  // Merge realtime stats with Gemini per-participant insights
+  const participants = [];
+  const geminiParticipants = gemini?.participants ?? [];
+
+  for (const [, stats] of participantStats) {
+    const avg = (total, count) => count > 0 ? round(total / count) : 0;
+
+    // Try to match with Gemini participant by name/position
+    const geminiMatch = findGeminiMatch(stats, geminiParticipants);
+
+    participants.push({
+      id: stats.id,
+      participant_name: stats.participant_name,
+      audience_id: stats.audience_id,
+      duration_sec: Math.round((stats.t_end - stats.t_start) / 1000),
+      visible_frames: stats.frames,
+      realtime: {
+        gaze_screen_ratio: avg(stats.gaze_screen, stats.frames),
+        avg_eye_openness: avg(stats.total_eye_openness, stats.frames),
+        avg_mouth_openness: avg(stats.total_mouth_openness, stats.frames),
+        avg_nod_score: avg(stats.total_nod_score, stats.frames),
+        total_nod_events: stats.nod_events,
+        avg_smile: avg(stats.total_smile, stats.smile_frames),
+        avg_brow_down: avg(stats.total_brow_down, stats.brow_frames),
+        gaze_distribution: stats.gaze_directions
+      },
+      gemini: geminiMatch ? {
+        overall_engagement: geminiMatch.overall_engagement,
+        engagement_summary: geminiMatch.engagement_summary,
+        timeline: geminiMatch.timeline
+      } : null
+    });
+  }
+
+  // If Gemini has participants not in realtime data, add them too
+  for (const gp of geminiParticipants) {
+    const alreadyMatched = participants.some((p) => p.gemini && findGeminiMatch(p, [gp]));
+    if (!alreadyMatched) {
+      const existingById = participants.find((p) =>
+        p.participant_name === gp.name_or_position || p.id === gp.name_or_position
+      );
+      if (!existingById) {
+        participants.push({
+          id: gp.name_or_position,
+          participant_name: gp.name_or_position,
+          audience_id: null,
+          duration_sec: 0,
+          visible_frames: 0,
+          realtime: null,
+          gemini: {
+            overall_engagement: gp.overall_engagement,
+            engagement_summary: gp.engagement_summary,
+            timeline: gp.timeline
+          }
+        });
+      }
+    }
+  }
+
+  return {
+    session_id: sessionId,
+    generated_at: new Date().toISOString(),
+    total_frames: totalFrames,
+    duration_sec: featureEvents.length > 0
+      ? Math.round((featureEvents[featureEvents.length - 1].t_ms - featureEvents[0].t_ms) / 1000)
+      : 0,
+    participants,
+    meeting_summary: gemini?.meeting_summary ?? null,
+    room_engagement_timeline: roomEngagementTimeline
+  };
+}
+
+function findGeminiMatch(stats, geminiParticipants) {
+  if (!geminiParticipants.length) return null;
+
+  // Exact name match
+  if (stats.participant_name) {
+    const match = geminiParticipants.find((gp) =>
+      gp.name_or_position === stats.participant_name
+    );
+    if (match) return match;
+  }
+
+  // Position-based heuristic: if only one participant in both, match them
+  if (geminiParticipants.length === 1 && stats.frames > 0) {
+    return geminiParticipants[0];
+  }
+
+  return null;
+}
+
+function renderUnifiedReport(report) {
+  const el = elements.unifiedReport;
+  let html = "";
+
+  // Meeting overview
+  html += `<h3>Meeting Overview</h3>`;
+  html += `<table>`;
+  html += `<tr><th>Session</th><td>${report.session_id}</td></tr>`;
+  html += `<tr><th>Duration</th><td>${formatDuration(report.duration_sec)}</td></tr>`;
+  html += `<tr><th>Total Frames</th><td>${report.total_frames}</td></tr>`;
+  html += `<tr><th>Participants</th><td>${report.participants.length}</td></tr>`;
+  html += `</table>`;
+
+  // Meeting summary from Gemini
+  if (report.meeting_summary) {
+    const ms = report.meeting_summary;
+    html += `<h3>Meeting Summary (Gemini)</h3>`;
+    html += `<p>Overall: ${engagementTag(ms.overall_engagement)}</p>`;
+    if (ms.key_moments?.length) {
+      html += `<ul>${ms.key_moments.map((m) => `<li>${escapeHtml(m)}</li>`).join("")}</ul>`;
+    }
+    if (ms.recommendations?.length) {
+      html += `<p><strong>Recommendations:</strong></p>`;
+      html += `<ul>${ms.recommendations.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>`;
+    }
+  }
+
+  // Per-participant details
+  html += `<h3>Participants</h3>`;
+  for (const p of report.participants) {
+    html += `<table>`;
+    html += `<tr><th colspan="2">${escapeHtml(p.participant_name || p.id)}`;
+    if (p.gemini) html += ` ${engagementTag(p.gemini.overall_engagement)}`;
+    html += `</th></tr>`;
+
+    if (p.realtime) {
+      html += `<tr><th>Visible</th><td>${formatDuration(p.duration_sec)} (${p.visible_frames} frames)</td></tr>`;
+      html += `<tr><th>Gaze on screen</th><td>${pct(p.realtime.gaze_screen_ratio)}</td></tr>`;
+      html += `<tr><th>Avg eye openness</th><td>${p.realtime.avg_eye_openness}</td></tr>`;
+      html += `<tr><th>Avg smile</th><td>${p.realtime.avg_smile}</td></tr>`;
+      html += `<tr><th>Nod events</th><td>${p.realtime.total_nod_events} (avg score: ${p.realtime.avg_nod_score})</td></tr>`;
+    }
+
+    if (p.gemini) {
+      html += `<tr><th>Gemini summary</th><td>${escapeHtml(p.gemini.engagement_summary ?? "-")}</td></tr>`;
+      if (p.gemini.timeline?.length) {
+        html += `<tr><th>Timeline</th><td>`;
+        html += `<table>`;
+        html += `<tr><th>Time</th><th>Expression</th><th>Level</th><th>Reaction</th></tr>`;
+        for (const t of p.gemini.timeline) {
+          html += `<tr>`;
+          html += `<td>${escapeHtml(t.time_range ?? "")}</td>`;
+          html += `<td>${escapeHtml(t.expression ?? "")}</td>`;
+          html += `<td>${engagementTag(t.engagement_level)}</td>`;
+          html += `<td>${escapeHtml(t.notable_reaction ?? "-")}</td>`;
+          html += `</tr>`;
+        }
+        html += `</table></td></tr>`;
+      }
+    }
+
+    html += `</table>`;
+  }
+
+  // Export button
+  html += `<button class="report-export" onclick="this.dispatchEvent(new CustomEvent('export-report', {bubbles:true}))">レポートをJSONエクスポート</button>`;
+
+  el.innerHTML = html;
+
+  // Attach export handler
+  el.querySelector(".report-export")?.addEventListener("click", () => {
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `unified_report_${sessionId}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    logEvent({ type: "unified_report_exported" });
+  });
+}
+
+function engagementTag(level) {
+  if (!level) return "";
+  const cls = level === "high" ? "tag-high" : level === "medium" ? "tag-medium" : "tag-low";
+  return `<span class="tag ${cls}">${escapeHtml(level)}</span>`;
+}
+
+function formatDuration(sec) {
+  if (!sec) return "0s";
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function pct(ratio) {
+  return `${Math.round(ratio * 100)}%`;
+}
+
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = String(str);
+  return div.innerHTML;
+}
+
+// --- Session Storage (IndexedDB) ---
+
+const SESSION_DB_NAME = "reaction_engine_sessions";
+const SESSION_DB_VERSION = 1;
+const SESSION_STORE_NAME = "events";
+
+let sessionDb = null;
+
+async function openSessionDb() {
+  if (sessionDb) return sessionDb;
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(SESSION_DB_NAME, SESSION_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(SESSION_STORE_NAME)) {
+        const store = db.createObjectStore(SESSION_STORE_NAME, { autoIncrement: true });
+        store.createIndex("session_id", "session_id", { unique: false });
+        store.createIndex("t_ms", "t_ms", { unique: false });
+      }
+    };
+    request.onsuccess = () => {
+      sessionDb = request.result;
+      resolve(sessionDb);
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function storeFeatureEvent(event) {
+  try {
+    const db = await openSessionDb();
+    const tx = db.transaction(SESSION_STORE_NAME, "readwrite");
+    tx.objectStore(SESSION_STORE_NAME).add(event);
+  } catch (error) {
+    console.debug("[reaction-engine] failed to store event", error);
+  }
+}
+
+async function exportSessionData(targetSessionId) {
+  const db = await openSessionDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SESSION_STORE_NAME, "readonly");
+    const index = tx.objectStore(SESSION_STORE_NAME).index("session_id");
+    const request = index.getAll(targetSessionId);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function downloadSessionJson() {
+  try {
+    const events = await exportSessionData(sessionId);
+    if (!events.length) {
+      logEvent({ type: "export_error", message: "No data for current session" });
+      return;
+    }
+    const blob = new Blob([JSON.stringify(events, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${sessionId}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    logEvent({ type: "export_complete", message: `${events.length} events exported` });
+  } catch (error) {
+    logEvent({ type: "export_error", message: error.message });
+  }
 }
 
 function createSessionId() {
