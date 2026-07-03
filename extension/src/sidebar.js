@@ -983,33 +983,43 @@ function pitchRange(samples, startIndex, endIndex) {
 }
 
 async function setupAudioAnalysis(displayStream) {
+  const startTs = Date.now();
+  vad.self.lastSpeechTs = startTs;
+  vad.other.lastSpeechTs = startTs;
+
   try {
     audioContext = new AudioContext();
     if (audioContext.state === "suspended") await audioContext.resume();
-    const startTs = Date.now();
-    vad.self.lastSpeechTs = startTs;
-    vad.other.lastSpeechTs = startTs;
+    sendDiagnostic("audio_status", `AudioContext state=${audioContext.state}`);
+  } catch (error) {
+    sendDiagnostic("audio_init_error", `AudioContext failed: ${error.name} ${error.message}`);
+    return;
+  }
 
-    // 相手 = タブ音声（getDisplayMedia の audio トラックを流用。スピーカー前のデジタル音声）
-    const otherTrack = displayStream.getAudioTracks()[0];
-    if (otherTrack) {
-      const src = audioContext.createMediaStreamSource(new MediaStream([otherTrack]));
+  // 相手 = タブ音声（getDisplayMedia の audio トラックを流用。スピーカー前のデジタル音声）
+  const audioTracks = displayStream.getAudioTracks();
+  if (audioTracks[0]) {
+    try {
+      const src = audioContext.createMediaStreamSource(new MediaStream([audioTracks[0]]));
       vad.other.analyser = makeAnalyser(src);
+      sendDiagnostic("audio_status", "other(tab) VAD enabled");
+    } catch (error) {
+      sendDiagnostic("audio_init_error", `other(tab) failed: ${error.name} ${error.message}`);
     }
+  } else {
+    sendDiagnostic("audio_status", "other(tab) no audio track — 「タブの音声を共有」未チェックの可能性");
+  }
 
-    // 自分 = マイク（AEC on で相手声のかぶりを消す）
+  // 自分 = マイク（AEC on で相手声のかぶりを消す）。失敗してもタブ音声は生かす
+  try {
     micStream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     });
     const micSrc = audioContext.createMediaStreamSource(micStream);
     vad.self.analyser = makeAnalyser(micSrc);
-
-    logEvent({
-      type: "audio_status",
-      message: `audio VAD enabled (self:${!!vad.self.analyser} other:${!!vad.other.analyser})`
-    });
+    sendDiagnostic("audio_status", "self(mic) VAD enabled");
   } catch (error) {
-    logEvent({ type: "audio_init_error", message: error.message });
+    sendDiagnostic("audio_init_error", `self(mic) failed: ${error.name} ${error.message}`);
   }
 }
 
@@ -1174,6 +1184,12 @@ function drawFacePartPoints(faceParts) {
 function drawEmptyPreview() {
   ctx.fillStyle = "#101828";
   ctx.fillRect(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+}
+
+function sendDiagnostic(type, message) {
+  const event = { type, message, t_ms: Date.now() };
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
+  logEvent(event);
 }
 
 function sendFeatureEvent() {
