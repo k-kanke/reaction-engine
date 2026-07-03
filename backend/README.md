@@ -37,7 +37,7 @@ backend/
     contract/       Shared Go structs and JSON Schema / OpenAPI contracts
     config/         Environment config loading and validation
     observability/  Logging, metrics, tracing helpers
-  migrations/       Cloud SQL migrations
+  migrations/       Cloud SQL migrations in golang-migrate format
   deploy/           Cloud Run and Google Cloud deployment files
   scripts/          Local backend utility scripts
   tests/            Backend tests
@@ -45,10 +45,30 @@ backend/
 
 ## Initial Service Split
 
-- `reaction-gateway`: WebSocket Gateway, Memorystore writes, signal summary / decision log, Pub/Sub publish, feedback return.
-- `reaction-media-api`: signed upload URL, media_ref, capture_snapshots, media_uploaded publish.
-- `reaction-writer`: Pub/Sub consumer, Cloud Storage JSONL writer, Cloud SQL signal summary / decision log writer.
-- `reaction-image-analysis-worker`: image + capture_snapshots.feature_snapshot -> participant_baseline / visual_summary.
-- `reaction-analysis-job`: Cloud Run Job for post-session analysis.
+- `r-gateway`: WebSocket Gateway, Memorystore writes, signal summary / decision log, Pub/Sub publish, feedback return.
+- `r-media-api`: signed upload URL, media_ref, capture_snapshots, media_uploaded publish.
+- `r-writer`: Pub/Sub consumer, Cloud Storage JSONL writer, Cloud SQL signal summary / decision log writer.
+- `r-image-worker`: image + capture_snapshots.feature_snapshot -> participant_baseline / visual_summary.
+- `r-post-session-job`: Cloud Run Job for post-session analysis.
 
 Keep high-frequency compact raw feature events out of Cloud SQL. Store compact raw features as JSONL chunks in Cloud Storage and put metadata, signal summaries, decision logs, feedback history, and reports in Cloud SQL.
+
+## Migration Naming
+
+Use `golang-migrate/migrate` standard SQL file names.
+
+```text
+backend/migrations/
+  000001_initial_schema.up.sql
+  000001_initial_schema.down.sql
+  000002_add_capture_snapshots.up.sql
+  000002_add_capture_snapshots.down.sql
+```
+
+Rules:
+
+- Use a 6-digit sequence number.
+- Use snake_case for the description.
+- Do not include dates in migration file names.
+- Always create `up.sql` and `down.sql` as a pair.
+- Track migration creation timing through Git history.

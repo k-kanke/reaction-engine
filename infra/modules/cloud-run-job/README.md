@@ -2,5 +2,4 @@
 
 Terraform module placeholder for Cloud Run Jobs such as:
 
-- `reaction-analysis-job`
-
+- `r-post-session-job`

@@ -45,11 +45,11 @@ Chrome 拡張から送られる `realtime_feature` / `audio_chunk` を Cloud Run
 - Google Cloud project id
 - default region
 - Cloud Run service / job 名
-  - `reaction-gateway`
-  - `reaction-media-api`
-  - `reaction-writer`
-  - `reaction-image-analysis-worker`
-  - `reaction-post-session-job`
+  - `r-gateway`
+  - `r-media-api`
+  - `r-writer`
+  - `r-image-worker`
+  - `r-post-session-job`
 - Pub/Sub topic / subscription 名
   - topic: `feature-events`
   - topic: `media-analysis-events`
@@ -401,6 +401,25 @@ POST /sessions/{session_id}/media/{capture_id}/complete
 
 - `backend/migrations/`
 
+ファイル形式:
+
+```text
+backend/migrations/
+  000001_initial_schema.up.sql
+  000001_initial_schema.down.sql
+  000002_add_capture_snapshots.up.sql
+  000002_add_capture_snapshots.down.sql
+```
+
+命名ルール:
+
+- `golang-migrate/migrate` 標準形式にする。
+- 6桁連番を使う。
+- description は snake_case にする。
+- 日付はファイル名に入れない。
+- `up.sql` と `down.sql` を必ずペアで作る。
+- migration の作成日時は Git 履歴で追う。
+
 必要テーブル:
 
 - `sessions`
@@ -462,14 +481,14 @@ Go 実装:
 
 ### 13.2 Cloud Run service split
 
-- `reaction-gateway`
-- `reaction-media-api`
-- `reaction-writer`
-- `reaction-image-analysis-worker`
+- `r-gateway`
+- `r-media-api`
+- `r-writer`
+- `r-image-worker`
 
 Cloud Run Jobs:
 
-- `reaction-post-session-job`
+- `r-post-session-job`
 
 ## Phase 14: Observability
 
