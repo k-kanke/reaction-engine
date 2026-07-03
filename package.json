@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Google Meet reaction analysis Chrome extension.",
   "scripts": {
+    "env": "node scripts/generate-config.cjs",
     "check": "node --check extension/src/sidebar.js && node --check extension/src/service-worker.js && node --check extension/src/content-script.js && node --check scripts/ws-log-server.cjs",
     "ws:log": "node scripts/ws-log-server.cjs"
   },
