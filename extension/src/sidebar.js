@@ -51,6 +51,28 @@ let trackHistory = new Map();
 let nextTrackId = 1;
 let latestTileSnapshot = null;
 
+// --- 音声VAD (§4-1): ローカルのみ。相手=タブ音声, 自分=マイク(AEC) ---
+const VAD_INTERVAL_MS = 100; // VADサンプリング間隔
+const VAD_RMS_THRESHOLD = 0.02; // 発話判定のRMS閾値（仮値・後で実データ調整）
+const SPEECH_WINDOW_MS = 5000; // speech_ratio を出す移動窓
+let audioContext = null;
+let micStream = null;
+let vadTimer = null;
+const vad = {
+  self: createVadState(),
+  other: createVadState()
+};
+
+function createVadState() {
+  return {
+    analyser: null,
+    buf: null,
+    speaking: false,
+    lastSpeechTs: 0,
+    history: [] // {t, speaking} 直近 SPEECH_WINDOW_MS 分
+  };
+}
+
 elements.sessionId.textContent = sessionId;
 restoreSettings();
 initEdgeVision();
@@ -205,8 +227,11 @@ async function startCapture() {
     elements.stopButton.disabled = false;
     previousFrame = null;
 
+    setupAudioAnalysis(stream);
+
     analysisTimer = window.setInterval(runAnalysisFrame, ANALYSIS_INTERVAL_MS);
     eventTimer = window.setInterval(sendFeatureEvent, EVENT_INTERVAL_MS);
+    vadTimer = window.setInterval(sampleVad, VAD_INTERVAL_MS);
     setStatus("Capturing", "active");
   } catch (error) {
     setStatus("Capture failed", "error");
@@ -217,8 +242,11 @@ async function startCapture() {
 function stopCapture() {
   if (analysisTimer) window.clearInterval(analysisTimer);
   if (eventTimer) window.clearInterval(eventTimer);
+  if (vadTimer) window.clearInterval(vadTimer);
   analysisTimer = null;
   eventTimer = null;
+  vadTimer = null;
+  teardownAudioAnalysis();
 
   if (stream) {
     for (const track of stream.getTracks()) track.stop();
@@ -954,6 +982,96 @@ function pitchRange(samples, startIndex, endIndex) {
   return Math.max(...pitches) - Math.min(...pitches);
 }
 
+async function setupAudioAnalysis(displayStream) {
+  try {
+    audioContext = new AudioContext();
+    if (audioContext.state === "suspended") await audioContext.resume();
+    const startTs = Date.now();
+    vad.self.lastSpeechTs = startTs;
+    vad.other.lastSpeechTs = startTs;
+
+    // 相手 = タブ音声（getDisplayMedia の audio トラックを流用。スピーカー前のデジタル音声）
+    const otherTrack = displayStream.getAudioTracks()[0];
+    if (otherTrack) {
+      const src = audioContext.createMediaStreamSource(new MediaStream([otherTrack]));
+      vad.other.analyser = makeAnalyser(src);
+    }
+
+    // 自分 = マイク（AEC on で相手声のかぶりを消す）
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    const micSrc = audioContext.createMediaStreamSource(micStream);
+    vad.self.analyser = makeAnalyser(micSrc);
+
+    logEvent({
+      type: "audio_status",
+      message: `audio VAD enabled (self:${!!vad.self.analyser} other:${!!vad.other.analyser})`
+    });
+  } catch (error) {
+    logEvent({ type: "audio_init_error", message: error.message });
+  }
+}
+
+function makeAnalyser(sourceNode) {
+  const analyser = audioContext.createAnalyser();
+  analyser.fftSize = 512;
+  sourceNode.connect(analyser);
+  return analyser;
+}
+
+function teardownAudioAnalysis() {
+  if (micStream) {
+    for (const t of micStream.getTracks()) t.stop();
+  }
+  micStream = null;
+  if (audioContext) audioContext.close().catch(() => {});
+  audioContext = null;
+  vad.self = createVadState();
+  vad.other = createVadState();
+}
+
+function computeRms(state) {
+  if (!state.buf) state.buf = new Uint8Array(state.analyser.fftSize);
+  state.analyser.getByteTimeDomainData(state.buf);
+  let sum = 0;
+  for (let i = 0; i < state.buf.length; i++) {
+    const v = (state.buf[i] - 128) / 128; // -1..1 に正規化
+    sum += v * v;
+  }
+  return Math.sqrt(sum / state.buf.length);
+}
+
+function sampleVad() {
+  const now = Date.now();
+  const cutoff = now - SPEECH_WINDOW_MS;
+  for (const key of ["self", "other"]) {
+    const s = vad[key];
+    if (!s.analyser) continue;
+    const speaking = computeRms(s) > VAD_RMS_THRESHOLD;
+    if (speaking) s.lastSpeechTs = now;
+    s.speaking = speaking;
+    s.history.push({ t: now, speaking });
+    while (s.history.length && s.history[0].t < cutoff) s.history.shift();
+  }
+}
+
+function buildSpeechFeatures() {
+  const now = Date.now();
+  const perSource = (key) => {
+    const s = vad[key];
+    if (!s.analyser) return null; // 音源が無い（例: タブ音声を共有していない）
+    const total = s.history.length;
+    const speakingCount = s.history.reduce((n, h) => n + (h.speaking ? 1 : 0), 0);
+    return {
+      speaking: s.speaking,
+      pause_ms: s.speaking ? 0 : Math.round(now - s.lastSpeechTs),
+      speech_ratio: total ? round(speakingCount / total) : 0
+    };
+  };
+  return { self: perSource("self"), other: perSource("other") };
+}
+
 function buildFeatures(faces, motionScore) {
   const faceVisible = faces.length > 0;
   const firstGaze = faces.find((face) => face.parts?.gaze_estimate)?.parts.gaze_estimate;
@@ -1003,6 +1121,7 @@ function buildFeatures(faces, motionScore) {
       visible_faces: engagement.visible_faces,
       calibrating: engagement.calibrating
     },
+    speech: buildSpeechFeatures(),
     gaze_estimate: faceVisible ? firstGaze ?? "unknown" : "not_visible",
     gestures: {
       nod_count: totalNodCount,
@@ -1145,6 +1264,7 @@ function createEmptyFeatures() {
     face_tracks: [],
     motion_score: 0,
     attention_score: 0,
+    speech: { self: null, other: null },
     gaze_estimate: "not_visible",
     gestures: {
       nod_count: 0,
