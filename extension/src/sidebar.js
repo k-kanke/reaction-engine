@@ -244,7 +244,10 @@ async function runAnalysisFrame() {
     const motionScore = calculateMotionScore(imageData);
     previousFrame = imageData;
 
-    const faces = await analyzeFaces();
+    // Create ImageBitmap for MediaPipe — avoids WebGL context issues in side panel
+    const bitmap = await createImageBitmap(canvas);
+    const faces = await analyzeFaces(bitmap);
+    bitmap.close();
     const trackedFaces = updateTracks(faces);
     updateGestureHistory(trackedFaces);
     latestFeatures = buildFeatures(trackedFaces, motionScore);
@@ -255,37 +258,37 @@ async function runAnalysisFrame() {
   }
 }
 
-async function detectFaces() {
+async function detectFaces(bitmap) {
   if (!faceDetectorBackend) return [];
 
   try {
-    return await faceDetectorBackend.detect(elements.sourceVideo, performance.now());
+    return await faceDetectorBackend.detect(bitmap, performance.now());
   } catch (error) {
     logEvent({ type: "face_detection_error", message: error.message });
     return [];
   }
 }
 
-async function detectFaceParts() {
+async function detectFaceParts(bitmap) {
   if (!faceLandmarkerBackend) return [];
 
   try {
-    return faceLandmarkerBackend.detect(canvas, performance.now());
+    return faceLandmarkerBackend.detect(bitmap, performance.now());
   } catch (error) {
     logEvent({ type: "face_landmarker_error", message: error.message });
     return [];
   }
 }
 
-async function analyzeFaces() {
+async function analyzeFaces(bitmap) {
   // FaceLandmarker alone provides bbox + landmarks + blendshapes + iris.
   // Only fall back to FaceDetector when FaceLandmarker is unavailable.
   if (faceLandmarkerBackend) {
-    const faceParts = await detectFaceParts();
+    const faceParts = await detectFaceParts(bitmap);
     return faceParts.map((parts) => ({ ...parts.face_bbox, parts }));
   }
 
-  return detectFaces();
+  return detectFaces(bitmap);
 }
 
 function normalizeNativeFace(box) {
