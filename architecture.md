@@ -15,11 +15,15 @@ Reaction Engine は、Google Meet 上の発表・商談・授業・社内共有�
 | Chrome Extension | Chrome MV3 | Meet 画面/音声取得、Edge Vision、feature event 送信 |
 | WebSocket Gateway | Cloud Run service | `realtime_feature` 受信、Redis/Pub/Sub への分岐、`feedback_event` 返却 |
 | システム演算層 | Cloud Run WebSocket Gateway 内 | window 集計、変化率、signal summary、decision log の一回計算 |
+| Media API | Cloud Run service | baseline frame 用 signed upload URL 発行、media_ref 登録 |
 | Realtime state | Memorystore for Redis | 直近 window、latest state、feedback cooldown |
 | Durable event pipeline | Pub/Sub | compact raw feature、signal summary、decision log を後続 worker に渡す durable queue |
+| Baseline event pipeline | Pub/Sub | baseline capture 完了 event を Baseline Calibration Job に渡す |
 | Durable Writer | Cloud Run service / Cloud Run worker | Pub/Sub を購読し、Cloud Storage / Cloud SQL に保存 |
+| Baseline Calibration Job | Cloud Run Jobs | baseline frames と特徴量から participant baseline を計算 |
 | Compact raw feature storage | Cloud Storage | compact raw feature JSONL、代表フレーム、短いクリップ |
-| App database | Cloud SQL for PostgreSQL | session、participant、signal summary、decision log、feedback history、report |
+| Baseline frame storage | Cloud Storage | baseline 用 screenshot / manifest |
+| App database | Cloud SQL for PostgreSQL | session、participant、participant baseline、signal summary、decision log、feedback history、report |
 | Post-session jobs | Cloud Run Jobs | セッション後分析、レポート生成 |
 | Transcript | Speech-to-Text | 発話の文字起こし |
 | LLM report | Vertex AI / Gemini | 反応タイムライン、改善提案、レポート生成 |
@@ -28,6 +32,12 @@ Reaction Engine は、Google Meet 上の発表・商談・授業・社内共有�
 | Observability | Cloud Logging / Cloud Monitoring | logs、metrics、alerts、latency/cost 監視 |
 
 ## 全体像
+
+全体像は、3つのフローに分けて読む。
+
+- リアルタイムフロー: 発表中に特徴量を受け取り、即時 feedback を返す
+- 全体フィードバックフロー: セッション後の保存・集計・レポート生成を行う
+- 画像処理フロー: baseline 用 screenshot を扱い、個人差補正の基準値を作る
 
 ```mermaid
 flowchart TB
@@ -40,22 +50,29 @@ flowchart TB
     sidebar["Sidebar UI<br/>スコア・フィードバック表示"]
   end
 
-  subgraph realtime["Realtime Path"]
+  subgraph realtime["リアルタイムフロー"]
     gateway["Cloud Run<br/>WebSocket Gateway"]
     redis[("Memorystore for Redis<br/>ZSET/HASH recent state")]
     systemCompute["システム演算層<br/>window集計・signal summary・decision log"]
     decision["Realtime Decision<br/>rule・template・cooldown"]
   end
 
-  subgraph durable["Durable / Async Path"]
+  subgraph durable["全体フィードバックフロー"]
     pubsub["Pub/Sub<br/>feature-events topic"]
     writer["Cloud Run Durable Writer<br/>batch persist / retry"]
-    storage[("Cloud Storage<br/>compact raw feature JSONL / signal summaries / decision logs / frames / clips")]
-    cloudsql[("Cloud SQL for PostgreSQL<br/>sessions / summaries / reports")]
+    storage[("Cloud Storage<br/>compact raw feature JSONL / signal summaries / decision logs / clips")]
+    cloudsql[("Cloud SQL for PostgreSQL<br/>sessions / baselines / summaries / reports")]
     jobs["Cloud Run Jobs<br/>post-session analysis"]
     stt["Speech-to-Text"]
     vertex["Vertex AI / Gemini"]
     bq[("BigQuery optional<br/>analytics / evaluation")]
+  end
+
+  subgraph baselineImage["画像処理フロー"]
+    mediaApi["Cloud Run<br/>Media API"]
+    baselineStorage[("Cloud Storage<br/>baseline frames / manifest")]
+    baselinePubsub["Pub/Sub<br/>baseline-calibration-events topic"]
+    baselineJob["Cloud Run Job<br/>baseline-calibration-job"]
   end
 
   presenter --> meet
@@ -76,11 +93,27 @@ flowchart TB
   writer -->|signal summary / decision log / feedback history| cloudsql
   writer -.->|optional load jobs| bq
 
+  edge -->|baseline frame upload URL request| mediaApi
+  mediaApi -->|signed upload URL| edge
+  edge -->|PUT baseline frame| baselineStorage
+  edge -->|media_ref registration| mediaApi
+  mediaApi -->|media_ref / baseline manifest| cloudsql
+  mediaApi -->|baseline_capture_completed| baselinePubsub
+  baselinePubsub --> baselineJob
+  baselineJob -->|read baseline frames / manifest| baselineStorage
+  storage -.->|read same-window feature summaries| baselineJob
+  baselineJob -->|participant_baselines| cloudsql
+  cloudsql -.->|baseline cache source| gateway
+
   storage --> jobs
   cloudsql --> jobs
   jobs --> stt
   jobs --> vertex
   jobs -->|report| cloudsql
+
+  style baselineImage fill:#fff7cc,stroke:#facc15,stroke-width:2px,color:#111827
+  classDef baselineNode fill:#fffbeb,stroke:#f59e0b,stroke-width:1px,color:#111827
+  class mediaApi,baselineStorage,baselinePubsub,baselineJob baselineNode
 ```
 
 ## Chrome 拡張の責務
@@ -94,9 +127,70 @@ Chrome 拡張はリアルタイム分析の一次処理を担当する。
 - 将来的に audio level、silence、speaking rate などを生成する
 - `realtime_feature` を WebSocket で Cloud Run Gateway に送る
 - Gateway からの `feedback_event` を sidebar に表示する
+- baseline 取得期間は、数秒おきに screenshot を WebP で生成する
+- baseline frame は WebSocket ではなく Media API の signed upload URL で Cloud Storage に直接 upload する
 - 代表フレーム/短いクリップが必要な場合だけ upload 経路を使う
 
 現状は Meet DOM の参加者名・タイル ID との紐づけ、音声特徴量、本格的な視線推定は未実装。
+
+## Media API / Baseline Frame Upload
+
+baseline 用 screenshot は realtime WebSocket path に混ぜない。画像は重いため、Cloud Run Media API が signed upload URL を発行し、Chrome 拡張が Cloud Storage に直接 upload する。
+
+推奨 baseline capture:
+
+- duration: session 開始後 30秒程度
+- interval: 3〜5秒
+- frame count: 6〜10枚
+- format: `image/webp`
+- quality: 0.6〜0.8
+
+API:
+
+```text
+POST /sessions/{session_id}/media/upload-url
+POST /sessions/{session_id}/media
+POST /sessions/{session_id}/baseline/complete
+```
+
+Upload URL request:
+
+```json
+{
+  "purpose": "baseline_frame",
+  "content_type": "image/webp",
+  "t_ms": 12345,
+  "audience_id": "aud_1",
+  "tile_id": "tile_1"
+}
+```
+
+Upload URL response:
+
+```json
+{
+  "upload_url": "https://storage.googleapis.com/...",
+  "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/baseline/frames/12345-aud_1.webp",
+  "expires_at": "2026-07-03T12:00:00Z"
+}
+```
+
+media_ref registration:
+
+```json
+{
+  "type": "media_ref",
+  "purpose": "baseline_frame",
+  "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/baseline/frames/12345-aud_1.webp",
+  "t_ms": 12345,
+  "audience_id": "aud_1",
+  "tile_id": "tile_1",
+  "content_type": "image/webp",
+  "nearest_feature_event_id": "evt_123"
+}
+```
+
+`baseline/complete` を受けた Media API は Pub/Sub topic `baseline-calibration-events` に `baseline_capture_completed` event を publish する。
 
 ## Cloud Run WebSocket Gateway
 
@@ -220,6 +314,29 @@ Pub/Sub message:
 
 Pub/Sub は最終保存先ではない。Cloud Run Durable Writer が subscribe し、保存成功後に ack する。失敗時は retry / dead-letter topic を使う。
 
+Baseline calibration 用には別 topic を使う。
+
+Topic:
+
+```text
+baseline-calibration-events
+```
+
+Message:
+
+```json
+{
+  "event_id": "evt_baseline_123",
+  "type": "baseline_capture_completed",
+  "schema_version": 1,
+  "session_id": "sess_123",
+  "t_start_ms": 0,
+  "t_end_ms": 30000,
+  "frame_count": 8,
+  "manifest_ref": "gs://reaction-engine-sessions/sessions/sess_123/baseline/manifest.jsonl"
+}
+```
+
 ## Durable Writer
 
 Durable Writer は Cloud Run service または Cloud Run worker として動かす。Pub/Sub subscription から realtime analysis event を受け取り、後分析用データとして保存する。
@@ -255,6 +372,47 @@ Cloud SQL for PostgreSQL:
 ```
 
 Cloud Storage の JSONL は append ではなく、一定件数/一定時間ごとの chunk file として作る。重複は `event_id` で後分析時に dedupe できるようにする。
+
+## Baseline Calibration Job
+
+Baseline Calibration Job は Cloud Run Jobs として動かす。session 開始直後の baseline frames と同じ時間帯の compact raw feature / signal summary をまとめて読み、参加者または face track ごとの baseline を作る。
+
+入力:
+
+- `baseline-calibration-events`
+- Cloud Storage の baseline frames
+- Cloud Storage の baseline manifest
+- Cloud Storage の compact raw feature JSONL
+- Cloud Storage / Cloud SQL の signal summary
+
+処理:
+
+1. `session_id` と baseline capture window を受け取る。
+2. baseline frames と manifest を読む。
+3. 同じ時間帯の compact raw feature / signal summary を読む。
+4. `audience_id` / `tile_id` / `face_track_id` ごとに baseline を計算する。
+5. `participant_baselines` を Cloud SQL に保存する。
+6. 必要なら `session:baseline:{session_id}` として Memorystore に cache する。
+
+保存する baseline 例:
+
+```json
+{
+  "session_id": "sess_123",
+  "audience_id": "aud_1",
+  "baseline": {
+    "attention_score_avg": 0.61,
+    "motion_score_avg": 0.05,
+    "gaze_screen_ratio": 0.72,
+    "head_pose_center": { "yaw": 0.03, "pitch": -0.08, "roll": 0.01 },
+    "eye_openness_avg": { "left": 0.42, "right": 0.44 }
+  },
+  "sample_count": 8,
+  "confidence": 0.74
+}
+```
+
+baseline ができるまでの最初の 30〜60秒は `baseline_status = warming_up` として扱う。Gateway のシステム演算層は、baseline が未準備なら session default threshold で控えめに feedback を出し、baseline 完了後に個人差補正を使う。
 
 ## リアルタイム分析
 
@@ -387,6 +545,9 @@ MVP では transcript を必須にしない。後分析の品質を上げる段�
 | compact raw feature | 再集計・後分析 source of truth | Pub/Sub -> Cloud Storage |
 | signal summary | リアルタイム判断根拠・後分析 | Pub/Sub -> Cloud Storage / Cloud SQL |
 | decision log | feedback の根拠・評価 | Pub/Sub -> Cloud Storage / Cloud SQL |
+| baseline frame | baseline 計算の根拠・短期再処理 | Signed upload -> Cloud Storage |
+| baseline manifest | baseline frame と feature event の対応 | Cloud Storage / Cloud SQL |
+| participant baseline | 個人差補正・しきい値補正 | Cloud SQL / Memorystore cache |
 | session metadata | lifecycle / consent / role | Cloud SQL for PostgreSQL |
 | session summary | レポート・一覧表示 | Cloud SQL for PostgreSQL |
 | feedback history | UI / 評価 / report | Cloud SQL for PostgreSQL |
@@ -403,8 +564,11 @@ MVP では transcript を必須にしない。後分析の品質を上げる段�
 6. Pub/Sub topic `feature-events` に compact raw feature + signal summary + decision log を publish する
 7. Cloud Run Durable Writer で Pub/Sub から JSONL を Cloud Storage に保存する
 8. Cloud SQL に session metadata / signal summary / decision log / feedback history を保存する
-9. session end で Cloud Run Job を起動する
-10. compact raw JSONL + signal summary + transcript からセッション後レポートを生成する
+9. Media API で baseline frame の signed upload URL と media_ref 登録を実装する
+10. `baseline-calibration-events` と Baseline Calibration Job を追加する
+11. participant baseline を Cloud SQL に保存し、必要なら Memorystore に cache する
+12. session end で Cloud Run Job を起動する
+13. compact raw JSONL + signal summary + transcript からセッション後レポートを生成する
 
 ## 技術選定
 
@@ -416,6 +580,8 @@ MVP では transcript を必須にしない。後分析の品質を上げる段�
 - Durable Event Pipeline: Pub/Sub
 - Durable Writer: Cloud Run service / worker
 - Durable Storage: Cloud Storage JSONL
+- Media Upload: Cloud Run signed upload API + Cloud Storage signed URL
+- Baseline Calibration: Cloud Run Jobs + Pub/Sub
 - App DB: Cloud SQL for PostgreSQL
 - Post-session Workers: Cloud Run Jobs
 - Transcript: Speech-to-Text
@@ -432,4 +598,6 @@ MVP では transcript を必須にしない。後分析の品質を上げる段�
 - Cloud Storage JSONL は chunk file として保存し、後分析時に `event_id` で dedupe する。
 - Cloud SQL に compact raw feature を全件 insert しない。Cloud SQL は metadata、signal summary、decision log、report、feedback history を持つ。
 - full face landmarks / face_parts は常時保存しない。debug mode、sampling、anomaly segment、明示的な consent がある場合だけ保存する。
+- baseline frame は WebSocket に流さない。signed upload URL で Cloud Storage に直接 upload し、Pub/Sub には `media_ref` / manifest だけを流す。
+- baseline frame は顔画像を含むため、consent と retention を feature event より厳しく扱う。
 - BigQuery は MVP では必須ではない。セッション横断分析や評価が必要になった段階で追加する。
