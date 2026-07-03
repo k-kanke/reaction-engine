@@ -1339,25 +1339,45 @@ function analyzeAudio(state, sampleRate) {
   const rms = Math.sqrt(sumSq / n);
 
   // ピッチ = 自己相関で基本周波数を推定（人声域 70〜400Hz）。小音量/無声は null
-  let pitchHz = null;
-  if (rms >= 0.01) {
-    const minLag = Math.floor(sampleRate / 400);
-    const maxLag = Math.floor(sampleRate / 70);
-    let bestLag = -1;
-    let bestCorr = 0;
-    for (let lag = minLag; lag <= maxLag; lag++) {
-      let corr = 0;
-      for (let i = 0; i < n - lag; i++) corr += buf[i] * buf[i + lag];
-      corr /= n - lag;
-      if (corr > bestCorr) {
-        bestCorr = corr;
-        bestLag = lag;
-      }
-    }
-    if (bestLag > 0 && bestCorr > 0.01) pitchHz = Math.round(sampleRate / bestLag);
-  }
+  const pitchHz = rms >= 0.015 ? detectPitch(buf, n, sampleRate) : null;
 
   return { rms, pitchHz };
+}
+
+// 正規化自己相関＋放物線補間で基本周波数を推定。周期性が弱ければ null
+function detectPitch(buf, n, sampleRate) {
+  const minLag = Math.max(2, Math.floor(sampleRate / 400));
+  const maxLag = Math.min(n - 2, Math.floor(sampleRate / 70));
+
+  let energy = 0;
+  for (let i = 0; i < n; i++) energy += buf[i] * buf[i];
+  if (energy <= 0) return null;
+
+  const corr = new Float32Array(maxLag + 2);
+  let bestLag = -1;
+  let bestVal = 0;
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let sum = 0;
+    for (let i = 0; i < n - lag; i++) sum += buf[i] * buf[i + lag];
+    const c = sum / energy; // 0付近〜1に正規化。長lagほど項数減で自然に減衰=低域誤検出を抑制
+    corr[lag] = c;
+    if (c > bestVal) {
+      bestVal = c;
+      bestLag = lag;
+    }
+  }
+  // 十分な周期性がある voiced 区間だけ採用（無声/子音は null）
+  if (bestLag < 0 || bestVal < 0.5) return null;
+
+  // 放物線補間でサブサンプル精度
+  let lag = bestLag;
+  const cl = corr[bestLag - 1];
+  const cr = corr[bestLag + 1];
+  const denom = 2 * (2 * bestVal - cl - cr);
+  if (denom !== 0) lag = bestLag + (cr - cl) / denom;
+
+  const hz = sampleRate / lag;
+  return hz >= 70 && hz <= 400 ? Math.round(hz) : null;
 }
 
 function sampleVad() {
