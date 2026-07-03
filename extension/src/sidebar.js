@@ -6,8 +6,8 @@ import {
 
 const ANALYSIS_INTERVAL_MS = 250;
 const EVENT_INTERVAL_MS = 1000;
-const PREVIEW_WIDTH = 640;
-const PREVIEW_HEIGHT = 360;
+let PREVIEW_WIDTH = 640;
+let PREVIEW_HEIGHT = 360;
 const MEDIAPIPE_MODEL_PATH = "models/blaze_face_short_range.tflite";
 const MEDIAPIPE_LANDMARKER_MODEL_PATH = "models/face_landmarker.task";
 const GESTURE_HISTORY_MS = 3500;
@@ -107,7 +107,7 @@ async function createMediaPipeFaceDetector() {
         delegate: "CPU"
       },
       runningMode: "VIDEO",
-      minDetectionConfidence: 0.45
+      minDetectionConfidence: 0.3
     });
 
     return {
@@ -136,9 +136,9 @@ async function createMediaPipeFaceLandmarker() {
       runningMode: "VIDEO",
       numFaces: 4,
       outputFaceBlendshapes: true,
-      minFaceDetectionConfidence: 0.45,
-      minFacePresenceConfidence: 0.45,
-      minTrackingConfidence: 0.45
+      minFaceDetectionConfidence: 0.3,
+      minFacePresenceConfidence: 0.3,
+      minTrackingConfidence: 0.3
     });
 
     return {
@@ -277,6 +277,9 @@ async function startVideoFileAnalysis() {
     return;
   }
 
+  // Use higher resolution for file analysis to detect smaller/distant faces
+  setAnalysisResolution(1280, 720);
+
   previousFrame = null;
   tracks = [];
   trackHistory = new Map();
@@ -292,6 +295,13 @@ async function startVideoFileAnalysis() {
   eventTimer = window.setInterval(sendFeatureEvent, EVENT_INTERVAL_MS);
   setStatus("Analyzing file", "active");
   logEvent({ type: "video_file_started", message: file.name });
+}
+
+function setAnalysisResolution(w, h) {
+  PREVIEW_WIDTH = w;
+  PREVIEW_HEIGHT = h;
+  canvas.width = w;
+  canvas.height = h;
 }
 
 function stopVideoFileAnalysis() {
@@ -310,6 +320,7 @@ function stopVideoFileAnalysis() {
   }
 
   video.src = "";
+  setAnalysisResolution(640, 360);
   elements.uploadPlayButton.disabled = false;
   elements.uploadStopButton.disabled = true;
   elements.startButton.disabled = false;
