@@ -3,6 +3,7 @@ import {
   FaceLandmarker,
   FilesetResolver
 } from "../vendor/mediapipe/vision_bundle.mjs";
+import { analyzeVideoWithGemini } from "./gemini.js";
 
 const ANALYSIS_INTERVAL_MS = 250;
 const EVENT_INTERVAL_MS = 1000;
@@ -29,6 +30,11 @@ const elements = {
   micPermButton: document.getElementById("micPermButton"),
   eventLog: document.getElementById("eventLog"),
   exportButton: document.getElementById("exportButton"),
+  geminiApiKey: document.getElementById("geminiApiKey"),
+  saveApiKeyButton: document.getElementById("saveApiKeyButton"),
+  geminiAnalyzeButton: document.getElementById("geminiAnalyzeButton"),
+  geminiStatus: document.getElementById("geminiStatus"),
+  geminiResult: document.getElementById("geminiResult"),
   videoFile: document.getElementById("videoFile"),
   uploadPlayButton: document.getElementById("uploadPlayButton"),
   uploadStopButton: document.getElementById("uploadStopButton"),
@@ -95,6 +101,8 @@ elements.videoFile.addEventListener("change", handleVideoFileSelect);
 elements.uploadPlayButton.addEventListener("click", startVideoFileAnalysis);
 elements.uploadStopButton.addEventListener("click", stopVideoFileAnalysis);
 elements.exportButton.addEventListener("click", downloadSessionJson);
+elements.saveApiKeyButton.addEventListener("click", saveGeminiApiKey);
+elements.geminiAnalyzeButton.addEventListener("click", runGeminiAnalysis);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "meet_tile_snapshot") {
@@ -316,6 +324,7 @@ function handleVideoFileSelect() {
   elements.uploadPlayButton.disabled = false;
   elements.uploadStopButton.disabled = true;
   logEvent({ type: "video_file_selected", message: file.name });
+  updateGeminiButton();
 }
 
 async function startVideoFileAnalysis() {
@@ -1585,6 +1594,65 @@ function createEmptyFeatures() {
       face_landmarker: null
     }
   };
+}
+
+// --- Gemini Analysis ---
+
+let geminiApiKeyStored = null;
+let latestGeminiResult = null;
+
+async function restoreGeminiApiKey() {
+  const stored = await chrome.storage.local.get(["geminiApiKey"]);
+  if (stored.geminiApiKey) {
+    geminiApiKeyStored = stored.geminiApiKey;
+    elements.geminiApiKey.value = "••••••••";
+    updateGeminiButton();
+  }
+}
+restoreGeminiApiKey();
+
+async function saveGeminiApiKey() {
+  const key = elements.geminiApiKey.value.trim();
+  if (!key || key === "••••••••") return;
+  await chrome.storage.local.set({ geminiApiKey: key });
+  geminiApiKeyStored = key;
+  elements.geminiApiKey.value = "••••••••";
+  updateGeminiButton();
+  logEvent({ type: "gemini_api_key_saved" });
+}
+
+function updateGeminiButton() {
+  const hasKey = !!geminiApiKeyStored;
+  const hasFile = !!elements.videoFile.files[0];
+  elements.geminiAnalyzeButton.disabled = !(hasKey && hasFile);
+}
+
+async function runGeminiAnalysis() {
+  const file = elements.videoFile.files[0];
+  if (!file || !geminiApiKeyStored) return;
+
+  elements.geminiAnalyzeButton.disabled = true;
+  elements.geminiResult.style.display = "none";
+  elements.geminiStatus.textContent = "Starting...";
+
+  try {
+    const result = await analyzeVideoWithGemini(
+      geminiApiKeyStored,
+      file,
+      (status) => { elements.geminiStatus.textContent = status; }
+    );
+
+    latestGeminiResult = result;
+    elements.geminiResult.textContent = JSON.stringify(result, null, 2);
+    elements.geminiResult.style.display = "";
+    elements.geminiStatus.textContent = "Analysis complete";
+    logEvent({ type: "gemini_analysis_complete", participant_count: result.participants?.length ?? 0 });
+  } catch (error) {
+    elements.geminiStatus.textContent = `Error: ${error.message}`;
+    logEvent({ type: "gemini_analysis_error", message: error.message });
+  } finally {
+    updateGeminiButton();
+  }
 }
 
 // --- Session Storage (IndexedDB) ---

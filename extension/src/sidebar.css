@@ -172,6 +172,20 @@ input {
   padding: 0;
 }
 
+.gemini-result {
+  background: #f2f4f7;
+  border-radius: 6px;
+  color: #344054;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  margin-top: 8px;
+  max-height: 400px;
+  overflow: auto;
+  padding: 10px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 input[type="file"] {
   border: none;
   padding: 0;
