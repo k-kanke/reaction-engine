@@ -446,9 +446,15 @@ function estimateIris(landmarks) {
   const rightOuter = landmarks[263];
   if (!leftInner || !leftOuter || !rightInner || !rightOuter) return null;
 
-  // Iris position ratio within eye (0=outer corner, 1=inner corner)
-  const leftRatioX = (leftCenter.x - leftOuter.x) / Math.max(0.001, leftInner.x - leftOuter.x);
-  const rightRatioX = (rightCenter.x - rightOuter.x) / Math.max(0.001, rightInner.x - rightOuter.x);
+  // Iris position ratio within eye (0=outer corner, 1=inner corner).
+  // 左右で目頭/目尻の x 順が逆(左目 inner>outer, 右目 inner<outer)なので、
+  // 分母を正の下限に潰すと右目が壊れる。符号を保ったまま 0 割りだけ避ける。
+  const signedDenomX = (inner, outer) => {
+    const d = inner.x - outer.x;
+    return Math.abs(d) < 0.001 ? (d < 0 ? -0.001 : 0.001) : d;
+  };
+  const leftRatioX = (leftCenter.x - leftOuter.x) / signedDenomX(leftInner, leftOuter);
+  const rightRatioX = (rightCenter.x - rightOuter.x) / signedDenomX(rightInner, rightOuter);
 
   const leftTop = landmarks[159];
   const leftBottom = landmarks[145];
