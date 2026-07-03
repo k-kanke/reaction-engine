@@ -135,6 +135,58 @@ flowchart TB
   privacyControls --> mediaApi
 ```
 
+## 全体アーキテクチャ（簡易版）
+
+上図は詳細度が高いため、第三者にも一目で伝わるよう概念レベルに圧縮したもの。5つの塊（発信者〜Meet、Chrome拡張、リアルタイム判断、蓄積・非同期分析、運用）で全体の流れを示す。
+
+なお本セクション時点で実装済みなのは Chrome 拡張（Edge Vision MVP）のみで、リアルタイム判断/蓄積・非同期分析/運用は未実装（設計段階）。
+
+```mermaid
+flowchart TB
+  presenter["発信者"]
+  meet["Google Meet"]
+
+  subgraph extension["Chrome拡張（Edge AI）"]
+    capture["画面/音声キャプチャ"]
+    vision["Edge Vision/Audio<br/>顔検出・視線・動き・音声特徴量"]
+    sidebar["Sidebar UI<br/>スコア表示・フィードバック"]
+  end
+
+  subgraph realtime["リアルタイム判断"]
+    stream["集計・平滑化"]
+    decision["判断エンジン<br/>ルール+軽量モデル"]
+  end
+
+  subgraph platform["蓄積・非同期分析"]
+    store[("イベント/メディア保存")]
+    analysis["文字起こし・変化点検出・LLMレポート生成"]
+  end
+
+  ops["モデル/プロンプト運用・評価"]
+
+  presenter --> meet
+  meet --> capture
+  capture --> vision
+  vision -->|特徴量イベント| stream
+  stream --> decision
+  decision -->|即時フィードバック| sidebar
+  sidebar --> presenter
+
+  vision -->|特徴量/代表フレーム| store
+  store --> analysis
+  analysis -->|反応タイムライン/レポート| presenter
+
+  ops -.->|しきい値/モデル更新| decision
+  ops -.->|プロンプト/モデル更新| analysis
+```
+
+**読み方**
+
+- 左上〜拡張: 発信者が Meet を開くと、拡張がタブ画面をキャプチャし、ブラウザ内（Edge）で顔・視線・動き・音声の特徴量を抽出する。画像そのものは基本的にサーバーに送らない。
+- リアルタイム判断: 特徴量イベントを集計し、断定しすぎない軽いフィードバック（例:「反応が薄くなっている可能性」）を即座に発信者へ返す。
+- 蓄積・非同期分析: 特徴量や代表フレームだけをサーバーに送り、会議後にまとめて文字起こし・変化点検出・LLMでレポート化する。
+- 運用: プロンプト/モデル/しきい値は継続的に評価・更新され、リアルタイム判断と非同期分析の両方にフィードバックされる。
+
 ## Edge Vision Pipeline
 
 発信者が見たことのある「顔を四角で囲ってリアルタイムに検出する」処理は、この層で実現する。基本は Chrome 拡張内で `video -> canvas -> detector -> tracking -> features -> sidebar/debug overlay` の流れを作る。
