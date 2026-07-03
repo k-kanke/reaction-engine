@@ -97,3 +97,21 @@ Rules:
 - Do not include dates in migration file names.
 - Always create `up.sql` and `down.sql` as a pair.
 - Track migration creation timing through Git history.
+
+## Getting Started
+
+```bash
+cd backend
+go test ./...
+make build
+```
+
+Run a single service locally (each exposes `GET /healthz`, except `writer` and `post-session-job`):
+
+```bash
+make run-gateway       # http://localhost:8080/healthz
+make run-media-api     # http://localhost:8081/healthz
+make run-writer
+make run-image-worker  # http://localhost:8082/debug/healthz
+make run-post-session-job
+```
