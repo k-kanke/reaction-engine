@@ -136,9 +136,9 @@ async function createMediaPipeFaceLandmarker() {
       runningMode: "VIDEO",
       numFaces: 4,
       outputFaceBlendshapes: true,
-      minFaceDetectionConfidence: 0.3,
-      minFacePresenceConfidence: 0.3,
-      minTrackingConfidence: 0.3
+      minFaceDetectionConfidence: 0.2,
+      minFacePresenceConfidence: 0.2,
+      minTrackingConfidence: 0.2
     });
 
     return {
@@ -277,8 +277,9 @@ async function startVideoFileAnalysis() {
     return;
   }
 
-  // Use higher resolution for file analysis to detect smaller/distant faces
-  setAnalysisResolution(1280, 720);
+  // Use the video's native resolution for maximum face detection accuracy
+  setAnalysisResolution(video.videoWidth, video.videoHeight);
+  logEvent({ type: "video_file_resolution", message: `${video.videoWidth}x${video.videoHeight}` });
 
   previousFrame = null;
   tracks = [];
