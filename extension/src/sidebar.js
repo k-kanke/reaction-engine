@@ -55,6 +55,13 @@ let latestTileSnapshot = null;
 const VAD_INTERVAL_MS = 100; // VADサンプリング間隔
 const VAD_RMS_THRESHOLD = 0.02; // 発話判定のRMS閾値（仮値・後で実データ調整）
 const SPEECH_WINDOW_MS = 5000; // speech_ratio を出す移動窓
+// --- 代表フレーム取得 (§2.2 LLM定期パス用): 最初5分・30秒ごと ---
+const FRAME_CAPTURE_INTERVAL_MS = 30000; // 30秒ごと
+const FRAME_CAPTURE_DURATION_MS = 5 * 60 * 1000; // 最初の5分だけ
+const FRAME_CAPTURE_WIDTH = 480; // 縮小送信（プライバシー/帯域配慮）
+let frameTimer = null;
+let frameCanvas = null;
+let captureStartTs = 0;
 let audioContext = null;
 let micStream = null;
 let vadTimer = null;
@@ -232,6 +239,9 @@ async function startCapture() {
     analysisTimer = window.setInterval(runAnalysisFrame, ANALYSIS_INTERVAL_MS);
     eventTimer = window.setInterval(sendFeatureEvent, EVENT_INTERVAL_MS);
     vadTimer = window.setInterval(sampleVad, VAD_INTERVAL_MS);
+    captureStartTs = Date.now();
+    captureFrame(); // 開始直後に1枚
+    frameTimer = window.setInterval(captureFrame, FRAME_CAPTURE_INTERVAL_MS);
     setStatus("Capturing", "active");
   } catch (error) {
     setStatus("Capture failed", "error");
@@ -243,9 +253,11 @@ function stopCapture() {
   if (analysisTimer) window.clearInterval(analysisTimer);
   if (eventTimer) window.clearInterval(eventTimer);
   if (vadTimer) window.clearInterval(vadTimer);
+  if (frameTimer) window.clearInterval(frameTimer);
   analysisTimer = null;
   eventTimer = null;
   vadTimer = null;
+  frameTimer = null;
   teardownAudioAnalysis();
 
   if (stream) {
@@ -1080,6 +1092,32 @@ function buildSpeechFeatures() {
     };
   };
   return { self: perSource("self"), other: perSource("other") };
+}
+
+function captureFrame() {
+  const video = elements.sourceVideo;
+  if (!video || !video.videoWidth) return;
+
+  // 最初5分を過ぎたら自動停止
+  if (Date.now() - captureStartTs > FRAME_CAPTURE_DURATION_MS) {
+    if (frameTimer) window.clearInterval(frameTimer);
+    frameTimer = null;
+    sendDiagnostic("frame_capture_done", "5分経過: 代表フレーム取得を終了");
+    return;
+  }
+
+  if (!frameCanvas) frameCanvas = document.createElement("canvas");
+  const w = FRAME_CAPTURE_WIDTH;
+  const h = Math.round((video.videoHeight / video.videoWidth) * w) || 270;
+  frameCanvas.width = w;
+  frameCanvas.height = h;
+  frameCanvas.getContext("2d").drawImage(video, 0, 0, w, h);
+  const dataUrl = frameCanvas.toDataURL("image/jpeg", 0.5);
+
+  // 画像本体はWSへ（UIログには要約のみ＝肥大化回避）
+  const event = { type: "frame_capture", t_ms: Date.now(), w, h, image: dataUrl };
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
+  logEvent({ type: "frame_capture", t_ms: event.t_ms, message: `frame ${w}x${h} ~${Math.round(dataUrl.length / 1024)}KB` });
 }
 
 function buildFeatures(faces, motionScore) {
