@@ -28,6 +28,7 @@ const elements = {
   stopButton: document.getElementById("stopButton"),
   micPermButton: document.getElementById("micPermButton"),
   eventLog: document.getElementById("eventLog"),
+  exportButton: document.getElementById("exportButton"),
   videoFile: document.getElementById("videoFile"),
   uploadPlayButton: document.getElementById("uploadPlayButton"),
   uploadStopButton: document.getElementById("uploadStopButton"),
@@ -93,6 +94,7 @@ elements.connectButton.addEventListener("click", toggleWebSocket);
 elements.videoFile.addEventListener("change", handleVideoFileSelect);
 elements.uploadPlayButton.addEventListener("click", startVideoFileAnalysis);
 elements.uploadStopButton.addEventListener("click", stopVideoFileAnalysis);
+elements.exportButton.addEventListener("click", downloadSessionJson);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "meet_tile_snapshot") {
@@ -1497,6 +1499,7 @@ function sendFeatureEvent() {
     ws.send(JSON.stringify(event));
   }
 
+  storeFeatureEvent(event);
   logEvent(event);
 }
 
@@ -1582,6 +1585,75 @@ function createEmptyFeatures() {
       face_landmarker: null
     }
   };
+}
+
+// --- Session Storage (IndexedDB) ---
+
+const SESSION_DB_NAME = "reaction_engine_sessions";
+const SESSION_DB_VERSION = 1;
+const SESSION_STORE_NAME = "events";
+
+let sessionDb = null;
+
+async function openSessionDb() {
+  if (sessionDb) return sessionDb;
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(SESSION_DB_NAME, SESSION_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(SESSION_STORE_NAME)) {
+        const store = db.createObjectStore(SESSION_STORE_NAME, { autoIncrement: true });
+        store.createIndex("session_id", "session_id", { unique: false });
+        store.createIndex("t_ms", "t_ms", { unique: false });
+      }
+    };
+    request.onsuccess = () => {
+      sessionDb = request.result;
+      resolve(sessionDb);
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function storeFeatureEvent(event) {
+  try {
+    const db = await openSessionDb();
+    const tx = db.transaction(SESSION_STORE_NAME, "readwrite");
+    tx.objectStore(SESSION_STORE_NAME).add(event);
+  } catch (error) {
+    console.debug("[reaction-engine] failed to store event", error);
+  }
+}
+
+async function exportSessionData(targetSessionId) {
+  const db = await openSessionDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(SESSION_STORE_NAME, "readonly");
+    const index = tx.objectStore(SESSION_STORE_NAME).index("session_id");
+    const request = index.getAll(targetSessionId);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function downloadSessionJson() {
+  try {
+    const events = await exportSessionData(sessionId);
+    if (!events.length) {
+      logEvent({ type: "export_error", message: "No data for current session" });
+      return;
+    }
+    const blob = new Blob([JSON.stringify(events, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${sessionId}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    logEvent({ type: "export_complete", message: `${events.length} events exported` });
+  } catch (error) {
+    logEvent({ type: "export_error", message: error.message });
+  }
 }
 
 function createSessionId() {

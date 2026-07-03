@@ -156,6 +156,11 @@ input {
   margin: 0 0 8px;
 }
 
+#exportButton {
+  margin-bottom: 8px;
+  width: 100%;
+}
+
 .event-log {
   display: flex;
   flex-direction: column;
