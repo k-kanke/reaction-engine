@@ -115,3 +115,25 @@ make run-writer
 make run-image-worker  # http://localhost:8082/debug/healthz
 make run-post-session-job
 ```
+
+## Docker Compose
+
+Run the full local stack (postgres, redis, gateway, media-api, writer, image-analysis-worker) with Docker Compose:
+
+```bash
+cp backend/.env.example backend/.env.local
+docker compose up --build
+```
+
+```bash
+curl http://localhost:8080/healthz
+curl http://localhost:8081/healthz
+```
+
+`docker compose build --build-arg SERVICE=<name>` is not needed directly; `compose.yaml` sets each service's `SERVICE` build arg already. To build a single service image manually:
+
+```bash
+docker build -f backend/Dockerfile --build-arg SERVICE=gateway backend
+```
+
+`post-session-job` is a one-shot job and is intentionally not part of `compose.yaml`; run it with `make run-post-session-job` or `docker run` on demand.
