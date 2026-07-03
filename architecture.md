@@ -627,6 +627,41 @@ LLM呼び出しの頻度・レイテンシ・コスト・失敗率は Cloud Moni
 6. report を Cloud SQL に保存する
 7. 必要に応じて BigQuery に評価・分析用データを export する
 
+## 録画アップロード分析（オプション）
+
+リアルタイム経路（realtime feature + streaming STT）は単体で完結する。録画アップロード分析は、その精度を上げるための **任意（オプション）機能** であり必須ではない。
+
+前提となる動線:
+
+- 録画は Google Workspace 有料プランの Google Meet 録画機能で取得する（主催者の Google Drive の Meet Recordings に保存される）。拡張側では録画しない。
+- ユーザーが会議後に、その録画ファイルを任意でアップロードする（アップロードは明示的なユーザー操作）。
+
+分析ロジックは現行と同じ:
+
+- フィードバック生成ロジックは、リアルタイム／セッション後分析と同一。すなわち **特徴量の変化量**（attention / gaze / motion / audio などの変化点）と、**文字起こしによる発話内容** を突き合わせて evidence を作り、Vertex AI / Gemini で report / coaching suggestion を生成する。
+- 録画は「新しい分析ロジック」を持ち込むのではなく、**同じ分析に、より高品質な入力を与える**だけである。
+
+録画で精度が上がる理由:
+
+- リアルタイムは edge 処理のためフレーム間引き・取りこぼし・低解像度がある。録画は **全フレーム・フル解像度で vision（MediaPipe）を再解析** でき、feature timeline が密で正確になる。
+- リアルタイムの streaming STT に対し、録画は **フル音声を asynchronous Speech-to-Text でバッチ認識** できるため、transcript の欠落・誤りが減る。
+- → ユーザーには「録画をアップロードすると分析精度が上がる」という位置づけで提示する。
+
+GCP 上の処理（既存のセッション後分析を再利用）:
+
+1. Media API で録画ファイルの signed upload URL を発行し、Cloud Storage に直接 upload、session_id に紐付けて media_ref を登録する。
+2. アップロード完了を契機に、録画あり用の Cloud Run Job を起動する。
+3. 録画映像から vision を再解析し、高精度な feature timeline を生成する。
+4. 録画音声を asynchronous Speech-to-Text で文字起こしし、session と同じ時計に align する（録画のタイムベースを session の絶対時刻へマップする）。
+5. 以降は既存のセッション後分析（変化点検出 → evidence 集約 → Gemini で report / coaching 生成）と同じ処理を通す。
+6. 既存のリアルタイム由来レポートを、録画由来の高精度版で補強または差し替える。
+
+注意:
+
+- 録画は顔映像・生音声を含むため、consent と retention を feature event / baseline frame より厳しく扱う。`Session.consent` に録画アップロード分析用の独立した同意項目を持たせる。
+- リアルタイム経路が「生 PCM を保存しない／事後ASRを行わない」方針なのに対し、録画パスは **ユーザーが明示的にアップロードした録画に限り** asynchronous STT と映像再解析を行う例外として扱う。
+- 処理後の録画本体の保持方針（保持しない／一定期間で削除など）を明示する。
+
 ## Speech-to-Text / Transcript
 
 文字起こしは会議中に Speech-to-Text streaming でリアルタイムに行う。事後の非同期認識（asynchronous recognition）は行わない。
