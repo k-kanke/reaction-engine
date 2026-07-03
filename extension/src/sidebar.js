@@ -1606,6 +1606,20 @@ let geminiApiKeyStored = null;
 let latestGeminiResult = null;
 
 async function restoreGeminiApiKey() {
+  // Try config.local.js first (hardcoded key for dev convenience)
+  try {
+    const config = await import("./config.local.js");
+    if (config.GEMINI_API_KEY) {
+      geminiApiKeyStored = config.GEMINI_API_KEY;
+      elements.geminiApiKey.value = "••••••••";
+      updateGeminiButton();
+      logEvent({ type: "gemini_api_key_loaded", source: "config.local.js" });
+      return;
+    }
+  } catch {
+    // config.local.js not found or empty — fall through to chrome.storage
+  }
+
   const stored = await chrome.storage.local.get(["geminiApiKey"]);
   if (stored.geminiApiKey) {
     geminiApiKeyStored = stored.geminiApiKey;
