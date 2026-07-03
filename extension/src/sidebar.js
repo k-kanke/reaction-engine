@@ -180,7 +180,7 @@ async function createMediaPipeFaceLandmarker() {
         delegate: "CPU"
       },
       runningMode: "VIDEO",
-      numFaces: 4,
+      numFaces: 8,
       outputFaceBlendshapes: true,
       minFaceDetectionConfidence: 0.2,
       minFacePresenceConfidence: 0.2,
@@ -441,9 +441,9 @@ async function runAnalysisFrame() {
 
 function detectGridTiles(imageData, width, height) {
   const data = imageData.data;
-  const DARK_THRESHOLD = 35;
-  const GAP_MIN_PX = 3;
-  const TILE_MIN_PX = 60;
+  const DARK_THRESHOLD = 55;
+  const GAP_MIN_PX = 2;
+  const TILE_MIN_PX = 50;
 
   // Scan each row: compute average brightness
   function rowBrightness(y) {
@@ -542,6 +542,10 @@ async function analyzeWithTileCrop() {
   if (!tiles?.length) {
     const imageData = ctx.getImageData(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT);
     tiles = detectGridTiles(imageData, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+    if (tiles.length && !analyzeWithTileCrop._logged) {
+      analyzeWithTileCrop._logged = true;
+      logEvent({ type: "grid_detect", tiles: tiles.length, resolution: `${PREVIEW_WIDTH}x${PREVIEW_HEIGHT}` });
+    }
   }
 
   if (!tiles?.length) {
