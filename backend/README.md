@@ -53,6 +53,31 @@ backend/
 
 Keep high-frequency compact raw feature events out of Cloud SQL. Store compact raw features as JSONL chunks in Cloud Storage and put metadata, signal summaries, decision logs, feedback history, and reports in Cloud SQL.
 
+These logical service names are fixed and used identically in local Docker Compose and in Cloud Run.
+
+## Local Ports
+
+Fixed for local Docker Compose. Cloud Run uses `PORT` injected by the platform instead.
+
+| service                 | local address                       |
+| ----------------------- | ------------------------------------ |
+| gateway                 | http://localhost:8080                |
+| media-api               | http://localhost:8081                |
+| writer                  | internal only (no exposed port)      |
+| image-analysis-worker   | internal only, or http://localhost:8082/debug |
+| postgres                | localhost:5432                       |
+| redis                   | localhost:6379                       |
+
+## Local Environment
+
+Local env values are fixed in `backend/.env.example` (tracked) and instantiated as `backend/.env.local` (untracked, gitignored) for actual local runs:
+
+```bash
+cp backend/.env.example backend/.env.local
+```
+
+`backend/.env.local` is the file Docker Compose and locally-run services read. Its variable names must stay consistent with `architecture.md`; only the values differ between local and Cloud Run so that env is the sole switch between environments.
+
 ## Migration Naming
 
 Use `golang-migrate/migrate` standard SQL file names.
