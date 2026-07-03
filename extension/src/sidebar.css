@@ -197,6 +197,69 @@ input[type="file"] {
   margin-top: 8px;
 }
 
+.unified-report {
+  margin-top: 8px;
+  max-height: 600px;
+  overflow: auto;
+}
+
+.unified-report h3 {
+  font-size: 13px;
+  margin: 12px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.unified-report h3:first-child {
+  margin-top: 0;
+}
+
+.unified-report table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  margin: 4px 0 8px;
+}
+
+.unified-report th,
+.unified-report td {
+  border: 1px solid var(--border);
+  padding: 4px 6px;
+  text-align: left;
+}
+
+.unified-report th {
+  background: #f2f4f7;
+  font-weight: 600;
+}
+
+.unified-report .tag {
+  display: inline-block;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+}
+
+.unified-report .tag-high { background: #d4edda; color: #155724; }
+.unified-report .tag-medium { background: #fff3cd; color: #856404; }
+.unified-report .tag-low { background: #f8d7da; color: #721c24; }
+
+.unified-report ul {
+  margin: 4px 0;
+  padding-left: 18px;
+}
+
+.unified-report li {
+  font-size: 12px;
+  margin: 2px 0;
+}
+
+.unified-report .report-export {
+  margin-top: 8px;
+  width: 100%;
+}
+
 .event-log li {
   background: #f2f4f7;
   border-radius: 6px;

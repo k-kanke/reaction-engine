@@ -38,7 +38,10 @@ const elements = {
   videoFile: document.getElementById("videoFile"),
   uploadPlayButton: document.getElementById("uploadPlayButton"),
   uploadStopButton: document.getElementById("uploadStopButton"),
-  uploadControls: document.querySelector(".upload-controls")
+  uploadControls: document.querySelector(".upload-controls"),
+  unifiedReportButton: document.getElementById("unifiedReportButton"),
+  unifiedReportStatus: document.getElementById("unifiedReportStatus"),
+  unifiedReport: document.getElementById("unifiedReport")
 };
 
 const canvas = elements.preview;
@@ -103,6 +106,7 @@ elements.uploadStopButton.addEventListener("click", stopVideoFileAnalysis);
 elements.exportButton.addEventListener("click", downloadSessionJson);
 elements.saveApiKeyButton.addEventListener("click", saveGeminiApiKey);
 elements.geminiAnalyzeButton.addEventListener("click", runGeminiAnalysis);
+elements.unifiedReportButton.addEventListener("click", generateUnifiedReport);
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "meet_tile_snapshot") {
@@ -1647,12 +1651,314 @@ async function runGeminiAnalysis() {
     elements.geminiResult.style.display = "";
     elements.geminiStatus.textContent = "Analysis complete";
     logEvent({ type: "gemini_analysis_complete", participant_count: result.participants?.length ?? 0 });
+    updateUnifiedReportButton();
   } catch (error) {
     elements.geminiStatus.textContent = `Error: ${error.message}`;
     logEvent({ type: "gemini_analysis_error", message: error.message });
   } finally {
     updateGeminiButton();
   }
+}
+
+// --- Unified Report ---
+
+function updateUnifiedReportButton() {
+  // Enable when we have session data OR gemini result
+  const hasGemini = !!latestGeminiResult;
+  elements.unifiedReportButton.disabled = !hasGemini;
+}
+
+async function generateUnifiedReport() {
+  elements.unifiedReportButton.disabled = true;
+  elements.unifiedReportStatus.textContent = "レポート生成中...";
+
+  try {
+    const events = await exportSessionData(sessionId);
+    const featureEvents = events.filter((e) => e.type === "realtime_feature");
+    const gemini = latestGeminiResult;
+
+    const report = buildUnifiedReport(featureEvents, gemini);
+    renderUnifiedReport(report);
+    elements.unifiedReportStatus.textContent = "";
+    elements.unifiedReport.style.display = "";
+    logEvent({ type: "unified_report_generated", participants: report.participants.length });
+  } catch (error) {
+    elements.unifiedReportStatus.textContent = `Error: ${error.message}`;
+    logEvent({ type: "unified_report_error", message: error.message });
+  } finally {
+    updateUnifiedReportButton();
+  }
+}
+
+function buildUnifiedReport(featureEvents, gemini) {
+  // Aggregate per-participant stats from realtime data
+  const participantStats = new Map();
+  let totalFrames = 0;
+
+  for (const event of featureEvents) {
+    const features = event.features;
+    if (!features) continue;
+    totalFrames++;
+
+    for (const track of features.face_tracks ?? []) {
+      const id = track.participant_name || track.audience_id;
+      if (!participantStats.has(id)) {
+        participantStats.set(id, {
+          id,
+          participant_name: track.participant_name,
+          audience_id: track.audience_id,
+          frames: 0,
+          gaze_screen: 0,
+          total_eye_openness: 0,
+          total_mouth_openness: 0,
+          total_nod_score: 0,
+          nod_events: 0,
+          total_smile: 0,
+          smile_frames: 0,
+          total_brow_down: 0,
+          brow_frames: 0,
+          gaze_directions: { screen: 0, left: 0, right: 0, up: 0, down: 0, unknown: 0 },
+          attention_scores: [],
+          t_start: event.t_ms,
+          t_end: event.t_ms
+        });
+      }
+
+      const stats = participantStats.get(id);
+      stats.frames++;
+      stats.t_end = event.t_ms;
+
+      if (track.gaze_estimate === "screen") stats.gaze_screen++;
+      stats.gaze_directions[track.gaze_estimate] = (stats.gaze_directions[track.gaze_estimate] ?? 0) + 1;
+
+      if (track.eye_openness) {
+        stats.total_eye_openness += (track.eye_openness.left + track.eye_openness.right) / 2;
+      }
+      stats.total_mouth_openness += track.mouth_openness ?? 0;
+      stats.total_nod_score += track.gestures?.nod_score ?? 0;
+      stats.nod_events += track.gestures?.nod_count ?? 0;
+
+      const smile = track.blendshapes
+        ? ((track.blendshapes.mouthSmileLeft ?? 0) + (track.blendshapes.mouthSmileRight ?? 0)) / 2
+        : null;
+      if (smile != null) {
+        stats.total_smile += smile;
+        stats.smile_frames++;
+      }
+      const browDown = track.blendshapes
+        ? ((track.blendshapes.browDownLeft ?? 0) + (track.blendshapes.browDownRight ?? 0)) / 2
+        : null;
+      if (browDown != null) {
+        stats.total_brow_down += browDown;
+        stats.brow_frames++;
+      }
+    }
+  }
+
+  // Room-level aggregation
+  const roomEngagementTimeline = featureEvents
+    .filter((e) => e.features?.room_engagement)
+    .map((e) => ({
+      t_ms: e.t_ms,
+      ...e.features.room_engagement,
+      motion: e.features.motion_score,
+      face_count: e.features.face_count
+    }));
+
+  // Merge realtime stats with Gemini per-participant insights
+  const participants = [];
+  const geminiParticipants = gemini?.participants ?? [];
+
+  for (const [, stats] of participantStats) {
+    const avg = (total, count) => count > 0 ? round(total / count) : 0;
+
+    // Try to match with Gemini participant by name/position
+    const geminiMatch = findGeminiMatch(stats, geminiParticipants);
+
+    participants.push({
+      id: stats.id,
+      participant_name: stats.participant_name,
+      audience_id: stats.audience_id,
+      duration_sec: Math.round((stats.t_end - stats.t_start) / 1000),
+      visible_frames: stats.frames,
+      realtime: {
+        gaze_screen_ratio: avg(stats.gaze_screen, stats.frames),
+        avg_eye_openness: avg(stats.total_eye_openness, stats.frames),
+        avg_mouth_openness: avg(stats.total_mouth_openness, stats.frames),
+        avg_nod_score: avg(stats.total_nod_score, stats.frames),
+        total_nod_events: stats.nod_events,
+        avg_smile: avg(stats.total_smile, stats.smile_frames),
+        avg_brow_down: avg(stats.total_brow_down, stats.brow_frames),
+        gaze_distribution: stats.gaze_directions
+      },
+      gemini: geminiMatch ? {
+        overall_engagement: geminiMatch.overall_engagement,
+        engagement_summary: geminiMatch.engagement_summary,
+        timeline: geminiMatch.timeline
+      } : null
+    });
+  }
+
+  // If Gemini has participants not in realtime data, add them too
+  for (const gp of geminiParticipants) {
+    const alreadyMatched = participants.some((p) => p.gemini && findGeminiMatch(p, [gp]));
+    if (!alreadyMatched) {
+      const existingById = participants.find((p) =>
+        p.participant_name === gp.name_or_position || p.id === gp.name_or_position
+      );
+      if (!existingById) {
+        participants.push({
+          id: gp.name_or_position,
+          participant_name: gp.name_or_position,
+          audience_id: null,
+          duration_sec: 0,
+          visible_frames: 0,
+          realtime: null,
+          gemini: {
+            overall_engagement: gp.overall_engagement,
+            engagement_summary: gp.engagement_summary,
+            timeline: gp.timeline
+          }
+        });
+      }
+    }
+  }
+
+  return {
+    session_id: sessionId,
+    generated_at: new Date().toISOString(),
+    total_frames: totalFrames,
+    duration_sec: featureEvents.length > 0
+      ? Math.round((featureEvents[featureEvents.length - 1].t_ms - featureEvents[0].t_ms) / 1000)
+      : 0,
+    participants,
+    meeting_summary: gemini?.meeting_summary ?? null,
+    room_engagement_timeline: roomEngagementTimeline
+  };
+}
+
+function findGeminiMatch(stats, geminiParticipants) {
+  if (!geminiParticipants.length) return null;
+
+  // Exact name match
+  if (stats.participant_name) {
+    const match = geminiParticipants.find((gp) =>
+      gp.name_or_position === stats.participant_name
+    );
+    if (match) return match;
+  }
+
+  // Position-based heuristic: if only one participant in both, match them
+  if (geminiParticipants.length === 1 && stats.frames > 0) {
+    return geminiParticipants[0];
+  }
+
+  return null;
+}
+
+function renderUnifiedReport(report) {
+  const el = elements.unifiedReport;
+  let html = "";
+
+  // Meeting overview
+  html += `<h3>Meeting Overview</h3>`;
+  html += `<table>`;
+  html += `<tr><th>Session</th><td>${report.session_id}</td></tr>`;
+  html += `<tr><th>Duration</th><td>${formatDuration(report.duration_sec)}</td></tr>`;
+  html += `<tr><th>Total Frames</th><td>${report.total_frames}</td></tr>`;
+  html += `<tr><th>Participants</th><td>${report.participants.length}</td></tr>`;
+  html += `</table>`;
+
+  // Meeting summary from Gemini
+  if (report.meeting_summary) {
+    const ms = report.meeting_summary;
+    html += `<h3>Meeting Summary (Gemini)</h3>`;
+    html += `<p>Overall: ${engagementTag(ms.overall_engagement)}</p>`;
+    if (ms.key_moments?.length) {
+      html += `<ul>${ms.key_moments.map((m) => `<li>${escapeHtml(m)}</li>`).join("")}</ul>`;
+    }
+    if (ms.recommendations?.length) {
+      html += `<p><strong>Recommendations:</strong></p>`;
+      html += `<ul>${ms.recommendations.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}</ul>`;
+    }
+  }
+
+  // Per-participant details
+  html += `<h3>Participants</h3>`;
+  for (const p of report.participants) {
+    html += `<table>`;
+    html += `<tr><th colspan="2">${escapeHtml(p.participant_name || p.id)}`;
+    if (p.gemini) html += ` ${engagementTag(p.gemini.overall_engagement)}`;
+    html += `</th></tr>`;
+
+    if (p.realtime) {
+      html += `<tr><th>Visible</th><td>${formatDuration(p.duration_sec)} (${p.visible_frames} frames)</td></tr>`;
+      html += `<tr><th>Gaze on screen</th><td>${pct(p.realtime.gaze_screen_ratio)}</td></tr>`;
+      html += `<tr><th>Avg eye openness</th><td>${p.realtime.avg_eye_openness}</td></tr>`;
+      html += `<tr><th>Avg smile</th><td>${p.realtime.avg_smile}</td></tr>`;
+      html += `<tr><th>Nod events</th><td>${p.realtime.total_nod_events} (avg score: ${p.realtime.avg_nod_score})</td></tr>`;
+    }
+
+    if (p.gemini) {
+      html += `<tr><th>Gemini summary</th><td>${escapeHtml(p.gemini.engagement_summary ?? "-")}</td></tr>`;
+      if (p.gemini.timeline?.length) {
+        html += `<tr><th>Timeline</th><td>`;
+        html += `<table>`;
+        html += `<tr><th>Time</th><th>Expression</th><th>Level</th><th>Reaction</th></tr>`;
+        for (const t of p.gemini.timeline) {
+          html += `<tr>`;
+          html += `<td>${escapeHtml(t.time_range ?? "")}</td>`;
+          html += `<td>${escapeHtml(t.expression ?? "")}</td>`;
+          html += `<td>${engagementTag(t.engagement_level)}</td>`;
+          html += `<td>${escapeHtml(t.notable_reaction ?? "-")}</td>`;
+          html += `</tr>`;
+        }
+        html += `</table></td></tr>`;
+      }
+    }
+
+    html += `</table>`;
+  }
+
+  // Export button
+  html += `<button class="report-export" onclick="this.dispatchEvent(new CustomEvent('export-report', {bubbles:true}))">レポートをJSONエクスポート</button>`;
+
+  el.innerHTML = html;
+
+  // Attach export handler
+  el.querySelector(".report-export")?.addEventListener("click", () => {
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `unified_report_${sessionId}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    logEvent({ type: "unified_report_exported" });
+  });
+}
+
+function engagementTag(level) {
+  if (!level) return "";
+  const cls = level === "high" ? "tag-high" : level === "medium" ? "tag-medium" : "tag-low";
+  return `<span class="tag ${cls}">${escapeHtml(level)}</span>`;
+}
+
+function formatDuration(sec) {
+  if (!sec) return "0s";
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function pct(ratio) {
+  return `${Math.round(ratio * 100)}%`;
+}
+
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = String(str);
+  return div.innerHTML;
 }
 
 // --- Session Storage (IndexedDB) ---
