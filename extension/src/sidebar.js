@@ -85,9 +85,11 @@ const vad = {
 function createVadState() {
   return {
     analyser: null,
-    buf: null,
+    floatBuf: null,
     speaking: false,
     lastSpeechTs: 0,
+    volume: 0, // 直近RMS
+    pitchHz: null, // 直近の基本周波数(Hz)
     history: [] // {t, speaking} 直近 SPEECH_WINDOW_MS 分
   };
 }
@@ -1306,7 +1308,7 @@ async function setupAudioAnalysis(displayStream) {
 
 function makeAnalyser(sourceNode) {
   const analyser = audioContext.createAnalyser();
-  analyser.fftSize = 512;
+  analyser.fftSize = 2048; // ピッチ(自己相関)に十分な窓長。RMSにも問題なし
   sourceNode.connect(analyser);
   return analyser;
 }
@@ -1322,24 +1324,53 @@ function teardownAudioAnalysis() {
   vad.other = createVadState();
 }
 
-function computeRms(state) {
-  if (!state.buf) state.buf = new Uint8Array(state.analyser.fftSize);
-  state.analyser.getByteTimeDomainData(state.buf);
-  let sum = 0;
-  for (let i = 0; i < state.buf.length; i++) {
-    const v = (state.buf[i] - 128) / 128; // -1..1 に正規化
-    sum += v * v;
+// 1回の time-domain 読み取りで音量(RMS)とピッチ(基本周波数)を返す
+function analyzeAudio(state, sampleRate) {
+  const n = state.analyser.fftSize;
+  if (!state.floatBuf || state.floatBuf.length !== n) {
+    state.floatBuf = new Float32Array(n);
   }
-  return Math.sqrt(sum / state.buf.length);
+  const buf = state.floatBuf;
+  state.analyser.getFloatTimeDomainData(buf);
+
+  // 音量 = RMS
+  let sumSq = 0;
+  for (let i = 0; i < n; i++) sumSq += buf[i] * buf[i];
+  const rms = Math.sqrt(sumSq / n);
+
+  // ピッチ = 自己相関で基本周波数を推定（人声域 70〜400Hz）。小音量/無声は null
+  let pitchHz = null;
+  if (rms >= 0.01) {
+    const minLag = Math.floor(sampleRate / 400);
+    const maxLag = Math.floor(sampleRate / 70);
+    let bestLag = -1;
+    let bestCorr = 0;
+    for (let lag = minLag; lag <= maxLag; lag++) {
+      let corr = 0;
+      for (let i = 0; i < n - lag; i++) corr += buf[i] * buf[i + lag];
+      corr /= n - lag;
+      if (corr > bestCorr) {
+        bestCorr = corr;
+        bestLag = lag;
+      }
+    }
+    if (bestLag > 0 && bestCorr > 0.01) pitchHz = Math.round(sampleRate / bestLag);
+  }
+
+  return { rms, pitchHz };
 }
 
 function sampleVad() {
   const now = Date.now();
   const cutoff = now - SPEECH_WINDOW_MS;
+  const sampleRate = audioContext?.sampleRate ?? 48000;
   for (const key of ["self", "other"]) {
     const s = vad[key];
     if (!s.analyser) continue;
-    const speaking = computeRms(s) > VAD_RMS_THRESHOLD;
+    const { rms, pitchHz } = analyzeAudio(s, sampleRate);
+    s.volume = rms;
+    s.pitchHz = pitchHz;
+    const speaking = rms > VAD_RMS_THRESHOLD;
     if (speaking) s.lastSpeechTs = now;
     s.speaking = speaking;
     s.history.push({ t: now, speaking });
@@ -1357,7 +1388,9 @@ function buildSpeechFeatures() {
     return {
       speaking: s.speaking,
       pause_ms: s.speaking ? 0 : Math.round(now - s.lastSpeechTs),
-      speech_ratio: total ? round(speakingCount / total) : 0
+      speech_ratio: total ? round(speakingCount / total) : 0,
+      volume: round(s.volume ?? 0), // RMS音量 0〜1
+      pitch_hz: s.pitchHz // 基本周波数(Hz)。無声/小音量は null
     };
   };
   return { self: perSource("self"), other: perSource("other") };
