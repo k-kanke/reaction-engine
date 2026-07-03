@@ -405,8 +405,9 @@ function normalizeMediaPipeFace(box) {
 
 function buildFacePartsFromLandmarks(landmarks) {
   const face_bbox = bboxFromLandmarks(landmarks);
-  const leftEye = summarizeLandmarkGroup(landmarks, [33, 133, 159, 145]);
-  const rightEye = summarizeLandmarkGroup(landmarks, [362, 263, 386, 374]);
+  // MediaPipe uses subject's perspective: landmarks 33-area = subject's RIGHT, 362-area = subject's LEFT
+  const leftEye = summarizeLandmarkGroup(landmarks, [362, 263, 386, 374]);
+  const rightEye = summarizeLandmarkGroup(landmarks, [33, 133, 159, 145]);
   const mouth = summarizeLandmarkGroup(landmarks, [61, 291, 13, 14]);
   const nose = summarizeLandmarkGroup(landmarks, [1, 4, 98, 327]);
   const headPose = estimateHeadPose(landmarks);
@@ -434,16 +435,17 @@ function buildFacePartsFromLandmarks(landmarks) {
 }
 
 function estimateIris(landmarks) {
-  // Iris landmarks: left 468-472 (468=center), right 473-477 (473=center)
-  // Eye corner landmarks: left inner 133, outer 33; right inner 362, outer 263
+  // Subject's perspective (MediaPipe convention):
+  //   LEFT iris: 468-472 (468=center), LEFT eye corners: outer 263, inner 362
+  //   RIGHT iris: 473-477 (473=center), RIGHT eye corners: outer 33, inner 133
   const leftCenter = landmarks[468];
   const rightCenter = landmarks[473];
   if (!leftCenter || !rightCenter) return null;
 
-  const leftInner = landmarks[133];
-  const leftOuter = landmarks[33];
-  const rightInner = landmarks[362];
-  const rightOuter = landmarks[263];
+  const leftOuter = landmarks[263];
+  const leftInner = landmarks[362];
+  const rightOuter = landmarks[33];
+  const rightInner = landmarks[133];
   if (!leftInner || !leftOuter || !rightInner || !rightOuter) return null;
 
   // Iris position ratio within eye (0=outer corner, 1=inner corner).
@@ -456,10 +458,10 @@ function estimateIris(landmarks) {
   const leftRatioX = (leftCenter.x - leftOuter.x) / signedDenomX(leftInner, leftOuter);
   const rightRatioX = (rightCenter.x - rightOuter.x) / signedDenomX(rightInner, rightOuter);
 
-  const leftTop = landmarks[159];
-  const leftBottom = landmarks[145];
-  const rightTop = landmarks[386];
-  const rightBottom = landmarks[374];
+  const leftTop = landmarks[386];
+  const leftBottom = landmarks[374];
+  const rightTop = landmarks[159];
+  const rightBottom = landmarks[145];
 
   const leftRatioY = (leftTop && leftBottom)
     ? (leftCenter.y - leftTop.y) / Math.max(0.001, leftBottom.y - leftTop.y)
