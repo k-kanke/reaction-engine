@@ -76,5 +76,18 @@ services:
       - postgres
       - redis
 
+  migrate:
+    image: migrate/migrate:v4.17.1
+    profiles:
+      - tools
+    volumes:
+      - ./backend/migrations:/migrations
+    depends_on:
+      - postgres
+    entrypoint:
+      - migrate
+      - -path=/migrations
+      - -database=postgres://reaction:reaction@postgres:5432/reaction?sslmode=disable
+
 volumes:
   postgres-data:

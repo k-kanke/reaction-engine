@@ -1,0 +1,11 @@
+DROP TABLE IF EXISTS reports;
+DROP TABLE IF EXISTS feedback_events;
+DROP TABLE IF EXISTS transcripts;
+DROP TABLE IF EXISTS decision_logs;
+DROP TABLE IF EXISTS signal_summaries;
+DROP TABLE IF EXISTS visual_summaries;
+DROP TABLE IF EXISTS participant_baselines;
+DROP TABLE IF EXISTS media_refs;
+DROP TABLE IF EXISTS capture_snapshots;
+DROP TABLE IF EXISTS participants;
+DROP TABLE IF EXISTS sessions;

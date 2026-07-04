@@ -98,6 +98,18 @@ Rules:
 - Always create `up.sql` and `down.sql` as a pair.
 - Track migration creation timing through Git history.
 
+## Running Migrations
+
+Migrations run via the `migrate/migrate` Docker image (`migrate` service in
+`compose.yaml`, kept out of `docker compose up` by the `tools` profile):
+
+```bash
+docker compose up -d postgres
+cd backend
+make migrate-up
+make migrate-down   # rolls back the most recent migration
+```
+
 ## Getting Started
 
 ```bash

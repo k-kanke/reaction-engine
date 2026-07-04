@@ -1,4 +1,4 @@
-.PHONY: test build run-gateway run-media-api run-writer run-image-worker run-post-session-job
+.PHONY: test build run-gateway run-media-api run-writer run-image-worker run-post-session-job migrate-up migrate-down
 
 test:
 	go test ./...
@@ -24,3 +24,9 @@ run-image-worker:
 
 run-post-session-job:
 	go run ./cmd/post-session-job
+
+migrate-up:
+	cd $(CURDIR)/.. && docker compose run --rm migrate up
+
+migrate-down:
+	cd $(CURDIR)/.. && docker compose run --rm migrate down 1
