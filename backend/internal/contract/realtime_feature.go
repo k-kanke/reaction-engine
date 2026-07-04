@@ -47,9 +47,9 @@ type CompactFeature struct {
 // FeatureEventPayload is the local_events payload the gateway publishes to
 // the "feature-events" topic for durable processing (local stand-in for
 // Pub/Sub, per plan/backend-local-docker-runbook.md Phase 5). An event
-// carries either Features (from realtime_feature) or TranscriptChunks
-// (from audio_chunk, Phase 11) — never both, since the two are triggered
-// independently.
+// carries either Features + DecisionLogs (from realtime_feature) or
+// TranscriptChunks (from audio_chunk, Phase 11) — never both sets, since
+// the two message types are triggered independently.
 type FeatureEventPayload struct {
 	EventID            string            `json:"event_id"`
 	SessionID          string            `json:"session_id"`
@@ -57,4 +57,5 @@ type FeatureEventPayload struct {
 	ServerReceivedAtMs int64             `json:"server_received_at_ms"`
 	Features           []CompactFeature  `json:"features,omitempty"`
 	TranscriptChunks   []TranscriptChunk `json:"transcript_chunks,omitempty"`
+	DecisionLogs       []DecisionLog     `json:"decision_logs,omitempty"`
 }

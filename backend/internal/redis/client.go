@@ -84,6 +84,26 @@ func (c *Client) StoreRecentTranscript(ctx context.Context, chunk contract.Trans
 	return err
 }
 
+// GetLatestTranscript returns the most recent (highest t_start_ms) cached
+// transcript_chunk for one session_id + speaker, if any. Used by the
+// realtime LLM stub (Phase 12) as the evidence_quote grounding a feedback
+// candidate.
+func (c *Client) GetLatestTranscript(ctx context.Context, sessionID, speaker string) (contract.TranscriptChunk, bool, error) {
+	vals, err := c.rdb.ZRevRange(ctx, transcriptRecentKey(sessionID, speaker), 0, 0).Result()
+	if err != nil {
+		return contract.TranscriptChunk{}, false, err
+	}
+	if len(vals) == 0 {
+		return contract.TranscriptChunk{}, false, nil
+	}
+
+	var chunk contract.TranscriptChunk
+	if err := json.Unmarshal([]byte(vals[0]), &chunk); err != nil {
+		return contract.TranscriptChunk{}, false, err
+	}
+	return chunk, true, nil
+}
+
 func baselineKey(sessionID, audienceID string) string {
 	return fmt.Sprintf("session:baseline:%s:%s", sessionID, audienceID)
 }
