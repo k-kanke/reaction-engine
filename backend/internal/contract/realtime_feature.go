@@ -19,10 +19,13 @@ type FaceTrack struct {
 }
 
 // FeedbackEvent is returned to the Chrome extension over the same
-// WebSocket connection.
+// WebSocket connection. One is sent per audience_id in the triggering
+// realtime_feature message, since baseline-aware correction (Phase 9) is
+// per participant.
 type FeedbackEvent struct {
 	Type         string `json:"type"`
 	SessionID    string `json:"session_id"`
+	AudienceID   string `json:"audience_id"`
 	TMs          int64  `json:"t_ms"`
 	FeedbackType string `json:"feedback_type"`
 	Severity     string `json:"severity"`
