@@ -138,7 +138,8 @@ func validateUploadURLRequest(sessionID string, req contract.UploadURLRequest) e
 
 // handleLocalUpload implements Phase 7.2: a local-only endpoint (not used in
 // Cloud Run, where the extension PUTs directly to a Cloud Storage signed
-// URL) that stores the uploaded bytes under LocalMediaDir.
+// URL) that stores the uploaded bytes under LocalMediaDir, at the same
+// sessions/{session_id}/baseline/frames/ layout mediaRef encodes.
 func (h *Handler) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("session_id")
 	filename := r.PathValue("filename")
@@ -152,7 +153,7 @@ func (h *Handler) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dir := filepath.Join(h.LocalMediaDir, "sessions", sessionID)
+	dir := filepath.Join(h.LocalMediaDir, "sessions", sessionID, "baseline", "frames")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		log.Printf("media-api: mkdir failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to prepare storage")

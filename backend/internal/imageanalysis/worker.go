@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
 )
@@ -54,7 +55,7 @@ func (w *Worker) ProcessMediaUploaded(ctx context.Context, payload contract.Medi
 	// Confirm the uploaded frame is actually reachable on local disk. The
 	// fake visual summary below doesn't read its bytes; a real vision
 	// model call would replace this step with actual image analysis.
-	path := localMediaPath(w.MediaDir, capture.SessionID, capture.CaptureID, capture.MediaRef)
+	path := localMediaPath(w.MediaDir, capture.MediaRef)
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("stat media file %s: %w", path, err)
 	}
@@ -86,14 +87,11 @@ func (w *Worker) ProcessMediaUploaded(ctx context.Context, payload contract.Medi
 
 // localMediaPath resolves capture_snapshots.media_ref (a local://
 // reference, e.g. local://sessions/{session_id}/baseline/frames/{capture_id}.webp)
-// to the on-disk path media-api's /local-upload endpoint actually wrote it
-// to: {mediaDir}/sessions/{session_id}/{capture_id}{ext}. The two paths
-// differ (media_ref carries an extra /baseline/frames/ segment not used on
-// disk); this reproduces media-api's own resolution instead of parsing
-// media_ref as a literal path.
-func localMediaPath(mediaDir, sessionID, captureID, mediaRef string) string {
-	ext := filepath.Ext(mediaRef)
-	return filepath.Join(mediaDir, "sessions", sessionID, captureID+ext)
+// to the on-disk path under mediaDir. media-api's /local-upload endpoint
+// writes files at exactly this relative layout (internal/media.localFilePath),
+// so this is a straight prefix trim rather than a re-derivation.
+func localMediaPath(mediaDir, mediaRef string) string {
+	return filepath.Join(mediaDir, strings.TrimPrefix(mediaRef, "local://"))
 }
 
 type compactFeatureSnapshot struct {

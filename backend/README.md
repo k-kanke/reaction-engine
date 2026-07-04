@@ -251,15 +251,12 @@ upload-complete handler) every 2s. For each event it:
 
 1. Loads the `capture_snapshots` row for `capture_id` (media_ref,
    `feature_snapshot`).
-2. Confirms the uploaded frame exists on local disk — resolving
-   `media_ref` the same way media-api's `/local-upload` endpoint actually
-   wrote it (`{LOCAL_MEDIA_DIR}/sessions/{session_id}/{capture_id}{ext}`),
-   **not** by treating `media_ref` as a literal path. `media_ref` itself
-   is `local://sessions/{session_id}/baseline/frames/{capture_id}.{ext}`,
-   which is a different path (extra `/baseline/frames/` segment) from
-   where the file is actually stored — a pre-existing mismatch from
-   Phase 7 that this worker works around rather than fixes, since fixing
-   it is out of this phase's scope.
+2. Confirms the uploaded frame exists on local disk by trimming the
+   `local://` scheme off `media_ref` and joining it with `LOCAL_MEDIA_DIR`
+   — `media_ref` (`local://sessions/{session_id}/baseline/frames/{capture_id}.{ext}`)
+   now matches exactly where media-api's `/local-upload` endpoint writes
+   the file, so no separate path re-derivation is needed (see the Media
+   API section below for the Phase 7 fix that made this true).
 3. Builds a fake, deterministic `visual_summary` (no vision model call
    yet):
    ```json
