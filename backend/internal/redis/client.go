@@ -55,3 +55,29 @@ func (c *Client) StoreRecentFeature(ctx context.Context, feature contract.Compac
 	_, err = pipe.Exec(ctx)
 	return err
 }
+
+func baselineKey(sessionID, audienceID string) string {
+	return fmt.Sprintf("session:baseline:%s:%s", sessionID, audienceID)
+}
+
+func visualSummaryKey(sessionID, audienceID string) string {
+	return fmt.Sprintf("session:visual_summary:%s:%s", sessionID, audienceID)
+}
+
+func baselineStatusKey(sessionID, audienceID string) string {
+	return fmt.Sprintf("session:baseline_status:%s:%s", sessionID, audienceID)
+}
+
+// SetBaselineReady caches a participant's baseline and visual summary and
+// marks baseline_status "ready", per
+// plan/backend-local-docker-runbook.md Phase 8. Gateway feedback logic
+// (Phase 9+) reads these to apply baseline-aware corrections once ready;
+// until then it should treat the participant as warming_up.
+func (c *Client) SetBaselineReady(ctx context.Context, sessionID, audienceID string, baseline, visualSummary []byte) error {
+	pipe := c.rdb.Pipeline()
+	pipe.Set(ctx, baselineKey(sessionID, audienceID), baseline, keyTTL)
+	pipe.Set(ctx, visualSummaryKey(sessionID, audienceID), visualSummary, keyTTL)
+	pipe.Set(ctx, baselineStatusKey(sessionID, audienceID), "ready", keyTTL)
+	_, err := pipe.Exec(ctx)
+	return err
+}
