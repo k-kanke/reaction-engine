@@ -26,12 +26,20 @@ PRで進めるための手順。Phase 0〜2 で確立した流れをテンプレ
 2. **最新状態とbase branchを確認する**
    ```bash
    git fetch origin
+   gh repo view --json defaultBranchRef -q .defaultBranchRef.name
    gh pr list --state open
    ```
-   - 直前のPhaseのPRが**マージ済み**なら `origin/main` を起点にする。
+   - base branch名を **`main` 決め打ちにしない**。上記コマンドでリポジトリの
+     デフォルトブランチ(現時点では `develop`)を毎回確認し、それを
+     起点にする。デフォルトブランチは途中で変わりうる(実際に `main` から
+     `develop` に変更された実績がある)ため、ハードコードした値を
+     過去のPRやドキュメントから流用しない。
+   - 直前のPhaseのPRが**マージ済み**なら `origin/<デフォルトブランチ>` を
+     起点にする。
    - **未マージ**で、かつ今回の変更がそのPRの内容に依存する(同じファイルを
      拡張する等)場合は、そのPRのブランチを起点にして積む。PR本文に
-     「#N マージ後にbaseをmainへ向け直してください」と明記する。
+     「#N マージ後にbaseを`<デフォルトブランチ>`へ向け直してください」と
+     明記する。
 
 3. **worktreeを作成してそこに入る**
    ```bash
@@ -85,7 +93,7 @@ PRで進めるための手順。Phase 0〜2 で確立した流れをテンプレ
 
      (base branchが未マージPRの場合のみ)
      Base branch: この修正は `<branch>` (#N、未マージ) の上に積んでいます。
-     #N マージ後にこのPRのbaseをmainに向け直してください。
+     #N マージ後にこのPRのbaseを`<デフォルトブランチ>`に向け直してください。
      ```
    - `gh pr create --base <base-branch-if-stacked> --title ... --body ...`
 
@@ -100,6 +108,9 @@ PRで進めるための手順。Phase 0〜2 で確立した流れをテンプレ
 - 前のPhaseのPRがマージされたかどうかは毎回 `gh pr view <N> --json
   state,mergedAt` で確認してから次のworktreeを作る(古い情報で
   base branchを決めない)。
+- デフォルトブランチ名も同様に毎回 `gh repo view --json defaultBranchRef`
+  で確認する。過去の会話やPRで見た `main` / `develop` などの名前を
+  そのまま使い回さない。
 - コマンド実行の許可を都度求めず進めてよい、と明示された場合以外は
   破壊的操作(`docker system prune`、他worktreeのファイル削除など)は
   避ける。
