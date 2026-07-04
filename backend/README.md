@@ -198,3 +198,87 @@ The real signal-summary/cooldown-driven `feedback_event` and the
 `session:computed:*` / `feedback:cooldown:*` Redis keys land in later
 phases (system computation layer, Phase 9, Phase 12); Phase 4 only
 wires the transport, storage, and response shape.
+
+## Local Event Bus (`local_events`)
+
+Before wiring real Pub/Sub, the gateway durably queues each
+`realtime_feature` message in a `local_events` Postgres table (migration
+`000002_add_local_events`) instead of publishing to a topic:
+
+```sql
+id bigserial primary key
+topic text not null
+event_id text not null
+payload jsonb not null
+available_at timestamptz not null default now()
+created_at timestamptz not null default now()
+acked_at timestamptz
+```
+
+On every `realtime_feature` message the gateway inserts one row with
+`topic = 'feature-events'` and a payload bundling the event's compact
+per-audience features (`internal/contract.FeatureEventPayload`).
+
+The `writer` service polls `local_events` for unacked, available rows
+on that topic every 2s (`internal/db.LocalEventStore.FetchUnacked`) and,
+per event, writes it out and acks it — see Durable Writer MVP below.
+
+## Durable Writer MVP
+
+For each unacked `feature-events` row, the `writer`:
+
+1. Unmarshals the payload back into `contract.FeatureEventPayload`.
+2. Appends it as one JSON line to
+   `{LOCAL_JSONL_DIR}/sessions/{session_id}/features/compact-raw/part-0001.jsonl`
+   (`internal/writer.AppendCompactRawFeature`; `LOCAL_JSONL_DIR` is
+   `/var/reaction/jsonl` in Docker Compose, mounted from `./tmp/jsonl`).
+3. Acks the row (`LocalEventStore.Ack`) only after the JSONL write
+   succeeds; on any failure it's left unacked and retried on the next
+   poll (2s later), so a writer restart naturally re-processes whatever
+   wasn't acked yet.
+
+Each JSONL line carries its own `event_id`, so a duplicate line from a
+reprocessed-but-already-written event is dedupable downstream (post-session
+analysis) — matching `architecture.md`'s storage policy for Cloud Storage
+JSONL, which already treats duplicates as expected and event_id-dedupable
+rather than something the writer must prevent outright.
+
+## Image Analysis Worker MVP
+
+The `image-analysis-worker` polls `local_events` for unacked
+`media-analysis-events` (`media_uploaded`, published by media-api's
+upload-complete handler) every 2s. For each event it:
+
+1. Loads the `capture_snapshots` row for `capture_id` (media_ref,
+   `feature_snapshot`).
+2. Confirms the uploaded frame exists on local disk by trimming the
+   `local://` scheme off `media_ref` and joining it with `LOCAL_MEDIA_DIR`
+   — `media_ref` (`local://sessions/{session_id}/baseline/frames/{capture_id}.{ext}`)
+   now matches exactly where media-api's `/local-upload` endpoint writes
+   the file, so no separate path re-derivation is needed (see the Media
+   API section below for the Phase 7 fix that made this true).
+3. Builds a fake, deterministic `visual_summary` (no vision model call
+   yet):
+   ```json
+   {"face_quality":"usable","lighting":"unknown","camera_angle":"unknown","baseline_expression":"unknown","source":"local_stub"}
+   ```
+4. Updates `participant_baselines` with a running average of
+   `feature_snapshot.attention_score` (confidence scales linearly with
+   `sample_count`, capped at 1.0 at 8 samples) — also a deterministic
+   stand-in for real baseline computation, not real vision analysis.
+5. Inserts a `visual_summaries` row.
+6. Caches both in Redis and marks the participant ready:
+   `session:baseline:{session_id}:{audience_id}`,
+   `session:visual_summary:{session_id}:{audience_id}`,
+   `session:baseline_status:{session_id}:{audience_id}` (`"ready"`).
+7. Acks the event only after all of the above succeed.
+
+`signal_summary` / `decision_log` inputs into this baseline (real vision
+model output) land once the system computation layer exists (Phase 9+);
+this phase only proves the media_uploaded → baseline/visual_summary →
+Redis pipeline end to end.
+
+`signal_summary` / `decision_log` JSONL output (also listed in the
+runbook's Phase 6) is intentionally not implemented yet: there is no real
+signal summary or decision log data to write until the system computation
+layer lands (Phase 9 baseline-aware feedback, Phase 12 realtime LLM stub).

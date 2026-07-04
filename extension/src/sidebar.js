@@ -73,6 +73,13 @@ const FRAME_CAPTURE_WIDTH = 480; // 縮小送信（プライバシー/帯域配�
 let frameTimer = null;
 let frameCanvas = null;
 let captureStartTs = 0;
+// --- baseline frame upload (Phase 10.2): Media API 経由でparticipantごとの
+// baseline WebP + feature_snapshot をアップロードする。architecture.md の
+// 「baseline ができるまでの最初の30〜60秒」に合わせ、capture開始直後だけ動かす。
+const BASELINE_CAPTURE_INTERVAL_MS = 5000; // 数秒おきにWebPを生成
+const BASELINE_CAPTURE_DURATION_MS = 60 * 1000; // 最初の60秒だけ
+let baselineTimer = null;
+let baselineCaptureStartTs = 0;
 let audioContext = null;
 let micStream = null;
 let micRequestError = null;
@@ -119,7 +126,7 @@ chrome.runtime.onMessage.addListener((message) => {
 
 async function restoreSettings() {
   const stored = await chrome.storage.local.get(["wsUrl"]);
-  if (stored.wsUrl) elements.wsUrl.value = stored.wsUrl;
+  elements.wsUrl.value = stored.wsUrl || window.REACTION_ENGINE_CONFIG?.gatewayWsUrl || "";
 }
 
 async function initEdgeVision() {
@@ -282,6 +289,8 @@ async function startCapture() {
     captureStartTs = Date.now();
     captureFrame(); // 開始直後に1枚
     frameTimer = window.setInterval(captureFrame, FRAME_CAPTURE_INTERVAL_MS);
+    baselineCaptureStartTs = Date.now();
+    baselineTimer = window.setInterval(captureBaselineFrames, BASELINE_CAPTURE_INTERVAL_MS);
     setStatus("Capturing", "active");
   } catch (error) {
     setStatus("Capture failed", "error");
@@ -294,6 +303,8 @@ function stopCapture() {
   if (eventTimer) window.clearInterval(eventTimer);
   if (vadTimer) window.clearInterval(vadTimer);
   if (frameTimer) window.clearInterval(frameTimer);
+  if (baselineTimer) window.clearInterval(baselineTimer);
+  baselineTimer = null;
   analysisTimer = null;
   eventTimer = null;
   vadTimer = null;
@@ -1440,6 +1451,101 @@ function captureFrame() {
   const event = { type: "frame_capture", t_ms: Date.now(), w, h, image: dataUrl };
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
   logEvent({ type: "frame_capture", t_ms: event.t_ms, message: `frame ${w}x${h} ~${Math.round(dataUrl.length / 1024)}KB` });
+}
+
+// captureBaselineFrames uploads one WebP crop per currently-tracked face to
+// Media API (plan/backend-local-docker-runbook.md Phase 10.2), each paired
+// with the compact feature_snapshot from that same instant. Images never go
+// over the Gateway WebSocket; only realtime_feature/feedback_event does.
+function captureBaselineFrames() {
+  if (Date.now() - baselineCaptureStartTs > BASELINE_CAPTURE_DURATION_MS) {
+    if (baselineTimer) window.clearInterval(baselineTimer);
+    baselineTimer = null;
+    return;
+  }
+
+  const mediaApiBaseUrl = window.REACTION_ENGINE_CONFIG?.mediaApiBaseUrl;
+  if (!mediaApiBaseUrl) return;
+
+  const tMs = Date.now();
+  for (const track of latestFeatures.face_tracks ?? []) {
+    uploadBaselineFrame(mediaApiBaseUrl, track, tMs).catch((error) => {
+      logEvent({ type: "baseline_upload_error", audience_id: track.audience_id, message: error.message });
+    });
+  }
+}
+
+async function uploadBaselineFrame(mediaApiBaseUrl, track, tMs) {
+  const blob = await cropFaceToWebp(track.face_bbox);
+  if (!blob) return;
+
+  const captureId = `cap_${tMs}_${track.audience_id}`;
+  const featureSnapshot = {
+    attention_score: latestFeatures.attention_score,
+    motion_score: latestFeatures.motion_score,
+    gaze_estimate: track.gaze_estimate,
+    head_pose_estimate: track.head_pose_estimate,
+    mouth_openness: track.mouth_openness,
+    eye_openness: track.eye_openness,
+    face_bbox: track.face_bbox
+  };
+
+  const uploadURLRes = await fetch(`${mediaApiBaseUrl}/sessions/${sessionId}/media/upload-url`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      purpose: "baseline_frame",
+      content_type: "image/webp",
+      capture_id: captureId,
+      t_ms: tMs,
+      audience_id: track.audience_id,
+      tile_id: track.tile_id ?? undefined,
+      feature_snapshot: featureSnapshot
+    })
+  });
+  if (!uploadURLRes.ok) throw new Error(`upload-url failed: ${uploadURLRes.status}`);
+  const { upload_url: uploadUrl } = await uploadURLRes.json();
+
+  const putRes = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "image/webp" },
+    body: blob
+  });
+  if (!putRes.ok) throw new Error(`local-upload failed: ${putRes.status}`);
+
+  const completeRes = await fetch(`${mediaApiBaseUrl}/sessions/${sessionId}/media/${captureId}/complete`, {
+    method: "POST"
+  });
+  if (!completeRes.ok) throw new Error(`complete failed: ${completeRes.status}`);
+
+  logEvent({ type: "baseline_frame_uploaded", audience_id: track.audience_id, capture_id: captureId });
+}
+
+// cropFaceToWebp crops the face_bbox region (normalized 0..1 against
+// PREVIEW_WIDTH/PREVIEW_HEIGHT, same convention as drawDebugFrame) out of the
+// preview canvas and encodes it as WebP.
+function cropFaceToWebp(faceBbox) {
+  return new Promise((resolve) => {
+    if (!faceBbox) {
+      resolve(null);
+      return;
+    }
+
+    const x = Math.round(faceBbox.x * PREVIEW_WIDTH);
+    const y = Math.round(faceBbox.y * PREVIEW_HEIGHT);
+    const w = Math.round(faceBbox.w * PREVIEW_WIDTH);
+    const h = Math.round(faceBbox.h * PREVIEW_HEIGHT);
+    if (w <= 0 || h <= 0) {
+      resolve(null);
+      return;
+    }
+
+    const tileCanvas = document.createElement("canvas");
+    tileCanvas.width = w;
+    tileCanvas.height = h;
+    tileCanvas.getContext("2d").drawImage(canvas, x, y, w, h, 0, 0, w, h);
+    tileCanvas.toBlob((blob) => resolve(blob), "image/webp", 0.8);
+  });
 }
 
 function buildFeatures(faces, motionScore) {

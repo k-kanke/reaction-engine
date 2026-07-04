@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
 
+	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	"github.com/k-kanke/reaction-engine/backend/internal/gateway"
 	"github.com/k-kanke/reaction-engine/backend/internal/redis"
 )
@@ -20,10 +22,24 @@ func main() {
 		redisAddr = "localhost:6379"
 	}
 
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		databaseURL = "postgres://reaction:reaction@localhost:5432/reaction?sslmode=disable"
+	}
+
+	llmEnabled := os.Getenv("ENABLE_REAL_LLM") == "true"
+
 	redisClient := redis.NewClient(redisAddr)
 	defer redisClient.Close()
 
-	handler := gateway.NewHandler(redisClient)
+	pool, err := db.NewPool(context.Background(), databaseURL)
+	if err != nil {
+		log.Fatalf("gateway: failed to connect to postgres: %v", err)
+	}
+	defer pool.Close()
+
+	events := db.NewLocalEventStore(pool)
+	handler := gateway.NewHandler(redisClient, events, llmEnabled)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
