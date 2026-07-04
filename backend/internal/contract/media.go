@@ -22,3 +22,20 @@ type UploadURLResponse struct {
 	CaptureID string `json:"capture_id"`
 	ExpiresAt string `json:"expires_at"`
 }
+
+// MediaUploadedEventPayload is the local_events payload media-api publishes
+// to the "media-analysis-events" topic once an uploaded capture frame is
+// confirmed on disk. Shape matches architecture.md's Image Analysis Worker
+// input contract.
+type MediaUploadedEventPayload struct {
+	EventID       string `json:"event_id"`
+	Type          string `json:"type"`
+	SchemaVersion int    `json:"schema_version"`
+	SessionID     string `json:"session_id"`
+	CaptureID     string `json:"capture_id"`
+	AudienceID    string `json:"audience_id"`
+	TileID        string `json:"tile_id,omitempty"`
+	TMs           int64  `json:"t_ms"`
+	MediaRef      string `json:"media_ref"`
+	Purpose       string `json:"purpose"`
+}
