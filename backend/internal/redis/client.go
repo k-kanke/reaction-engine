@@ -81,3 +81,48 @@ func (c *Client) SetBaselineReady(ctx context.Context, sessionID, audienceID str
 	_, err := pipe.Exec(ctx)
 	return err
 }
+
+// BaselineStatusReady and BaselineStatusWarmingUp mirror the
+// session:baseline_status:* values from architecture.md: "ready" once the
+// Image Analysis Worker has produced a baseline for this participant,
+// "warming_up" before that (no row yet, or the status key missing/expired).
+const (
+	BaselineStatusReady     = "ready"
+	BaselineStatusWarmingUp = "warming_up"
+)
+
+// BaselineState is the Gateway-side read of a participant's cached
+// baseline/visual_summary/baseline_status, per Phase 9 of
+// plan/backend-local-docker-runbook.md.
+type BaselineState struct {
+	Status        string
+	Baseline      json.RawMessage
+	VisualSummary json.RawMessage
+}
+
+// GetBaselineState reads session:baseline:*, session:visual_summary:*, and
+// session:baseline_status:* for one session_id + audience_id. A missing
+// baseline_status key (nothing written yet by the Image Analysis Worker)
+// reports BaselineStatusWarmingUp rather than an error.
+func (c *Client) GetBaselineState(ctx context.Context, sessionID, audienceID string) (BaselineState, error) {
+	vals, err := c.rdb.MGet(ctx,
+		baselineKey(sessionID, audienceID),
+		visualSummaryKey(sessionID, audienceID),
+		baselineStatusKey(sessionID, audienceID),
+	).Result()
+	if err != nil {
+		return BaselineState{}, err
+	}
+
+	state := BaselineState{Status: BaselineStatusWarmingUp}
+	if s, ok := vals[0].(string); ok {
+		state.Baseline = json.RawMessage(s)
+	}
+	if s, ok := vals[1].(string); ok {
+		state.VisualSummary = json.RawMessage(s)
+	}
+	if s, ok := vals[2].(string); ok && s != "" {
+		state.Status = s
+	}
+	return state, nil
+}

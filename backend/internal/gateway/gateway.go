@@ -18,6 +18,25 @@ import (
 
 const featureEventsTopic = "feature-events"
 
+// defaultAttentionThreshold is the fixed threshold used while a
+// participant's baseline is still warming_up (no Image Analysis Worker
+// output yet). baselineDropMargin is how far below a ready baseline's
+// attention_score_avg counts as a drop once a personal baseline is
+// available. Both are stand-ins for the real signal_summary / LLM
+// decision layer (Phase 12); Phase 9 only wires baseline availability
+// into feedback, per plan/backend-local-docker-runbook.md.
+const (
+	defaultAttentionThreshold = 0.4
+	baselineDropMargin        = 0.15
+)
+
+// baselineFields is the subset of session:baseline:* JSON
+// (internal/imageanalysis's baselineFields) the gateway reads to correct
+// feedback.
+type baselineFields struct {
+	AttentionScoreAvg float64 `json:"attention_score_avg"`
+}
+
 type Handler struct {
 	redis  *gwredis.Client
 	events *db.LocalEventStore
@@ -102,20 +121,67 @@ func (h *Handler) handleRealtimeFeature(ctx context.Context, conn *websocket.Con
 		log.Printf("gateway: enqueue local event failed: %v", err)
 	}
 
-	// Phase 4 stub: a real signal_summary/decision_log driven feedback_event
-	// lands in later phases (system computation layer, cooldown, LLM).
+	// One feedback_event per audience_id: baseline-aware correction
+	// (Phase 9) is per participant, and a real signal_summary/decision_log
+	// driven decision still lands in a later phase (system computation
+	// layer, cooldown, LLM).
+	for _, feature := range compactFeatures {
+		state, err := h.redis.GetBaselineState(ctx, feature.SessionID, feature.AudienceID)
+		if err != nil {
+			log.Printf("gateway: get baseline state failed: %v", err)
+			state = gwredis.BaselineState{Status: gwredis.BaselineStatusWarmingUp}
+		}
+
+		feedback := buildFeedback(feature, state)
+		if err := wsjson.Write(ctx, conn, feedback); err != nil {
+			log.Printf("gateway: write feedback_event failed: %v", err)
+			return
+		}
+	}
+}
+
+// buildFeedback decides a feedback_event for one participant's compact
+// feature. If that participant's baseline is ready, attention_score is
+// compared against their own attention_score_avg; otherwise (warming_up,
+// missing, or unparseable baseline JSON) it falls back to
+// defaultAttentionThreshold. Deterministic and LLM-free, matching Phase
+// 8's fake visual_summary / baseline stub.
+func buildFeedback(feature contract.CompactFeature, state gwredis.BaselineState) contract.FeedbackEvent {
 	feedback := contract.FeedbackEvent{
-		Type:         "feedback_event",
-		SessionID:    msg.SessionID,
-		TMs:          msg.TMs,
-		FeedbackType: "stub",
-		Severity:     "info",
-		Message:      "placeholder feedback_event (Phase 4)",
-		Source:       "stub",
+		Type:       "feedback_event",
+		SessionID:  feature.SessionID,
+		AudienceID: feature.AudienceID,
+		TMs:        feature.TMs,
 	}
-	if err := wsjson.Write(ctx, conn, feedback); err != nil {
-		log.Printf("gateway: write feedback_event failed: %v", err)
+
+	if state.Status == gwredis.BaselineStatusReady {
+		var baseline baselineFields
+		if err := json.Unmarshal(state.Baseline, &baseline); err == nil {
+			feedback.Source = "rule_baseline"
+			if feature.AttentionScore < baseline.AttentionScoreAvg-baselineDropMargin {
+				feedback.FeedbackType = "attention_drop"
+				feedback.Severity = "warning"
+				feedback.Message = "attention below this participant's baseline"
+			} else {
+				feedback.FeedbackType = "on_track"
+				feedback.Severity = "info"
+				feedback.Message = "attention within this participant's baseline"
+			}
+			return feedback
+		}
 	}
+
+	feedback.Source = "rule_default"
+	if feature.AttentionScore < defaultAttentionThreshold {
+		feedback.FeedbackType = "attention_drop"
+		feedback.Severity = "warning"
+		feedback.Message = "attention below default threshold (baseline warming up)"
+	} else {
+		feedback.FeedbackType = "on_track"
+		feedback.Severity = "info"
+		feedback.Message = "attention within default threshold (baseline warming up)"
+	}
+	return feedback
 }
 
 func (h *Handler) writeError(ctx context.Context, conn *websocket.Conn, message string) {
