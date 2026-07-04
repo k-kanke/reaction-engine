@@ -1,0 +1,4 @@
+dsn: postgres://reaction:reaction@postgres:5432/reaction?sslmode=disable
+docPath: docs/schema
+er:
+  format: mermaid
