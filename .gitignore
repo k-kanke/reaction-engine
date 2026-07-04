@@ -23,3 +23,5 @@ coverage/
 bin/
 
 tmp/
+
+docs/schema/schema.json

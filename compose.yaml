@@ -89,5 +89,21 @@ services:
       - -path=/migrations
       - -database=postgres://reaction:reaction@postgres:5432/reaction?sslmode=disable
 
+  tbls:
+    image: ghcr.io/k1low/tbls:v1.79.4
+    profiles:
+      - tools
+    working_dir: /work
+    volumes:
+      - .:/work
+    depends_on:
+      - postgres
+    entrypoint:
+      - tbls
+      - doc
+      - --config
+      - /work/.tbls.yml
+      - --force
+
 volumes:
   postgres-data:
