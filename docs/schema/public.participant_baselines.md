@@ -31,7 +31,31 @@
 
 ## Relations
 
-![er](public.participant_baselines.svg)
+```mermaid
+erDiagram
+
+"public.participant_baselines" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
+
+"public.participant_baselines" {
+  uuid id
+  text session_id FK
+  text audience_id
+  jsonb baseline
+  integer sample_count
+  double_precision confidence
+  timestamp_with_time_zone updated_at
+}
+"public.sessions" {
+  text session_id
+  text meeting_provider
+  text status
+  jsonb consent
+  timestamp_with_time_zone started_at
+  timestamp_with_time_zone ended_at
+  timestamp_with_time_zone created_at
+  timestamp_with_time_zone updated_at
+}
+```
 
 ---
 

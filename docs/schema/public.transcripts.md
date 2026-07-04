@@ -35,7 +35,34 @@
 
 ## Relations
 
-![er](public.transcripts.svg)
+```mermaid
+erDiagram
+
+"public.transcripts" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
+
+"public.transcripts" {
+  uuid id
+  text event_id
+  text session_id FK
+  text speaker
+  bigint t_start_ms
+  bigint t_end_ms
+  text text
+  double_precision confidence
+  boolean is_final
+  timestamp_with_time_zone created_at
+}
+"public.sessions" {
+  text session_id
+  text meeting_provider
+  text status
+  jsonb consent
+  timestamp_with_time_zone started_at
+  timestamp_with_time_zone ended_at
+  timestamp_with_time_zone created_at
+  timestamp_with_time_zone updated_at
+}
+```
 
 ---
 

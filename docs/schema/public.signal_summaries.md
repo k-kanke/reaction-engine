@@ -32,7 +32,31 @@
 
 ## Relations
 
-![er](public.signal_summaries.svg)
+```mermaid
+erDiagram
+
+"public.signal_summaries" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
+
+"public.signal_summaries" {
+  uuid id
+  text event_id
+  text session_id FK
+  text audience_id
+  bigint t_ms
+  jsonb summary
+  timestamp_with_time_zone created_at
+}
+"public.sessions" {
+  text session_id
+  text meeting_provider
+  text status
+  jsonb consent
+  timestamp_with_time_zone started_at
+  timestamp_with_time_zone ended_at
+  timestamp_with_time_zone created_at
+  timestamp_with_time_zone updated_at
+}
+```
 
 ---
 

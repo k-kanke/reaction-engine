@@ -23,7 +23,15 @@
 
 ## Relations
 
-![er](public.schema_migrations.svg)
+```mermaid
+erDiagram
+
+
+"public.schema_migrations" {
+  bigint version
+  boolean dirty
+}
+```
 
 ---
 

@@ -40,7 +40,39 @@
 
 ## Relations
 
-![er](public.feedback_events.svg)
+```mermaid
+erDiagram
+
+"public.feedback_events" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
+
+"public.feedback_events" {
+  uuid id
+  text event_id
+  text session_id FK
+  text audience_id
+  bigint t_ms
+  text feedback_type
+  text severity
+  text message
+  jsonb reason_codes
+  text evidence_quote
+  text source
+  text model_version
+  double_precision confidence
+  integer cooldown_ms
+  timestamp_with_time_zone created_at
+}
+"public.sessions" {
+  text session_id
+  text meeting_provider
+  text status
+  jsonb consent
+  timestamp_with_time_zone started_at
+  timestamp_with_time_zone ended_at
+  timestamp_with_time_zone created_at
+  timestamp_with_time_zone updated_at
+}
+```
 
 ---
 

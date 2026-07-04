@@ -32,7 +32,45 @@
 
 ## Relations
 
-![er](public.visual_summaries.svg)
+```mermaid
+erDiagram
+
+"public.visual_summaries" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
+"public.visual_summaries" }o--o| "public.capture_snapshots" : "FOREIGN KEY (capture_id) REFERENCES capture_snapshots(capture_id)"
+
+"public.visual_summaries" {
+  uuid id
+  text session_id FK
+  text audience_id
+  text capture_id FK
+  text media_ref
+  jsonb visual_summary
+  double_precision confidence
+  timestamp_with_time_zone created_at
+}
+"public.sessions" {
+  text session_id
+  text meeting_provider
+  text status
+  jsonb consent
+  timestamp_with_time_zone started_at
+  timestamp_with_time_zone ended_at
+  timestamp_with_time_zone created_at
+  timestamp_with_time_zone updated_at
+}
+"public.capture_snapshots" {
+  text capture_id
+  text session_id FK
+  text audience_id
+  text tile_id
+  bigint t_ms
+  text media_ref
+  text upload_status
+  jsonb feature_snapshot
+  timestamp_with_time_zone created_at
+  timestamp_with_time_zone uploaded_at
+}
+```
 
 ---
 
