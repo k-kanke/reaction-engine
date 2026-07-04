@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os"
 	"time"
 
+	"github.com/k-kanke/reaction-engine/backend/internal/contract"
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
+	"github.com/k-kanke/reaction-engine/backend/internal/writer"
 )
 
 const (
@@ -19,6 +22,11 @@ func main() {
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		databaseURL = "postgres://reaction:reaction@localhost:5432/reaction?sslmode=disable"
+	}
+
+	jsonlDir := os.Getenv("LOCAL_JSONL_DIR")
+	if jsonlDir == "" {
+		jsonlDir = "./tmp/jsonl"
 	}
 
 	ctx := context.Background()
@@ -43,10 +51,23 @@ func main() {
 			continue
 		}
 		for _, e := range unacked {
-			// Phase 5 stub: only proves the local event bus can be read.
-			// Writing compact raw features to JSONL / Cloud SQL and acking
-			// lands in Phase 6 (Durable Writer MVP).
-			log.Printf("writer: unacked event id=%d event_id=%s topic=%s", e.ID, e.EventID, e.Topic)
+			var payload contract.FeatureEventPayload
+			if err := json.Unmarshal(e.Payload, &payload); err != nil {
+				log.Printf("writer: invalid payload for event id=%d event_id=%s: %v", e.ID, e.EventID, err)
+				continue
+			}
+
+			if err := writer.AppendCompactRawFeature(jsonlDir, payload.SessionID, payload); err != nil {
+				log.Printf("writer: write compact raw feature failed for event id=%d event_id=%s: %v", e.ID, e.EventID, err)
+				continue
+			}
+
+			if err := events.Ack(ctx, e.ID); err != nil {
+				log.Printf("writer: ack failed for event id=%d event_id=%s: %v", e.ID, e.EventID, err)
+				continue
+			}
+
+			log.Printf("writer: wrote + acked event id=%d event_id=%s session_id=%s", e.ID, e.EventID, payload.SessionID)
 		}
 	}
 }

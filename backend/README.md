@@ -220,7 +220,30 @@ On every `realtime_feature` message the gateway inserts one row with
 per-audience features (`internal/contract.FeatureEventPayload`).
 
 The `writer` service polls `local_events` for unacked, available rows
-on that topic every 2s and logs what it finds
-(`internal/db.LocalEventStore.FetchUnacked`). Writing those events out
-to JSONL / Cloud SQL and acking them is Phase 6 (Durable Writer MVP);
-Phase 5 only proves the queue itself works end-to-end.
+on that topic every 2s (`internal/db.LocalEventStore.FetchUnacked`) and,
+per event, writes it out and acks it — see Durable Writer MVP below.
+
+## Durable Writer MVP
+
+For each unacked `feature-events` row, the `writer`:
+
+1. Unmarshals the payload back into `contract.FeatureEventPayload`.
+2. Appends it as one JSON line to
+   `{LOCAL_JSONL_DIR}/sessions/{session_id}/features/compact-raw/part-0001.jsonl`
+   (`internal/writer.AppendCompactRawFeature`; `LOCAL_JSONL_DIR` is
+   `/var/reaction/jsonl` in Docker Compose, mounted from `./tmp/jsonl`).
+3. Acks the row (`LocalEventStore.Ack`) only after the JSONL write
+   succeeds; on any failure it's left unacked and retried on the next
+   poll (2s later), so a writer restart naturally re-processes whatever
+   wasn't acked yet.
+
+Each JSONL line carries its own `event_id`, so a duplicate line from a
+reprocessed-but-already-written event is dedupable downstream (post-session
+analysis) — matching `architecture.md`'s storage policy for Cloud Storage
+JSONL, which already treats duplicates as expected and event_id-dedupable
+rather than something the writer must prevent outright.
+
+`signal_summary` / `decision_log` JSONL output (also listed in the
+runbook's Phase 6) is intentionally not implemented yet: there is no real
+signal summary or decision log data to write until the system computation
+layer lands (Phase 9 baseline-aware feedback, Phase 12 realtime LLM stub).
