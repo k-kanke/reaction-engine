@@ -168,3 +168,33 @@ docker build -f backend/Dockerfile --build-arg SERVICE=gateway backend
 ```
 
 `post-session-job` is a one-shot job and is intentionally not part of `compose.yaml`; run it with `make run-post-session-job` or `docker run` on demand.
+
+## Gateway WebSocket (`GET /ws`)
+
+The gateway accepts a WebSocket connection at `/ws` and handles the
+`realtime_feature` message type:
+
+```json
+{"type":"realtime_feature","session_id":"sess_local","t_ms":1783136845733,"features":{"face_tracks":[{"audience_id":"aud_1","attention_score":0.55}]}}
+```
+
+`t_ms` must be a real epoch-millisecond timestamp (as in
+`architecture.md`'s data contract), not a small relative number — the
+gateway trims `features:recent:{session_id}:{audience_id}` down to the
+last 60s by comparing `t_ms` against the server's wall-clock receipt
+time, so a non-epoch `t_ms` gets immediately trimmed back out.
+
+For each `face_tracks` entry the gateway assigns an `event_id`, stamps
+`server_received_at_ms`, writes a compact feature into the
+`features:recent:{session_id}:{audience_id}` Redis ZSET (60s window,
+1h key TTL), and replies on the same connection with a placeholder
+`feedback_event`:
+
+```json
+{"type":"feedback_event","session_id":"sess_local","t_ms":1783136845733,"feedback_type":"stub","severity":"info","message":"placeholder feedback_event (Phase 4)","source":"stub"}
+```
+
+The real signal-summary/cooldown-driven `feedback_event` and the
+`session:computed:*` / `feedback:cooldown:*` Redis keys land in later
+phases (system computation layer, Phase 9, Phase 12); Phase 4 only
+wires the transport, storage, and response shape.
