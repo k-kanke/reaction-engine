@@ -43,13 +43,13 @@ func main() {
 	}
 
 	ctx := context.Background()
-	dbClient, err := db.NewClient(ctx, databaseURL)
+	pool, err := db.NewPool(ctx, databaseURL)
 	if err != nil {
 		log.Fatalf("media-api: failed to connect to postgres: %v", err)
 	}
-	defer dbClient.Close()
+	defer pool.Close()
 
-	store := media.NewPGStore(dbClient)
+	store := media.NewPGStore(pool)
 	handler := media.NewHandler(store, localMediaDir, publicBaseURL, signedURLTTL)
 
 	mux := http.NewServeMux()
