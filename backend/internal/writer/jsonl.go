@@ -49,3 +49,11 @@ func AppendCompactRawFeature(baseDir, sessionID string, payload any) error {
 func AppendTranscriptChunk(baseDir, sessionID string, chunk any) error {
 	return appendJSONLine(chunk, baseDir, "sessions", sessionID, "transcript")
 }
+
+// AppendDecisionLog appends one decision_log as a JSON line to
+// {baseDir}/sessions/{sessionID}/features/decision-log/part-0001.jsonl,
+// matching architecture.md's Cloud Storage layout (Phase 12 of
+// plan/backend-local-docker-runbook.md).
+func AppendDecisionLog(baseDir, sessionID string, log any) error {
+	return appendJSONLine(log, baseDir, "sessions", sessionID, "features", "decision-log")
+}

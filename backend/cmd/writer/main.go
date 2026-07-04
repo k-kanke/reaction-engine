@@ -38,7 +38,7 @@ func main() {
 	defer pool.Close()
 
 	events := db.NewLocalEventStore(pool)
-	transcripts := writer.NewTranscriptStore(pool)
+	store := writer.NewStore(pool)
 
 	log.Println("writer started")
 
@@ -58,7 +58,7 @@ func main() {
 				continue
 			}
 
-			if ok := writeEvent(ctx, jsonlDir, transcripts, e.ID, payload); !ok {
+			if ok := writeEvent(ctx, jsonlDir, store, e.ID, payload); !ok {
 				continue
 			}
 
@@ -73,12 +73,13 @@ func main() {
 }
 
 // writeEvent persists one feature-events payload: compact raw features (if
-// any) as JSONL, and transcript_chunks (if any, Phase 11) as both JSONL and
-// a `transcripts` Postgres row. A payload from realtime_feature carries
-// only Features; one from audio_chunk carries only TranscriptChunks (see
-// contract.FeatureEventPayload). Returns false if any step failed, so the
-// caller leaves the event unacked for retry.
-func writeEvent(ctx context.Context, jsonlDir string, transcripts *writer.TranscriptStore, eventID int64, payload contract.FeatureEventPayload) bool {
+// any) as JSONL, transcript_chunks (if any, Phase 11) as both JSONL and a
+// `transcripts` Postgres row, and decision_logs (if any, Phase 12) as both
+// JSONL and a `decision_logs` Postgres row. A payload from realtime_feature
+// carries Features + DecisionLogs; one from audio_chunk carries only
+// TranscriptChunks (see contract.FeatureEventPayload). Returns false if any
+// step failed, so the caller leaves the event unacked for retry.
+func writeEvent(ctx context.Context, jsonlDir string, store *writer.Store, eventID int64, payload contract.FeatureEventPayload) bool {
 	if len(payload.Features) > 0 {
 		if err := writer.AppendCompactRawFeature(jsonlDir, payload.SessionID, payload); err != nil {
 			log.Printf("writer: write compact raw feature failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
@@ -87,16 +88,31 @@ func writeEvent(ctx context.Context, jsonlDir string, transcripts *writer.Transc
 	}
 
 	for _, chunk := range payload.TranscriptChunks {
-		if err := transcripts.EnsureSession(ctx, chunk.SessionID); err != nil {
+		if err := store.EnsureSession(ctx, chunk.SessionID); err != nil {
 			log.Printf("writer: ensure session failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
 			return false
 		}
-		if err := transcripts.InsertTranscriptChunk(ctx, chunk); err != nil {
+		if err := store.InsertTranscriptChunk(ctx, chunk); err != nil {
 			log.Printf("writer: insert transcript failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
 			return false
 		}
 		if err := writer.AppendTranscriptChunk(jsonlDir, chunk.SessionID, chunk); err != nil {
 			log.Printf("writer: write transcript jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+	}
+
+	for _, decision := range payload.DecisionLogs {
+		if err := store.EnsureSession(ctx, decision.SessionID); err != nil {
+			log.Printf("writer: ensure session failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+		if err := store.InsertDecisionLog(ctx, decision); err != nil {
+			log.Printf("writer: insert decision log failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+		if err := writer.AppendDecisionLog(jsonlDir, decision.SessionID, decision); err != nil {
+			log.Printf("writer: write decision log jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
 			return false
 		}
 	}

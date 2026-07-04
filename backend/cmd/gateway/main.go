@@ -27,6 +27,8 @@ func main() {
 		databaseURL = "postgres://reaction:reaction@localhost:5432/reaction?sslmode=disable"
 	}
 
+	llmEnabled := os.Getenv("ENABLE_REAL_LLM") == "true"
+
 	redisClient := redis.NewClient(redisAddr)
 	defer redisClient.Close()
 
@@ -37,7 +39,7 @@ func main() {
 	defer pool.Close()
 
 	events := db.NewLocalEventStore(pool)
-	handler := gateway.NewHandler(redisClient, events)
+	handler := gateway.NewHandler(redisClient, events, llmEnabled)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
