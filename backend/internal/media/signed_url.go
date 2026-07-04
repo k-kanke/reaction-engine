@@ -2,6 +2,7 @@ package media
 
 import (
 	"fmt"
+	"path/filepath"
 	"time"
 )
 
@@ -32,4 +33,12 @@ func localUploadURL(publicBaseURL, sessionID, captureID, ext string) string {
 
 func expiresAt(ttl time.Duration, now time.Time) string {
 	return now.Add(ttl).UTC().Format(time.RFC3339)
+}
+
+// localFilePath returns the on-disk path handleLocalUpload stores (and
+// handleUploadComplete later verifies) a capture frame at: the same
+// {mediaDir}/sessions/{sessionID}/{captureID}.{ext} layout used when
+// building the local upload URL.
+func localFilePath(mediaDir, sessionID, captureID, ext string) string {
+	return filepath.Join(mediaDir, "sessions", sessionID, fmt.Sprintf("%s.%s", captureID, ext))
 }

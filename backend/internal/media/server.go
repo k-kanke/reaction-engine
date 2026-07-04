@@ -10,22 +10,29 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
 )
 
-const maxLocalUploadBytes = 10 << 20 // 10MB, generous for a single baseline frame
+const (
+	maxLocalUploadBytes      = 10 << 20 // 10MB, generous for a single baseline frame
+	mediaAnalysisEventsTopic = "media-analysis-events"
+)
 
 type Handler struct {
 	Store         Store
+	Events        EventPublisher
 	LocalMediaDir string
 	PublicBaseURL string
 	SignedURLTTL  time.Duration
 	Now           func() time.Time
 }
 
-func NewHandler(store Store, localMediaDir, publicBaseURL string, signedURLTTL time.Duration) *Handler {
+func NewHandler(store Store, events EventPublisher, localMediaDir, publicBaseURL string, signedURLTTL time.Duration) *Handler {
 	return &Handler{
 		Store:         store,
+		Events:        events,
 		LocalMediaDir: localMediaDir,
 		PublicBaseURL: publicBaseURL,
 		SignedURLTTL:  signedURLTTL,
@@ -36,6 +43,7 @@ func NewHandler(store Store, localMediaDir, publicBaseURL string, signedURLTTL t
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sessions/{session_id}/media/upload-url", h.handleUploadURL)
 	mux.HandleFunc("PUT /local-upload/{session_id}/{filename}", h.handleLocalUpload)
+	mux.HandleFunc("POST /sessions/{session_id}/media/{capture_id}/complete", h.handleUploadComplete)
 }
 
 // handleUploadURL implements Phase 7.1: it validates the request, records a
@@ -179,6 +187,76 @@ func (h *Handler) handleLocalUpload(w http.ResponseWriter, r *http.Request) {
 		"bytes":    written,
 		"path":     dest,
 		"filename": filename,
+	})
+}
+
+// handleUploadComplete implements Phase 7.3: it confirms the uploaded file
+// exists on local disk, marks the capture_snapshots/media_refs rows
+// uploaded, and publishes a media_uploaded event to the local event bus
+// (media-analysis-events topic) for the Image Analysis Worker to consume.
+func (h *Handler) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("session_id")
+	captureID := r.PathValue("capture_id")
+	if sessionID == "" || captureID == "" {
+		writeError(w, http.StatusBadRequest, "session_id and capture_id are required")
+		return
+	}
+
+	ctx := r.Context()
+	capture, err := h.Store.GetCapture(ctx, sessionID, captureID)
+	if errors.Is(err, ErrCaptureNotFound) {
+		writeError(w, http.StatusNotFound, "capture not found; call upload-url first")
+		return
+	}
+	if err != nil {
+		log.Printf("media-api: get capture failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to load capture")
+		return
+	}
+
+	ext, ok := extensionForContentType(capture.ContentType)
+	if !ok {
+		log.Printf("media-api: unknown content_type %q for capture %s/%s", capture.ContentType, sessionID, captureID)
+		writeError(w, http.StatusInternalServerError, "stored capture has unknown content_type")
+		return
+	}
+
+	path := localFilePath(h.LocalMediaDir, sessionID, captureID, ext)
+	if _, err := os.Stat(path); err != nil {
+		writeError(w, http.StatusBadRequest, "uploaded file not found; PUT to the upload URL first")
+		return
+	}
+
+	if err := h.Store.MarkUploaded(ctx, sessionID, captureID, h.Now()); err != nil {
+		log.Printf("media-api: mark uploaded failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to update upload status")
+		return
+	}
+
+	eventID := "evt_" + uuid.NewString()
+	payload := contract.MediaUploadedEventPayload{
+		EventID:       eventID,
+		Type:          "media_uploaded",
+		SchemaVersion: 1,
+		SessionID:     sessionID,
+		CaptureID:     captureID,
+		AudienceID:    capture.AudienceID,
+		TileID:        capture.TileID,
+		TMs:           capture.TMs,
+		MediaRef:      capture.MediaRef,
+		Purpose:       capture.Purpose,
+	}
+	if err := h.Events.Enqueue(ctx, mediaAnalysisEventsTopic, eventID, payload); err != nil {
+		log.Printf("media-api: enqueue media_uploaded failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to publish media_uploaded event")
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":     "uploaded",
+		"event_id":   eventID,
+		"capture_id": captureID,
 	})
 }
 

@@ -3,9 +3,17 @@ package media
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ErrCaptureNotFound is returned by Store.GetCapture when no
+// capture_snapshots/media_refs row exists for the given session_id +
+// capture_id.
+var ErrCaptureNotFound = errors.New("media: capture not found")
 
 // CaptureSnapshot mirrors a row of the capture_snapshots table.
 type CaptureSnapshot struct {
@@ -29,6 +37,21 @@ type MediaRef struct {
 	UploadStatus string
 }
 
+// CaptureRecord is the joined capture_snapshots + media_refs view returned
+// by Store.GetCapture, used by the upload-complete handler (Phase 7.3) to
+// locate the uploaded file and build the media_uploaded event.
+type CaptureRecord struct {
+	SessionID    string
+	CaptureID    string
+	AudienceID   string
+	TileID       string // empty means NULL
+	TMs          int64
+	MediaRef     string
+	ContentType  string
+	Purpose      string
+	UploadStatus string
+}
+
 // Store is the persistence boundary the media-api handlers depend on. It is
 // an interface so handler logic can be unit tested without a real Postgres.
 type Store interface {
@@ -38,6 +61,18 @@ type Store interface {
 	EnsureSession(ctx context.Context, sessionID string) error
 	InsertCaptureSnapshot(ctx context.Context, snapshot CaptureSnapshot) error
 	InsertMediaRef(ctx context.Context, ref MediaRef) error
+	// GetCapture returns ErrCaptureNotFound if no matching row exists.
+	GetCapture(ctx context.Context, sessionID, captureID string) (CaptureRecord, error)
+	// MarkUploaded sets upload_status = 'uploaded' (+ uploaded_at) on both
+	// capture_snapshots and media_refs for the given capture.
+	MarkUploaded(ctx context.Context, sessionID, captureID string, uploadedAt time.Time) error
+}
+
+// EventPublisher is the local event bus boundary (Phase 5's
+// db.LocalEventStore in production) media-api publishes media_uploaded
+// events to.
+type EventPublisher interface {
+	Enqueue(ctx context.Context, topic, eventID string, payload any) error
 }
 
 // PGStore is the pgx-backed Store implementation used outside tests.
@@ -100,4 +135,61 @@ func (s *PGStore) InsertMediaRef(ctx context.Context, ref MediaRef) error {
 		ref.UploadStatus,
 	)
 	return err
+}
+
+func (s *PGStore) GetCapture(ctx context.Context, sessionID, captureID string) (CaptureRecord, error) {
+	var rec CaptureRecord
+	var tileID *string
+
+	err := s.pool.QueryRow(ctx, `
+		SELECT cs.session_id, cs.capture_id, cs.audience_id, cs.tile_id, cs.t_ms,
+		       cs.media_ref, mr.content_type, mr.purpose, cs.upload_status
+		FROM capture_snapshots cs
+		JOIN media_refs mr ON mr.capture_id = cs.capture_id AND mr.session_id = cs.session_id
+		WHERE cs.session_id = $1 AND cs.capture_id = $2
+	`, sessionID, captureID).Scan(
+		&rec.SessionID,
+		&rec.CaptureID,
+		&rec.AudienceID,
+		&tileID,
+		&rec.TMs,
+		&rec.MediaRef,
+		&rec.ContentType,
+		&rec.Purpose,
+		&rec.UploadStatus,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CaptureRecord{}, ErrCaptureNotFound
+	}
+	if err != nil {
+		return CaptureRecord{}, err
+	}
+	if tileID != nil {
+		rec.TileID = *tileID
+	}
+	return rec, nil
+}
+
+func (s *PGStore) MarkUploaded(ctx context.Context, sessionID, captureID string, uploadedAt time.Time) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE capture_snapshots SET upload_status = 'uploaded', uploaded_at = $3
+		WHERE session_id = $1 AND capture_id = $2
+	`, sessionID, captureID, uploadedAt); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE media_refs SET upload_status = 'uploaded', uploaded_at = $3
+		WHERE session_id = $1 AND capture_id = $2
+	`, sessionID, captureID, uploadedAt); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }

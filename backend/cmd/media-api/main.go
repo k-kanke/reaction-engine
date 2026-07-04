@@ -50,7 +50,8 @@ func main() {
 	defer pool.Close()
 
 	store := media.NewPGStore(pool)
-	handler := media.NewHandler(store, localMediaDir, publicBaseURL, signedURLTTL)
+	events := db.NewLocalEventStore(pool)
+	handler := media.NewHandler(store, events, localMediaDir, publicBaseURL, signedURLTTL)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
