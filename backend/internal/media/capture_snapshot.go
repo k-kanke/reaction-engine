@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/k-kanke/reaction-engine/backend/internal/db"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // CaptureSnapshot mirrors a row of the capture_snapshots table.
@@ -42,15 +42,15 @@ type Store interface {
 
 // PGStore is the pgx-backed Store implementation used outside tests.
 type PGStore struct {
-	client *db.Client
+	pool *pgxpool.Pool
 }
 
-func NewPGStore(client *db.Client) *PGStore {
-	return &PGStore{client: client}
+func NewPGStore(pool *pgxpool.Pool) *PGStore {
+	return &PGStore{pool: pool}
 }
 
 func (s *PGStore) EnsureSession(ctx context.Context, sessionID string) error {
-	_, err := s.client.Pool.Exec(ctx, `
+	_, err := s.pool.Exec(ctx, `
 		INSERT INTO sessions (session_id, meeting_provider)
 		VALUES ($1, 'unknown')
 		ON CONFLICT (session_id) DO NOTHING
@@ -69,7 +69,7 @@ func (s *PGStore) InsertCaptureSnapshot(ctx context.Context, snapshot CaptureSna
 		featureSnapshot = json.RawMessage("{}")
 	}
 
-	_, err := s.client.Pool.Exec(ctx, `
+	_, err := s.pool.Exec(ctx, `
 		INSERT INTO capture_snapshots
 			(capture_id, session_id, audience_id, tile_id, t_ms, media_ref, upload_status, feature_snapshot)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
@@ -87,7 +87,7 @@ func (s *PGStore) InsertCaptureSnapshot(ctx context.Context, snapshot CaptureSna
 }
 
 func (s *PGStore) InsertMediaRef(ctx context.Context, ref MediaRef) error {
-	_, err := s.client.Pool.Exec(ctx, `
+	_, err := s.pool.Exec(ctx, `
 		INSERT INTO media_refs
 			(session_id, capture_id, media_ref, purpose, content_type, upload_status)
 		VALUES ($1, $2, $3, $4, $5, $6)
