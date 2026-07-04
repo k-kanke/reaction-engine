@@ -198,3 +198,29 @@ The real signal-summary/cooldown-driven `feedback_event` and the
 `session:computed:*` / `feedback:cooldown:*` Redis keys land in later
 phases (system computation layer, Phase 9, Phase 12); Phase 4 only
 wires the transport, storage, and response shape.
+
+## Local Event Bus (`local_events`)
+
+Before wiring real Pub/Sub, the gateway durably queues each
+`realtime_feature` message in a `local_events` Postgres table (migration
+`000002_add_local_events`) instead of publishing to a topic:
+
+```sql
+id bigserial primary key
+topic text not null
+event_id text not null
+payload jsonb not null
+available_at timestamptz not null default now()
+created_at timestamptz not null default now()
+acked_at timestamptz
+```
+
+On every `realtime_feature` message the gateway inserts one row with
+`topic = 'feature-events'` and a payload bundling the event's compact
+per-audience features (`internal/contract.FeatureEventPayload`).
+
+The `writer` service polls `local_events` for unacked, available rows
+on that topic every 2s and logs what it finds
+(`internal/db.LocalEventStore.FetchUnacked`). Writing those events out
+to JSONL / Cloud SQL and acking them is Phase 6 (Durable Writer MVP);
+Phase 5 only proves the queue itself works end-to-end.

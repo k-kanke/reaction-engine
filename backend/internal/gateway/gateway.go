@@ -12,15 +12,19 @@ import (
 	"nhooyr.io/websocket/wsjson"
 
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
+	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	gwredis "github.com/k-kanke/reaction-engine/backend/internal/redis"
 )
 
+const featureEventsTopic = "feature-events"
+
 type Handler struct {
-	redis *gwredis.Client
+	redis  *gwredis.Client
+	events *db.LocalEventStore
 }
 
-func NewHandler(redis *gwredis.Client) *Handler {
-	return &Handler{redis: redis}
+func NewHandler(redis *gwredis.Client, events *db.LocalEventStore) *Handler {
+	return &Handler{redis: redis, events: events}
 }
 
 // ServeWS handles GET /ws: it accepts the WebSocket connection, dispatches
@@ -71,6 +75,7 @@ func (h *Handler) handleRealtimeFeature(ctx context.Context, conn *websocket.Con
 	eventID := "evt_" + uuid.NewString()
 	serverReceivedAtMs := time.Now().UnixMilli()
 
+	compactFeatures := make([]contract.CompactFeature, 0, len(msg.Features.FaceTracks))
 	for _, track := range msg.Features.FaceTracks {
 		feature := contract.CompactFeature{
 			EventID:            eventID,
@@ -80,9 +85,21 @@ func (h *Handler) handleRealtimeFeature(ctx context.Context, conn *websocket.Con
 			ServerReceivedAtMs: serverReceivedAtMs,
 			AttentionScore:     track.AttentionScore,
 		}
+		compactFeatures = append(compactFeatures, feature)
 		if err := h.redis.StoreRecentFeature(ctx, feature); err != nil {
 			log.Printf("gateway: store recent feature failed: %v", err)
 		}
+	}
+
+	payload := contract.FeatureEventPayload{
+		EventID:            eventID,
+		SessionID:          msg.SessionID,
+		TMs:                msg.TMs,
+		ServerReceivedAtMs: serverReceivedAtMs,
+		Features:           compactFeatures,
+	}
+	if err := h.events.Enqueue(ctx, featureEventsTopic, eventID, payload); err != nil {
+		log.Printf("gateway: enqueue local event failed: %v", err)
 	}
 
 	// Phase 4 stub: a real signal_summary/decision_log driven feedback_event
