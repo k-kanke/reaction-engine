@@ -195,7 +195,7 @@ func TestHandleLocalUpload_Success(t *testing.T) {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 
-	stored := filepath.Join(dir, "sessions", "sess_1", "cap_1.webp")
+	stored := filepath.Join(dir, "sessions", "sess_1", "baseline", "frames", "cap_1.webp")
 	data, err := os.ReadFile(stored)
 	if err != nil {
 		t.Fatalf("expected file at %s: %v", stored, err)
@@ -252,7 +252,7 @@ func TestHandleUploadComplete_Success(t *testing.T) {
 	mux := newTestMux(newTestHandler(store, publisher, dir))
 
 	// The file must already exist on disk, as if handleLocalUpload had run.
-	uploadedDir := filepath.Join(dir, "sessions", "sess_1")
+	uploadedDir := filepath.Join(dir, "sessions", "sess_1", "baseline", "frames")
 	if err := os.MkdirAll(uploadedDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
