@@ -43,6 +43,16 @@ func (s *LocalEventStore) Enqueue(ctx context.Context, topic, eventID string, pa
 	return err
 }
 
+// Ack marks an event as processed. It is a no-op (idempotent) if the event
+// is already acked.
+func (s *LocalEventStore) Ack(ctx context.Context, id int64) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE local_events SET acked_at = now() WHERE id = $1 AND acked_at IS NULL`,
+		id,
+	)
+	return err
+}
+
 // FetchUnacked returns up to limit unacked, available events for a topic,
 // oldest first.
 func (s *LocalEventStore) FetchUnacked(ctx context.Context, topic string, limit int) ([]LocalEvent, error) {
