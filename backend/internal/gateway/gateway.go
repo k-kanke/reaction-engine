@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -17,6 +18,24 @@ import (
 )
 
 const featureEventsTopic = "feature-events"
+
+// transcriptFlushIntervalMs is how much audio_chunk t_ms range accumulates
+// per speaker before the stub STT flushes a fake transcript_chunk.
+// fakeTranscriptConfidence is a fixed stub confidence; there is no real STT
+// model behind it yet (Phase 11 of plan/backend-local-docker-runbook.md).
+const (
+	transcriptFlushIntervalMs = 5000
+	fakeTranscriptConfidence  = 0.6
+)
+
+// audioAccumulator tracks one speaker's audio_chunk arrivals within a
+// single WebSocket connection so the gateway knows when to flush a stub
+// transcript_chunk. It only ever sees t_ms/count — raw PCM is read off the
+// wire and discarded, never stored here or anywhere else.
+type audioAccumulator struct {
+	firstTMs int64
+	lastTMs  int64
+}
 
 // defaultAttentionThreshold is the fixed threshold used while a
 // participant's baseline is still warming_up (no Image Analysis Worker
@@ -58,6 +77,11 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 	defer conn.CloseNow()
 
 	ctx := r.Context()
+	// One session per connection (architecture.md: "Gateway が session_id
+	// ごとに self/other 各1本の Speech-to-Text streaming セッションを維持"),
+	// so per-speaker audio accumulators live for the connection's lifetime.
+	audioAccumulators := make(map[string]*audioAccumulator)
+
 	for {
 		var raw json.RawMessage
 		if err := wsjson.Read(ctx, conn, &raw); err != nil {
@@ -78,6 +102,8 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		switch envelope.Type {
 		case "realtime_feature":
 			h.handleRealtimeFeature(ctx, conn, raw)
+		case "audio_chunk":
+			h.handleAudioChunk(ctx, raw, audioAccumulators)
 		default:
 			h.writeError(ctx, conn, "unsupported type: "+envelope.Type)
 		}
@@ -137,6 +163,72 @@ func (h *Handler) handleRealtimeFeature(ctx context.Context, conn *websocket.Con
 			log.Printf("gateway: write feedback_event failed: %v", err)
 			return
 		}
+	}
+}
+
+// handleAudioChunk implements the Phase 11 STT stub: it never calls a real
+// Speech-to-Text service and never persists msg.PCM anywhere. It only
+// tracks how much audio_chunk t_ms range has accumulated per speaker, and
+// once that reaches transcriptFlushIntervalMs it fabricates one
+// deterministic "final" transcript_chunk covering that range, caches it in
+// the Redis transcript window, and enqueues it to the same feature-events
+// local bus realtime_feature uses so Durable Writer persists it too.
+func (h *Handler) handleAudioChunk(ctx context.Context, raw json.RawMessage, accumulators map[string]*audioAccumulator) {
+	var msg contract.AudioChunkMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		log.Printf("gateway: invalid audio_chunk payload: %v", err)
+		return
+	}
+	if msg.Speaker == "" {
+		log.Printf("gateway: audio_chunk missing speaker")
+		return
+	}
+
+	acc, ok := accumulators[msg.Speaker]
+	if !ok {
+		acc = &audioAccumulator{firstTMs: msg.TMs}
+		accumulators[msg.Speaker] = acc
+	}
+	acc.lastTMs = msg.TMs
+
+	if acc.lastTMs-acc.firstTMs < transcriptFlushIntervalMs {
+		return
+	}
+
+	chunk := buildFakeTranscriptChunk(msg.SessionID, msg.Speaker, acc.firstTMs, acc.lastTMs)
+	acc.firstTMs = msg.TMs
+
+	if err := h.redis.StoreRecentTranscript(ctx, chunk); err != nil {
+		log.Printf("gateway: store recent transcript failed: %v", err)
+	}
+
+	payload := contract.FeatureEventPayload{
+		EventID:            chunk.EventID,
+		SessionID:          chunk.SessionID,
+		TMs:                chunk.TEndMs,
+		ServerReceivedAtMs: time.Now().UnixMilli(),
+		TranscriptChunks:   []contract.TranscriptChunk{chunk},
+	}
+	if err := h.events.Enqueue(ctx, featureEventsTopic, chunk.EventID, payload); err != nil {
+		log.Printf("gateway: enqueue transcript event failed: %v", err)
+	}
+}
+
+// buildFakeTranscriptChunk fabricates a deterministic "final" transcript
+// covering [tStartMs, tEndMs) for one speaker. Placeholder until Phase 14
+// wires a real Speech-to-Text adapter behind the same shape.
+func buildFakeTranscriptChunk(sessionID, speaker string, tStartMs, tEndMs int64) contract.TranscriptChunk {
+	return contract.TranscriptChunk{
+		EventID:       "evt_" + uuid.NewString(),
+		Type:          "transcript_chunk",
+		SchemaVersion: 1,
+		SessionID:     sessionID,
+		Speaker:       speaker,
+		TStartMs:      tStartMs,
+		TEndMs:        tEndMs,
+		Text:          fmt.Sprintf("[stub transcript speaker=%s %d-%dms]", speaker, tStartMs, tEndMs),
+		Confidence:    fakeTranscriptConfidence,
+		IsFinal:       true,
 	}
 }
 
