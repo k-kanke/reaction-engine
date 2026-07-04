@@ -243,6 +243,44 @@ analysis) — matching `architecture.md`'s storage policy for Cloud Storage
 JSONL, which already treats duplicates as expected and event_id-dedupable
 rather than something the writer must prevent outright.
 
+## Image Analysis Worker MVP
+
+The `image-analysis-worker` polls `local_events` for unacked
+`media-analysis-events` (`media_uploaded`, published by media-api's
+upload-complete handler) every 2s. For each event it:
+
+1. Loads the `capture_snapshots` row for `capture_id` (media_ref,
+   `feature_snapshot`).
+2. Confirms the uploaded frame exists on local disk — resolving
+   `media_ref` the same way media-api's `/local-upload` endpoint actually
+   wrote it (`{LOCAL_MEDIA_DIR}/sessions/{session_id}/{capture_id}{ext}`),
+   **not** by treating `media_ref` as a literal path. `media_ref` itself
+   is `local://sessions/{session_id}/baseline/frames/{capture_id}.{ext}`,
+   which is a different path (extra `/baseline/frames/` segment) from
+   where the file is actually stored — a pre-existing mismatch from
+   Phase 7 that this worker works around rather than fixes, since fixing
+   it is out of this phase's scope.
+3. Builds a fake, deterministic `visual_summary` (no vision model call
+   yet):
+   ```json
+   {"face_quality":"usable","lighting":"unknown","camera_angle":"unknown","baseline_expression":"unknown","source":"local_stub"}
+   ```
+4. Updates `participant_baselines` with a running average of
+   `feature_snapshot.attention_score` (confidence scales linearly with
+   `sample_count`, capped at 1.0 at 8 samples) — also a deterministic
+   stand-in for real baseline computation, not real vision analysis.
+5. Inserts a `visual_summaries` row.
+6. Caches both in Redis and marks the participant ready:
+   `session:baseline:{session_id}:{audience_id}`,
+   `session:visual_summary:{session_id}:{audience_id}`,
+   `session:baseline_status:{session_id}:{audience_id}` (`"ready"`).
+7. Acks the event only after all of the above succeed.
+
+`signal_summary` / `decision_log` inputs into this baseline (real vision
+model output) land once the system computation layer exists (Phase 9+);
+this phase only proves the media_uploaded → baseline/visual_summary →
+Redis pipeline end to end.
+
 `signal_summary` / `decision_log` JSONL output (also listed in the
 runbook's Phase 6) is intentionally not implemented yet: there is no real
 signal summary or decision log data to write until the system computation
