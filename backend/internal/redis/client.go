@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	recentWindow = 60 * time.Second
-	keyTTL       = time.Hour
+	recentWindow           = 60 * time.Second
+	transcriptRecentWindow = 10 * time.Second
+	keyTTL                 = time.Hour
 )
 
 type Client struct {
@@ -50,6 +51,33 @@ func (c *Client) StoreRecentFeature(ctx context.Context, feature contract.Compac
 
 	pipe := c.rdb.Pipeline()
 	pipe.ZAdd(ctx, key, redis.Z{Score: float64(feature.TMs), Member: payload})
+	pipe.ZRemRangeByScore(ctx, key, "-inf", fmt.Sprintf("%d", cutoff))
+	pipe.Expire(ctx, key, keyTTL)
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func transcriptRecentKey(sessionID, speaker string) string {
+	return fmt.Sprintf("transcript:recent:%s:%s", sessionID, speaker)
+}
+
+// StoreRecentTranscript appends one finalized transcript_chunk to the
+// session/speaker recent window (ZSET scored by t_start_ms), trims entries
+// older than the window, and refreshes the key TTL. Mirrors
+// StoreRecentFeature's shape for features:recent:*, per architecture.md's
+// "on audio_chunk" pseudocode and Phase 11 of
+// plan/backend-local-docker-runbook.md.
+func (c *Client) StoreRecentTranscript(ctx context.Context, chunk contract.TranscriptChunk) error {
+	payload, err := json.Marshal(chunk)
+	if err != nil {
+		return err
+	}
+
+	key := transcriptRecentKey(chunk.SessionID, chunk.Speaker)
+	cutoff := chunk.TEndMs - transcriptRecentWindow.Milliseconds()
+
+	pipe := c.rdb.Pipeline()
+	pipe.ZAdd(ctx, key, redis.Z{Score: float64(chunk.TStartMs), Member: payload})
 	pipe.ZRemRangeByScore(ctx, key, "-inf", fmt.Sprintf("%d", cutoff))
 	pipe.Expire(ctx, key, keyTTL)
 	_, err = pipe.Exec(ctx)

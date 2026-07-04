@@ -38,6 +38,7 @@ func main() {
 	defer pool.Close()
 
 	events := db.NewLocalEventStore(pool)
+	transcripts := writer.NewTranscriptStore(pool)
 
 	log.Println("writer started")
 
@@ -57,8 +58,7 @@ func main() {
 				continue
 			}
 
-			if err := writer.AppendCompactRawFeature(jsonlDir, payload.SessionID, payload); err != nil {
-				log.Printf("writer: write compact raw feature failed for event id=%d event_id=%s: %v", e.ID, e.EventID, err)
+			if ok := writeEvent(ctx, jsonlDir, transcripts, e.ID, payload); !ok {
 				continue
 			}
 
@@ -70,4 +70,36 @@ func main() {
 			log.Printf("writer: wrote + acked event id=%d event_id=%s session_id=%s", e.ID, e.EventID, payload.SessionID)
 		}
 	}
+}
+
+// writeEvent persists one feature-events payload: compact raw features (if
+// any) as JSONL, and transcript_chunks (if any, Phase 11) as both JSONL and
+// a `transcripts` Postgres row. A payload from realtime_feature carries
+// only Features; one from audio_chunk carries only TranscriptChunks (see
+// contract.FeatureEventPayload). Returns false if any step failed, so the
+// caller leaves the event unacked for retry.
+func writeEvent(ctx context.Context, jsonlDir string, transcripts *writer.TranscriptStore, eventID int64, payload contract.FeatureEventPayload) bool {
+	if len(payload.Features) > 0 {
+		if err := writer.AppendCompactRawFeature(jsonlDir, payload.SessionID, payload); err != nil {
+			log.Printf("writer: write compact raw feature failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+	}
+
+	for _, chunk := range payload.TranscriptChunks {
+		if err := transcripts.EnsureSession(ctx, chunk.SessionID); err != nil {
+			log.Printf("writer: ensure session failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+		if err := transcripts.InsertTranscriptChunk(ctx, chunk); err != nil {
+			log.Printf("writer: insert transcript failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+		if err := writer.AppendTranscriptChunk(jsonlDir, chunk.SessionID, chunk); err != nil {
+			log.Printf("writer: write transcript jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+	}
+
+	return true
 }
