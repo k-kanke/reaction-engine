@@ -40,3 +40,14 @@ type CompactFeature struct {
 	ServerReceivedAtMs int64   `json:"server_received_at_ms"`
 	AttentionScore     float64 `json:"attention_score"`
 }
+
+// FeatureEventPayload is the local_events payload the gateway publishes to
+// the "feature-events" topic for durable processing (local stand-in for
+// Pub/Sub, per plan/backend-local-docker-runbook.md Phase 5).
+type FeatureEventPayload struct {
+	EventID            string           `json:"event_id"`
+	SessionID          string           `json:"session_id"`
+	TMs                int64            `json:"t_ms"`
+	ServerReceivedAtMs int64            `json:"server_received_at_ms"`
+	Features           []CompactFeature `json:"features"`
+}
