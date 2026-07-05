@@ -42,3 +42,16 @@ module "terraform_state_bucket" {
   location           = var.region
   versioning_enabled = true
 }
+
+# Step A (docs/system-computation-flow.md deploy plan / plan/gcp-adapter-migration-phase14.md
+# Step 14-3): the Cloud SQL instance media-api (and later other services)
+# use instead of the local Docker Compose Postgres. Public IP only, reached
+# via the Cloud SQL Auth Proxy locally and via Cloud Run's built-in Cloud
+# SQL connector once deployed -- no VPC needed for this piece.
+module "db" {
+  source = "../../modules/cloud-sql"
+
+  project_id    = var.project_id
+  region        = var.region
+  instance_name = var.db_instance_name
+}

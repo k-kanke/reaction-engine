@@ -37,4 +37,13 @@ local state before the backend block existed, then migrated in with
   ```
 - `module.terraform_state_bucket`: this environment's own Terraform state,
   versioned so a bad state push can be rolled back.
+- `module.db` (Phase 14 Step 14-3): the Cloud SQL for PostgreSQL instance
+  backing `backend/migrations`. Public IP only; connect locally through the
+  [Cloud SQL Auth
+  Proxy](https://cloud.google.com/sql/docs/postgres/sql-proxy):
+  ```bash
+  cloud-sql-proxy $(terraform output -raw db_connection_name)
+  ```
+  then point `DATABASE_URL` at `postgres://<db_database_user>:<db_database_password>@localhost:5432/<db_database_name>?sslmode=disable`
+  (`terraform output -raw db_database_password` for the password).
 

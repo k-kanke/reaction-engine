@@ -7,6 +7,10 @@ resource "google_sql_database_instance" "this" {
 
   settings {
     tier = var.tier
+    # Shared-core legacy tiers like db-f1-micro only exist under the
+    # ENTERPRISE edition -- this project's default for new instances is
+    # ENTERPRISE_PLUS, which rejects them (400 Invalid Tier).
+    edition = "ENTERPRISE"
 
     ip_configuration {
       ipv4_enabled = true
