@@ -45,6 +45,7 @@ services:
       - "8081:8081"
     volumes:
       - ./tmp/media:/var/reaction/media
+      - ./backend/.secrets:/var/reaction/secrets:ro
     depends_on:
       - postgres
       - redis
@@ -72,6 +73,7 @@ services:
       - ./backend/.env.local
     volumes:
       - ./tmp/media:/var/reaction/media
+      - ./backend/.secrets:/var/reaction/secrets:ro
     depends_on:
       - postgres
       - redis
