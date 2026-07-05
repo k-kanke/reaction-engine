@@ -53,10 +53,72 @@ local state before the backend block existed, then migrated in with
   attached to a Cloud Run service. Tag images with the short git commit
   hash they were built from -- never `:latest` -- so a Cloud Run revision
   always traces back to an exact source commit.
+  Cloud Run needs a `linux/amd64` image. On Apple Silicon, cross-building
+  that locally under QEMU (`docker buildx build --platform linux/amd64`)
+  has been observed to crash mid-`go mod download` (a known Go/QEMU
+  interaction, not a project bug) -- build on Cloud Build instead, which
+  builds natively on `amd64` workers and pushes directly:
   ```bash
-  gcloud auth configure-docker asia-northeast1-docker.pkg.dev
   TAG=$(git rev-parse --short HEAD)
-  docker build --build-arg SERVICE=media-api -t $(terraform output -raw backend_images_repository_url)/media-api:$TAG backend/
-  docker push $(terraform output -raw backend_images_repository_url)/media-api:$TAG
+  IMAGE=$(terraform output -raw backend_images_repository_url)/media-api:$TAG
+  cat > /tmp/cloudbuild-media-api.yaml <<EOF
+  steps:
+    - name: 'gcr.io/cloud-builders/docker'
+      args: ['build', '--build-arg', 'SERVICE=media-api', '-t', '$IMAGE', '-f', 'backend/Dockerfile', 'backend']
+  images: ['$IMAGE']
+  EOF
+  gcloud builds submit --config=/tmp/cloudbuild-media-api.yaml --substitutions=_IMAGE="$IMAGE" ../../..
   ```
+- `module.media_api_service` (Step E): the `r-media-api` Cloud Run
+  service. Cloud SQL is reached through the built-in volume (no VPC
+  connector), and the runtime identity is `module.media_service_account`
+  -- no key file, no `GOOGLE_APPLICATION_CREDENTIALS`. There's no
+  application-level auth in `backend/internal/media` yet, so
+  `roles/run.invoker` is restricted to `media_api_invoker_members` (set in
+  `terraform.tfvars`) rather than public; widen that only once real auth
+  exists, since Chrome extension clients can't hold GCP identity tokens.
+  ```bash
+  terraform apply -var="media_api_image_tag=$(git rev-parse --short HEAD)"
+  ```
+- `module.tester_service_account`: exists only so humans in
+  `media_api_invoker_members` can impersonate it to test IAM-protected
+  Cloud Run services. `gcloud auth print-identity-token` for a *user*
+  account carries gcloud's own OAuth client ID as its audience, not the
+  Cloud Run URL -- Cloud Run silently rejects that (404, not 403, so as
+  not to reveal the service exists) before the request reaches the
+  container. Impersonation is the documented workaround, since
+  `--audiences` only works for service accounts:
+  ```bash
+  TOKEN=$(gcloud auth print-identity-token \
+    --impersonate-service-account=$(terraform output -raw tester_service_account_email) \
+    --audiences="$(terraform output -raw media_api_url)")
+  curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"purpose":"baseline","content_type":"image/webp","capture_id":"cap_1","t_ms":1000,"audience_id":"aud_1"}' \
+    "$(terraform output -raw media_api_url)/sessions/sess_1/media/upload-url"
+  ```
+  Note: `/healthz` specifically gets intercepted before reaching the
+  container (a generic Google 404 page, no server-side log entry at all,
+  regardless of auth) -- verify against a real route like `upload-url`
+  above instead, not `/healthz`.
 
+### Troubleshooting Cloud Run + Cloud SQL first-time setup
+
+Two gotchas hit during the first `r-media-api` deploy, in case they recur
+for another service:
+
+- **`sqladmin.googleapis.com` must be enabled**, separately from creating
+  the Cloud SQL instance itself (which succeeds either way). Without it,
+  Cloud Run's Cloud SQL connector fails with `dial unix
+  .../.s.PGSQL.5432: connect: connection refused` -- an unhelpful error
+  that looks like a networking problem but is actually `Cloud SQL Admin
+  API has not been used in project ... or it is disabled` buried in the
+  full log line. `gcloud services enable sqladmin.googleapis.com`.
+- **A running instance won't pick up a newly-granted IAM role.** If
+  `roles/cloudsql.client` (or any permission the container needs at
+  startup) is granted *after* an instance is already warm, that instance
+  keeps failing until it's replaced -- IAM propagation delay isn't the
+  (whole) story. Force a fresh revision rather than waiting it out:
+  ```bash
+  gcloud run services update r-media-api --region=asia-northeast1 \
+    --update-labels=force-redeploy=$(date +%s)
+  ```

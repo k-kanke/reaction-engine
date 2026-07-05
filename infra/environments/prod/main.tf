@@ -12,6 +12,13 @@ module "media_service_account" {
   project_id   = var.project_id
   account_id   = "reaction-engine-media-api"
   display_name = "Reaction Engine Media API"
+
+  # roles/cloudsql.client can't be scoped to one instance (Cloud SQL has no
+  # per-instance IAM binding like buckets do) -- it's what lets Cloud Run's
+  # built-in Cloud SQL volume actually authenticate to the Cloud SQL Admin
+  # API on this account's behalf. Without it the /cloudsql socket exists
+  # but nothing answers on it (dial: connection refused).
+  project_roles = ["roles/cloudsql.client"]
 }
 
 # Step C (deploy plan): lets media_service_account sign Cloud Storage V4
@@ -85,4 +92,55 @@ module "backend_images" {
       members = [module.media_service_account.member]
     }
   ]
+}
+
+# Step E (deploy plan): the media-api Cloud Run service itself. No
+# application-level auth exists yet (see backend/internal/media), so
+# roles/run.invoker is restricted to media_api_invoker_members rather than
+# allUsers -- widen that once real auth is built, since Chrome extension
+# clients can't hold GCP identity tokens anyway.
+module "media_api_service" {
+  source = "../../modules/cloud-run-service"
+
+  project_id = var.project_id
+  location   = var.region
+
+  service_name              = "r-media-api"
+  image                     = "${module.backend_images.repository_url}/media-api:${var.media_api_image_tag}"
+  service_account_email     = module.media_service_account.email
+  container_port            = 8080
+  cloudsql_connection_names = [module.db.connection_name]
+
+  env_vars = {
+    MEDIA_STORE_BACKEND = "gcs"
+    GCS_MEDIA_BUCKET    = module.media_bucket.name
+    MEDIA_API_PORT      = "8080"
+    DATABASE_URL        = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+  }
+
+  invoker_members = concat(var.media_api_invoker_members, [module.tester_service_account.member])
+}
+
+# gcloud auth print-identity-token for a *user* account carries gcloud's
+# own OAuth client ID as its audience, not the Cloud Run service URL --
+# Cloud Run then rejects it (as a generic 404, not 403, to avoid leaking
+# whether the service exists) before the request ever reaches the
+# container. The documented workaround is impersonating a service account,
+# which supports minting an ID token with the right --audiences. This SA
+# exists only for that: humans in media_api_invoker_members can
+# impersonate it to test IAM-protected Cloud Run services with curl.
+module "tester_service_account" {
+  source = "../../modules/service-account"
+
+  project_id   = var.project_id
+  account_id   = "reaction-engine-tester"
+  display_name = "Reaction Engine Local Tester (impersonate-only, for curl verification)"
+}
+
+resource "google_service_account_iam_member" "tester_service_account_impersonators" {
+  for_each = toset(var.media_api_invoker_members)
+
+  service_account_id = module.tester_service_account.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = each.value
 }

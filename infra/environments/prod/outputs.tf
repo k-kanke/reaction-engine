@@ -42,3 +42,13 @@ output "backend_images_repository_url" {
   value       = module.backend_images.repository_url
   description = "Prefix for docker tag/push, e.g. `docker push <this>/media-api:<tag>`."
 }
+
+output "media_api_url" {
+  value       = module.media_api_service.uri
+  description = "r-media-api's Cloud Run URL. Only media_api_invoker_members can call it, via an identity token impersonating tester_service_account_email (see this file's README for the full command) -- a plain `gcloud auth print-identity-token` for your user account has the wrong audience and gets silently 404'd."
+}
+
+output "tester_service_account_email" {
+  value       = module.tester_service_account.email
+  description = "Impersonate this (if you're in media_api_invoker_members) to mint a correctly-audienced identity token for testing IAM-protected Cloud Run services. See README."
+}
