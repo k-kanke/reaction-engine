@@ -30,3 +30,12 @@ variable "versioning_enabled" {
   default     = false
   description = "Keep old object versions on overwrite/delete. Turn on for buckets holding data you can't regenerate, e.g. Terraform state."
 }
+
+variable "iam_bindings" {
+  type = list(object({
+    role    = string
+    members = list(string)
+  }))
+  default     = []
+  description = "Bucket-scoped IAM bindings, e.g. [{ role = \"roles/storage.objectAdmin\", members = [\"serviceAccount:foo@project.iam.gserviceaccount.com\"] }]. Prefer this over project-wide roles so an account only gets access to this one bucket."
+}

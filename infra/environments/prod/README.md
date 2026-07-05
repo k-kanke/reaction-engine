@@ -24,9 +24,17 @@ local state before the backend block existed, then migrated in with
 ## Resources managed here
 
 - `module.media_bucket` (Phase 14 Step 14-1): the Cloud Storage bucket
-  `backend/internal/media.GCSMediaStore` uploads baseline frames to. No
-  service account / IAM binding yet -- that's the next step once this
-  bucket exists.
+  `backend/internal/media.GCSMediaStore` uploads baseline frames to.
+- `module.media_service_account` (Phase 14 Step 14-1): the identity that
+  same backend code uses -- scoped to `roles/storage.objectAdmin` on only
+  `module.media_bucket`, nothing project-wide. Its key isn't created by
+  Terraform (see `modules/service-account/README.md`); mint one after
+  `apply` with:
+  ```bash
+  terraform output -raw media_service_account_email
+  gcloud iam service-accounts keys create ./reaction-engine-media-api-key.json \
+    --iam-account=$(terraform output -raw media_service_account_email)
+  ```
 - `module.terraform_state_bucket`: this environment's own Terraform state,
   versioned so a bad state push can be rolled back.
 
