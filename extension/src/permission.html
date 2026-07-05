@@ -4,45 +4,88 @@
     <meta charset="utf-8" />
     <title>マイクの許可 - Reaction Engine</title>
     <style>
+      :root {
+        color-scheme: dark;
+      }
       body {
-        font-family: system-ui, -apple-system, sans-serif;
+        background: #0f131c;
+        color: #e6eaf2;
+        font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", sans-serif;
+        line-height: 1.8;
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+      .card {
+        background: #161c28;
+        border: 1px solid #273044;
+        border-radius: 12px;
         max-width: 480px;
-        margin: 40px auto;
-        padding: 0 16px;
-        line-height: 1.7;
-        color: #202124;
+        padding: 28px 30px 30px;
+      }
+      .eyebrow {
+        color: #8090a6;
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        font-size: 10px;
+        letter-spacing: 0.22em;
+        margin: 0 0 6px;
+        text-transform: uppercase;
+      }
+      h2 {
+        font-size: 18px;
+        margin: 0 0 14px;
+      }
+      p {
+        color: #b6c0d2;
+        font-size: 13.5px;
+        margin: 0 0 12px;
       }
       button {
-        font-size: 16px;
-        padding: 10px 22px;
+        background: #f0a63e;
+        border: 1px solid #f0a63e;
+        border-radius: 8px;
+        color: #241a08;
         cursor: pointer;
-        border-radius: 6px;
-        border: 1px solid #1a73e8;
-        background: #1a73e8;
-        color: #fff;
+        font: inherit;
+        font-size: 15px;
+        font-weight: 600;
+        margin-top: 8px;
+        padding: 10px 22px;
+      }
+      button:hover {
+        background: #f7b458;
+      }
+      button:focus-visible {
+        outline: 2px solid #f0a63e;
+        outline-offset: 2px;
       }
       #status {
-        margin-top: 18px;
-        font-weight: bold;
+        font-weight: 600;
+        margin: 18px 0 0;
         white-space: pre-wrap;
       }
       .ok {
-        color: #188038;
+        color: #46d39a;
       }
       .err {
-        color: #c5221f;
+        color: #f0685d;
       }
     </style>
   </head>
   <body>
-    <h2>🎤 マイクの許可</h2>
-    <p>
-      Reaction Engine が「自分の声」を解析するためにマイクを使います。side panel
-      からは許可プロンプトが正しく出せないため、この通常タブで一度だけ許可してください。
-    </p>
-    <p>一度許可すれば、以降は side panel の Start Capture で自動的に使えます。</p>
-    <button id="grant">マイクを許可する</button>
-    <p id="status"></p>
+    <div class="card">
+      <p class="eyebrow">Reaction Engine</p>
+      <h2>🎤 マイクの許可</h2>
+      <p>
+        Reaction Engine が「自分の声」を解析するためにマイクを使います。side panel
+        からは許可プロンプトが正しく出せないため、この通常タブで一度だけ許可してください。
+      </p>
+      <p>一度許可すれば、以降は side panel の Start Capture で自動的に使えます。</p>
+      <button id="grant">マイクを許可する</button>
+      <p id="status"></p>
+    </div>
     <script src="permission.js"></script>
   </body>
 </html>

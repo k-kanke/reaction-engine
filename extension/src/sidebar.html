@@ -9,15 +9,55 @@
   <body>
     <main class="app">
       <header class="header">
-        <div>
-          <h1>Reaction Engine</h1>
-          <p>Google Meet realtime reaction sidebar</p>
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <h1>Reaction Engine</h1>
+            <p class="brand-sub">Meet Signal Monitor</p>
+          </div>
         </div>
         <span id="statusBadge" class="badge">Idle</span>
       </header>
 
+      <section class="monitor" aria-label="Live monitor">
+        <div class="viewfinder">
+          <canvas id="preview" width="640" height="360"></canvas>
+          <span class="vf-corner vf-tl" aria-hidden="true"></span>
+          <span class="vf-corner vf-tr" aria-hidden="true"></span>
+          <span class="vf-corner vf-bl" aria-hidden="true"></span>
+          <span class="vf-corner vf-br" aria-hidden="true"></span>
+        </div>
+        <video id="sourceVideo" autoplay muted playsinline></video>
+
+        <div class="signal-strip">
+          <div class="signal">
+            <span class="signal-label">Faces</span>
+            <strong id="faceCount">0</strong>
+          </div>
+          <div class="signal">
+            <span class="signal-label">Motion</span>
+            <strong id="motionScore">0.00</strong>
+          </div>
+          <div class="signal">
+            <span class="signal-label">Attention</span>
+            <strong id="attentionScore">0.00</strong>
+          </div>
+          <div class="signal signal-session">
+            <span class="signal-label">Session</span>
+            <strong id="sessionId">-</strong>
+          </div>
+        </div>
+
+        <div class="controls">
+          <button id="startButton" type="button" class="primary">Start Capture</button>
+          <button id="stopButton" type="button" disabled>Stop</button>
+          <button id="micPermButton" type="button" class="controls-wide">マイクを許可</button>
+        </div>
+      </section>
+
       <section class="section">
-        <label for="wsUrl">WebSocket URL</label>
+        <h2 class="eyebrow">Backend Link</h2>
+        <label class="field-label" for="wsUrl">WebSocket URL</label>
         <div class="row">
           <input id="wsUrl" type="url" placeholder="ws://localhost:8787/realtime">
           <button id="connectButton" type="button">Connect</button>
@@ -26,42 +66,9 @@
       </section>
 
       <section class="section">
-        <div class="metrics">
-          <div>
-            <span class="metric-label">Session</span>
-            <strong id="sessionId">-</strong>
-          </div>
-          <div>
-            <span class="metric-label">Faces</span>
-            <strong id="faceCount">0</strong>
-          </div>
-          <div>
-            <span class="metric-label">Motion</span>
-            <strong id="motionScore">0.00</strong>
-          </div>
-          <div>
-            <span class="metric-label">Attention</span>
-            <strong id="attentionScore">0.00</strong>
-          </div>
-        </div>
-      </section>
-
-      <section class="section">
-        <canvas id="preview" width="640" height="360"></canvas>
-        <video id="sourceVideo" autoplay muted playsinline></video>
-      </section>
-
-      <section class="section controls">
-        <button id="startButton" type="button" class="primary">Start Capture</button>
-        <button id="stopButton" type="button" disabled>Stop</button>
-        <button id="micPermButton" type="button">🎤 マイクを許可</button>
-      </section>
-
-      <section class="section">
-        <label for="videoFile">録画ファイルを解析</label>
-        <div class="row">
-          <input id="videoFile" type="file" accept="video/*">
-        </div>
+        <h2 class="eyebrow">Recorded File</h2>
+        <label class="field-label" for="videoFile">録画ファイルを解析</label>
+        <input id="videoFile" type="file" accept="video/*">
         <div class="upload-controls row" style="display:none">
           <button id="uploadPlayButton" type="button" class="primary">再生 &amp; 解析</button>
           <button id="uploadStopButton" type="button" disabled>停止</button>
@@ -69,26 +76,26 @@
       </section>
 
       <section class="section">
-        <h2>Gemini 分析</h2>
+        <h2 class="eyebrow">Gemini Analysis</h2>
         <div class="row">
           <input id="geminiApiKey" type="password" placeholder="Gemini API Key">
           <button id="saveApiKeyButton" type="button">保存</button>
         </div>
-        <button id="geminiAnalyzeButton" type="button" class="primary" style="margin-top:8px;width:100%" disabled>録画を Gemini で分析</button>
+        <button id="geminiAnalyzeButton" type="button" class="primary block" disabled>録画を Gemini で分析</button>
         <p id="geminiStatus" class="hint"></p>
         <pre id="geminiResult" class="gemini-result" style="display:none"></pre>
       </section>
 
       <section class="section">
-        <h2>統合レポート</h2>
-        <button id="unifiedReportButton" type="button" class="primary" style="width:100%" disabled>リアルタイム + Gemini 統合レポート生成</button>
+        <h2 class="eyebrow">Unified Report</h2>
+        <button id="unifiedReportButton" type="button" class="primary block" disabled>リアルタイム + Gemini 統合レポート生成</button>
         <p id="unifiedReportStatus" class="hint"></p>
         <div id="unifiedReport" class="unified-report" style="display:none"></div>
       </section>
 
       <section class="section">
-        <h2>Feature Events</h2>
-        <button id="exportButton" type="button">セッションデータをエクスポート</button>
+        <h2 class="eyebrow">Event Log</h2>
+        <button id="exportButton" type="button" class="block">セッションデータをエクスポート</button>
         <ol id="eventLog" class="event-log"></ol>
       </section>
     </main>
@@ -97,4 +104,3 @@
     <script src="./sidebar.js" type="module"></script>
   </body>
 </html>
-
