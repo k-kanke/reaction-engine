@@ -76,8 +76,12 @@ func (f *fakePublisher) Enqueue(ctx context.Context, topic, eventID string, payl
 }
 
 func newTestHandler(store Store, publisher EventPublisher, mediaDir string) *Handler {
-	h := NewHandler(store, publisher, mediaDir, "http://test-base", 900*time.Second)
-	h.Now = func() time.Time { return time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC) }
+	mediaStore := NewLocalMediaStore(mediaDir, "http://test-base", 900*time.Second)
+	fixedNow := func() time.Time { return time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC) }
+	mediaStore.Now = fixedNow
+
+	h := NewHandler(store, publisher, mediaStore, mediaDir)
+	h.Now = fixedNow
 	return h
 }
 
@@ -316,6 +320,7 @@ func TestHandleUploadComplete_FileNotUploaded(t *testing.T) {
 				SessionID:   "sess_1",
 				CaptureID:   "cap_1",
 				AudienceID:  "aud_1",
+				MediaRef:    "local://sessions/sess_1/baseline/frames/cap_1.webp",
 				ContentType: "image/webp",
 				Purpose:     "baseline_frame",
 			},

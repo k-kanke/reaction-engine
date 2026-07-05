@@ -169,6 +169,34 @@ docker build -f backend/Dockerfile --build-arg SERVICE=gateway backend
 
 `post-session-job` is a one-shot job and is intentionally not part of `compose.yaml`; run it with `make run-post-session-job` or `docker run` on demand.
 
+## MediaStore backend (local / GCS)
+
+`media-api` and `image-analysis-worker` depend on `internal/media.MediaStore`
+(`SignedUploadURL`/`Exists`/`Read`) instead of hardcoding local disk access.
+`MEDIA_STORE_BACKEND` selects the implementation both services construct at
+startup:
+
+- `local` (default): `LocalMediaStore`. `media_ref` uses a `local://` scheme;
+  "signed" upload URLs point back at this same media-api instance's
+  `/local-upload` endpoint (Phase 7.2), which writes under `LOCAL_MEDIA_DIR`.
+- `gcs`: `GCSMediaStore`. `media_ref` uses a `gs://{GCS_MEDIA_BUCKET}/...`
+  scheme; upload URLs are real V4 signed URLs the Chrome extension PUTs
+  directly to Cloud Storage, so media-api never sees the bytes and
+  `/local-upload` goes unused.
+
+```env
+MEDIA_STORE_BACKEND=gcs
+GCS_MEDIA_BUCKET=reaction-engine-sessions
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+```
+
+`GOOGLE_APPLICATION_CREDENTIALS` here is a downloaded service account key
+used both to authenticate the Cloud Storage client and to sign upload URLs
+(`GoogleAccessID`/`PrivateKey`) — suitable for local verification against a
+real bucket. On Cloud Run this should instead sign via the attached service
+account's IAM SignBlob permission (no key file); that wiring is not
+implemented yet (see `plan/gcp-adapter-migration-phase14.md` Step 14-1).
+
 ## Gateway WebSocket (`GET /ws`)
 
 The gateway accepts a WebSocket connection at `/ws` and handles the
@@ -251,12 +279,10 @@ upload-complete handler) every 2s. For each event it:
 
 1. Loads the `capture_snapshots` row for `capture_id` (media_ref,
    `feature_snapshot`).
-2. Confirms the uploaded frame exists on local disk by trimming the
-   `local://` scheme off `media_ref` and joining it with `LOCAL_MEDIA_DIR`
-   — `media_ref` (`local://sessions/{session_id}/baseline/frames/{capture_id}.{ext}`)
-   now matches exactly where media-api's `/local-upload` endpoint writes
-   the file, so no separate path re-derivation is needed (see the Media
-   API section below for the Phase 7 fix that made this true).
+2. Confirms the uploaded frame is reachable via `media.MediaReader.Exists`
+   — the same `MediaStore` abstraction (local disk or Cloud Storage, see
+   "MediaStore backend" below) media-api uses, so the worker doesn't need
+   to know which backend produced `media_ref`.
 3. Builds a fake, deterministic `visual_summary` (no vision model call
    yet):
    ```json

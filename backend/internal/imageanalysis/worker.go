@@ -4,11 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
+	"github.com/k-kanke/reaction-engine/backend/internal/media"
 )
 
 // Cache is the Redis boundary the worker publishes baseline / visual
@@ -32,13 +30,13 @@ var fakeVisualSummary = map[string]string{
 }
 
 type Worker struct {
-	Store    Store
-	Cache    Cache
-	MediaDir string
+	Store      Store
+	Cache      Cache
+	MediaStore media.MediaReader
 }
 
-func NewWorker(store Store, cache Cache, mediaDir string) *Worker {
-	return &Worker{Store: store, Cache: cache, MediaDir: mediaDir}
+func NewWorker(store Store, cache Cache, mediaStore media.MediaReader) *Worker {
+	return &Worker{Store: store, Cache: cache, MediaStore: mediaStore}
 }
 
 // ProcessMediaUploaded implements the Phase 8 pipeline for one
@@ -52,12 +50,15 @@ func (w *Worker) ProcessMediaUploaded(ctx context.Context, payload contract.Medi
 		return fmt.Errorf("get capture snapshot: %w", err)
 	}
 
-	// Confirm the uploaded frame is actually reachable on local disk. The
-	// fake visual summary below doesn't read its bytes; a real vision
-	// model call would replace this step with actual image analysis.
-	path := localMediaPath(w.MediaDir, capture.MediaRef)
-	if _, err := os.Stat(path); err != nil {
-		return fmt.Errorf("stat media file %s: %w", path, err)
+	// Confirm the uploaded frame is actually reachable. The fake visual
+	// summary below doesn't read its bytes; a real vision model call would
+	// replace this step with actual image analysis via MediaStore.Read.
+	exists, err := w.MediaStore.Exists(ctx, capture.MediaRef)
+	if err != nil {
+		return fmt.Errorf("check media exists for ref %s: %w", capture.MediaRef, err)
+	}
+	if !exists {
+		return fmt.Errorf("media not found for ref %s", capture.MediaRef)
 	}
 
 	prev, hasPrev, err := w.Store.GetParticipantBaseline(ctx, payload.SessionID, payload.AudienceID)
@@ -83,15 +84,6 @@ func (w *Worker) ProcessMediaUploaded(ctx context.Context, payload contract.Medi
 	}
 
 	return nil
-}
-
-// localMediaPath resolves capture_snapshots.media_ref (a local://
-// reference, e.g. local://sessions/{session_id}/baseline/frames/{capture_id}.webp)
-// to the on-disk path under mediaDir. media-api's /local-upload endpoint
-// writes files at exactly this relative layout (internal/media.localFilePath),
-// so this is a straight prefix trim rather than a re-derivation.
-func localMediaPath(mediaDir, mediaRef string) string {
-	return filepath.Join(mediaDir, strings.TrimPrefix(mediaRef, "local://"))
 }
 
 type compactFeatureSnapshot struct {

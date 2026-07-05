@@ -11,6 +11,7 @@ import (
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	"github.com/k-kanke/reaction-engine/backend/internal/imageanalysis"
+	"github.com/k-kanke/reaction-engine/backend/internal/media"
 	"github.com/k-kanke/reaction-engine/backend/internal/redis"
 )
 
@@ -54,7 +55,31 @@ func main() {
 
 	events := db.NewLocalEventStore(pool)
 	store := imageanalysis.NewPGStore(pool)
-	worker := imageanalysis.NewWorker(store, redisClient, localMediaDir)
+
+	mediaStoreBackend := os.Getenv("MEDIA_STORE_BACKEND")
+	if mediaStoreBackend == "" {
+		mediaStoreBackend = "local"
+	}
+
+	var mediaStore media.MediaReader
+	switch mediaStoreBackend {
+	case "local":
+		mediaStore = media.NewLocalMediaStore(localMediaDir, "", 0)
+	case "gcs":
+		bucket := os.Getenv("GCS_MEDIA_BUCKET")
+		if bucket == "" {
+			log.Fatal("image-analysis-worker: GCS_MEDIA_BUCKET is required when MEDIA_STORE_BACKEND=gcs")
+		}
+		gcsStore, err := media.NewGCSMediaStore(ctx, bucket, os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"), 0)
+		if err != nil {
+			log.Fatalf("image-analysis-worker: failed to create gcs media store: %v", err)
+		}
+		mediaStore = gcsStore
+	default:
+		log.Fatalf("image-analysis-worker: unknown MEDIA_STORE_BACKEND %q (want local or gcs)", mediaStoreBackend)
+	}
+
+	worker := imageanalysis.NewWorker(store, redisClient, mediaStore)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/debug/healthz", func(w http.ResponseWriter, r *http.Request) {
