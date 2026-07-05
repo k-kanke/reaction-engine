@@ -46,4 +46,17 @@ local state before the backend block existed, then migrated in with
   ```
   then point `DATABASE_URL` at `postgres://<db_database_user>:<db_database_password>@localhost:5432/<db_database_name>?sslmode=disable`
   (`terraform output -raw db_database_password` for the password).
+- `module.backend_images` (Phase 14 Step 14-3 deploy plan): the Artifact
+  Registry Docker repository backend service images are pushed to before
+  Cloud Run deploys them. `module.media_service_account` has
+  `roles/artifactregistry.reader` on it so it can pull images once
+  attached to a Cloud Run service. Tag images with the short git commit
+  hash they were built from -- never `:latest` -- so a Cloud Run revision
+  always traces back to an exact source commit.
+  ```bash
+  gcloud auth configure-docker asia-northeast1-docker.pkg.dev
+  TAG=$(git rev-parse --short HEAD)
+  docker build --build-arg SERVICE=media-api -t $(terraform output -raw backend_images_repository_url)/media-api:$TAG backend/
+  docker push $(terraform output -raw backend_images_repository_url)/media-api:$TAG
+  ```
 

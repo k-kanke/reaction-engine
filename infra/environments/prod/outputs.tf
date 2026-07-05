@@ -37,3 +37,8 @@ output "db_database_password" {
   sensitive   = true
   description = "Retrieve with `terraform output -raw db_database_password`."
 }
+
+output "backend_images_repository_url" {
+  value       = module.backend_images.repository_url
+  description = "Prefix for docker tag/push, e.g. `docker push <this>/media-api:<tag>`."
+}

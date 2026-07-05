@@ -55,3 +55,23 @@ module "db" {
   region        = var.region
   instance_name = var.db_instance_name
 }
+
+# Step B (deploy plan): where backend Docker images (built via
+# backend/Dockerfile's SERVICE build arg) live before Cloud Run deploys
+# them. media_service_account gets pull access here since Step D/E attach
+# it as r-media-api's Cloud Run runtime identity.
+module "backend_images" {
+  source = "../../modules/artifact-registry"
+
+  project_id    = var.project_id
+  location      = var.region
+  repository_id = var.backend_images_repository_id
+  description   = "Backend service images (gateway, media-api, writer, image-analysis-worker, post-session-job)"
+
+  iam_bindings = [
+    {
+      role    = "roles/artifactregistry.reader"
+      members = [module.media_service_account.member]
+    }
+  ]
+}

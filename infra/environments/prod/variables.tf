@@ -24,3 +24,9 @@ variable "db_instance_name" {
   default     = "reaction-engine-db"
   description = "Cloud SQL instance name (Phase 14 Step 14-3). Unique within the project, not globally -- see modules/cloud-sql/variables.tf."
 }
+
+variable "backend_images_repository_id" {
+  type        = string
+  default     = "reaction-engine-backend"
+  description = "Artifact Registry repository name for backend service Docker images. Unique within the project + region, not globally."
+}
