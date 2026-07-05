@@ -14,6 +14,17 @@ module "media_service_account" {
   display_name = "Reaction Engine Media API"
 }
 
+# Step C (deploy plan): lets media_service_account sign Cloud Storage V4
+# URLs via the IAM Credentials SignBlob RPC (backend/internal/media.GCSMediaStore)
+# instead of a downloaded key file -- needed once it's attached as a Cloud
+# Run service's runtime identity, since Cloud Run has no key file to read.
+# Self-scoped: it can only impersonate itself, not any other account.
+resource "google_service_account_iam_member" "media_service_account_token_creator" {
+  service_account_id = module.media_service_account.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = module.media_service_account.member
+}
+
 module "media_bucket" {
   source = "../../modules/storage"
 
