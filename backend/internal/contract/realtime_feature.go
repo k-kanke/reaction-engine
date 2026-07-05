@@ -19,10 +19,13 @@ type FaceTrack struct {
 }
 
 // FeedbackEvent is returned to the Chrome extension over the same
-// WebSocket connection.
+// WebSocket connection. One is sent per audience_id in the triggering
+// realtime_feature message, since baseline-aware correction (Phase 9) is
+// per participant.
 type FeedbackEvent struct {
 	Type         string `json:"type"`
 	SessionID    string `json:"session_id"`
+	AudienceID   string `json:"audience_id"`
 	TMs          int64  `json:"t_ms"`
 	FeedbackType string `json:"feedback_type"`
 	Severity     string `json:"severity"`
@@ -43,11 +46,16 @@ type CompactFeature struct {
 
 // FeatureEventPayload is the local_events payload the gateway publishes to
 // the "feature-events" topic for durable processing (local stand-in for
-// Pub/Sub, per plan/backend-local-docker-runbook.md Phase 5).
+// Pub/Sub, per plan/backend-local-docker-runbook.md Phase 5). An event
+// carries either Features + DecisionLogs (from realtime_feature) or
+// TranscriptChunks (from audio_chunk, Phase 11) — never both sets, since
+// the two message types are triggered independently.
 type FeatureEventPayload struct {
-	EventID            string           `json:"event_id"`
-	SessionID          string           `json:"session_id"`
-	TMs                int64            `json:"t_ms"`
-	ServerReceivedAtMs int64            `json:"server_received_at_ms"`
-	Features           []CompactFeature `json:"features"`
+	EventID            string            `json:"event_id"`
+	SessionID          string            `json:"session_id"`
+	TMs                int64             `json:"t_ms"`
+	ServerReceivedAtMs int64             `json:"server_received_at_ms"`
+	Features           []CompactFeature  `json:"features,omitempty"`
+	TranscriptChunks   []TranscriptChunk `json:"transcript_chunks,omitempty"`
+	DecisionLogs       []DecisionLog     `json:"decision_logs,omitempty"`
 }

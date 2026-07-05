@@ -2,7 +2,6 @@ package media
 
 import (
 	"fmt"
-	"path/filepath"
 	"time"
 )
 
@@ -33,14 +32,4 @@ func localUploadURL(publicBaseURL, sessionID, captureID, ext string) string {
 
 func expiresAt(ttl time.Duration, now time.Time) string {
 	return now.Add(ttl).UTC().Format(time.RFC3339)
-}
-
-// localFilePath returns the on-disk path handleLocalUpload stores (and
-// handleUploadComplete later verifies) a capture frame at:
-// {mediaDir}/sessions/{sessionID}/baseline/frames/{captureID}.{ext}. This
-// matches the local:// path mediaRef encodes (local://sessions/{sessionID}/baseline/frames/{captureID}.{ext})
-// so media_ref actually points at where the file lives on disk instead of a
-// different, flatter layout.
-func localFilePath(mediaDir, sessionID, captureID, ext string) string {
-	return filepath.Join(mediaDir, "sessions", sessionID, "baseline", "frames", fmt.Sprintf("%s.%s", captureID, ext))
 }

@@ -51,7 +51,31 @@ func main() {
 
 	store := media.NewPGStore(pool)
 	events := db.NewLocalEventStore(pool)
-	handler := media.NewHandler(store, events, localMediaDir, publicBaseURL, signedURLTTL)
+
+	mediaStoreBackend := os.Getenv("MEDIA_STORE_BACKEND")
+	if mediaStoreBackend == "" {
+		mediaStoreBackend = "local"
+	}
+
+	var mediaStore media.MediaStore
+	switch mediaStoreBackend {
+	case "local":
+		mediaStore = media.NewLocalMediaStore(localMediaDir, publicBaseURL, signedURLTTL)
+	case "gcs":
+		bucket := os.Getenv("GCS_MEDIA_BUCKET")
+		if bucket == "" {
+			log.Fatal("media-api: GCS_MEDIA_BUCKET is required when MEDIA_STORE_BACKEND=gcs")
+		}
+		gcsStore, err := media.NewGCSMediaStore(ctx, bucket, os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"), signedURLTTL)
+		if err != nil {
+			log.Fatalf("media-api: failed to create gcs media store: %v", err)
+		}
+		mediaStore = gcsStore
+	default:
+		log.Fatalf("media-api: unknown MEDIA_STORE_BACKEND %q (want local or gcs)", mediaStoreBackend)
+	}
+
+	handler := media.NewHandler(store, events, mediaStore, localMediaDir)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

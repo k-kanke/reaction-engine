@@ -25,3 +25,18 @@ bin/
 tmp/
 
 docs/schema/schema.json
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+
+# GCP service account keys -- never commit these (see
+# infra/modules/service-account/README.md: keys are created out-of-band
+# with `gcloud iam service-accounts keys create`, not by Terraform)
+*-key.json
+*-sa-key.json
