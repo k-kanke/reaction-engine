@@ -73,6 +73,7 @@ project is needed.
    terraform apply
    ```
 
-State is local (`terraform.tfstate`, gitignored) -- there's one operator
-right now. Move to a `gcs` backend if/when more than one person needs to
-run `terraform apply` here.
+State lives in a `gcs` backend (see `environments/prod/versions.tf` and
+`environments/prod/README.md`), in a bucket that environment manages for
+itself via `module.terraform_state_bucket`. `terraform init` will pick this
+up automatically -- no separate setup needed here.

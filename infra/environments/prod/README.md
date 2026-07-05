@@ -15,8 +15,11 @@ terraform plan
 terraform apply
 ```
 
-State is local (`terraform.tfstate`, gitignored) for now -- single operator,
-single environment. Move to a `gcs` backend if that stops being true.
+State lives in the `gcs` backend configured in `versions.tf`
+(`gs://reaction-engine-501316-tfstate/terraform/state/prod`), a bucket
+managed by `module.terraform_state_bucket` below. It was bootstrapped with
+local state before the backend block existed, then migrated in with
+`terraform init -migrate-state`.
 
 ## Resources managed here
 
@@ -24,4 +27,6 @@ single environment. Move to a `gcs` backend if that stops being true.
   `backend/internal/media.GCSMediaStore` uploads baseline frames to. No
   service account / IAM binding yet -- that's the next step once this
   bucket exists.
+- `module.terraform_state_bucket`: this environment's own Terraform state,
+  versioned so a bad state push can be rolled back.
 

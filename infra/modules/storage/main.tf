@@ -4,4 +4,8 @@ resource "google_storage_bucket" "this" {
   location                    = var.location
   uniform_bucket_level_access = var.uniform_bucket_level_access
   force_destroy               = var.force_destroy
+
+  versioning {
+    enabled = var.versioning_enabled
+  }
 }

@@ -24,3 +24,9 @@ variable "force_destroy" {
   default     = false
   description = "Allow `terraform destroy` to delete the bucket even if it still has objects in it. Keep false outside of throwaway testing."
 }
+
+variable "versioning_enabled" {
+  type        = bool
+  default     = false
+  description = "Keep old object versions on overwrite/delete. Turn on for buckets holding data you can't regenerate, e.g. Terraform state."
+}

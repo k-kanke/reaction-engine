@@ -8,9 +8,14 @@ terraform {
     }
   }
 
-  # Local state for now (single-operator, single-environment setup). Move
-  # this to a `gcs` backend once more than one person needs to run
-  # terraform apply against this environment.
+  # Backend config can't reference variables, so the bucket name is
+  # hardcoded here. That's fine: there's exactly one prod environment, and
+  # this bucket is itself managed by module.terraform_state_bucket in
+  # main.tf (bootstrapped with local state before this block existed).
+  backend "gcs" {
+    bucket = "reaction-engine-501316-tfstate"
+    prefix = "terraform/state/prod"
+  }
 }
 
 provider "google" {
