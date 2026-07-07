@@ -11,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/compute/metadata"
+	credentials "cloud.google.com/go/iam/credentials/apiv1"
+	"cloud.google.com/go/iam/credentials/apiv1/credentialspb"
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/option"
 )
@@ -28,6 +31,11 @@ type GCSMediaStore struct {
 	now        func() time.Time
 	accessID   string
 	privateKey []byte
+	// iamClient signs V4 URLs via the IAM Credentials SignBlob RPC instead
+	// of privateKey, when there is no downloaded key file to read one
+	// from (the Cloud Run case). Requires accessID to hold
+	// roles/iam.serviceAccountTokenCreator on itself.
+	iamClient *credentials.IamCredentialsClient
 }
 
 type gcsCredentialsFile struct {
@@ -37,11 +45,13 @@ type gcsCredentialsFile struct {
 
 // NewGCSMediaStore builds a GCSMediaStore. credentialsFile is a downloaded
 // service account JSON key, used both to authenticate the Cloud Storage
-// client and to sign V4 upload URLs (GoogleAccessID/PrivateKey). This is
-// intended for local verification against a real bucket per the Step 14-1
-// runbook; on Cloud Run, signing should instead go through the attached
-// service account's IAM SignBlob permission (no key file), which this
-// constructor does not implement yet.
+// client and to sign V4 upload URLs (GoogleAccessID/PrivateKey) -- intended
+// for local verification against a real bucket per the Step 14-1 runbook.
+// When credentialsFile is empty (the Cloud Run case: the runtime identity
+// is the attached service account, no key file exists to read), it instead
+// detects that identity via the metadata server and signs V4 URLs through
+// the IAM Credentials SignBlob RPC, which requires that identity to hold
+// roles/iam.serviceAccountTokenCreator on itself.
 func NewGCSMediaStore(ctx context.Context, bucket, credentialsFile string, ttl time.Duration) (*GCSMediaStore, error) {
 	var opts []option.ClientOption
 	if credentialsFile != "" {
@@ -66,7 +76,19 @@ func NewGCSMediaStore(ctx context.Context, bucket, credentialsFile string, ttl t
 		}
 		store.accessID = sa.ClientEmail
 		store.privateKey = []byte(sa.PrivateKey)
+		return store, nil
 	}
+
+	email, err := metadata.EmailWithContext(ctx, "default")
+	if err != nil {
+		return nil, fmt.Errorf("media: detect runtime service account email via metadata server (required when GOOGLE_APPLICATION_CREDENTIALS is unset): %w", err)
+	}
+	iamClient, err := credentials.NewIamCredentialsClient(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("media: create iam credentials client: %w", err)
+	}
+	store.accessID = email
+	store.iamClient = iamClient
 
 	return store, nil
 }
@@ -79,14 +101,29 @@ func (s *GCSMediaStore) SignedUploadURL(ctx context.Context, sessionID, captureI
 	object := s.object(sessionID, captureID, ext)
 	expires := s.now().Add(s.ttl)
 
-	url, err := storage.SignedURL(s.bucket, object, &storage.SignedURLOptions{
+	opts := &storage.SignedURLOptions{
 		GoogleAccessID: s.accessID,
-		PrivateKey:     s.privateKey,
 		Method:         http.MethodPut,
 		Expires:        expires,
 		ContentType:    contentType,
 		Scheme:         storage.SigningSchemeV4,
-	})
+	}
+	if s.iamClient != nil {
+		opts.SignBytes = func(b []byte) ([]byte, error) {
+			resp, err := s.iamClient.SignBlob(ctx, &credentialspb.SignBlobRequest{
+				Name:    fmt.Sprintf("projects/-/serviceAccounts/%s", s.accessID),
+				Payload: b,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("media: sign blob via iam credentials: %w", err)
+			}
+			return resp.SignedBlob, nil
+		}
+	} else {
+		opts.PrivateKey = s.privateKey
+	}
+
+	url, err := storage.SignedURL(s.bucket, object, opts)
 	if err != nil {
 		return "", "", "", fmt.Errorf("media: sign upload url: %w", err)
 	}

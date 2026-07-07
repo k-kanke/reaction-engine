@@ -2,3 +2,7 @@ project_id                   = "your-gcp-project-id"
 region                       = "asia-northeast1"
 media_bucket_name            = "your-gcp-project-id-reaction-engine-sessions"
 terraform_state_bucket_name  = "your-gcp-project-id-tfstate"
+media_api_invoker_members    = ["user:you@example.com"]
+
+# media_api_image_tag isn't set here -- it changes every deploy, so pass it
+# explicitly: terraform apply -var="media_api_image_tag=$(git rev-parse --short HEAD)"
