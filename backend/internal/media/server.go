@@ -3,6 +3,7 @@ package media
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -90,6 +91,7 @@ func (h *Handler) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 		MediaRef:        ref,
 		UploadStatus:    "pending",
 		FeatureSnapshot: req.FeatureSnapshot,
+		TriggerID:       req.TriggerID,
 	}); err != nil {
 		log.Printf("media-api: insert capture_snapshot failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to store capture snapshot")
@@ -103,6 +105,7 @@ func (h *Handler) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 		Purpose:      req.Purpose,
 		ContentType:  req.ContentType,
 		UploadStatus: "pending",
+		TriggerID:    req.TriggerID,
 	}); err != nil {
 		log.Printf("media-api: insert media_ref failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to store media ref")
@@ -120,6 +123,11 @@ func (h *Handler) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// validateUploadURLRequest enforces the two shapes architecture.md's Upload
+// URL request examples show (画像フロー § Media API): baseline_frame is a
+// per-participant crop and requires audience_id; evidence_frame is a
+// room-level tab screenshot tied to the trigger that caused it and
+// requires trigger_id instead — it has no audience_id on the wire at all.
 func validateUploadURLRequest(sessionID string, req contract.UploadURLRequest) error {
 	if sessionID == "" {
 		return errors.New("session_id is required")
@@ -127,15 +135,25 @@ func validateUploadURLRequest(sessionID string, req contract.UploadURLRequest) e
 	if req.CaptureID == "" {
 		return errors.New("capture_id is required")
 	}
-	if req.AudienceID == "" {
-		return errors.New("audience_id is required")
-	}
-	if req.Purpose == "" {
-		return errors.New("purpose is required")
-	}
 	if req.ContentType == "" {
 		return errors.New("content_type is required")
 	}
+
+	switch req.Purpose {
+	case "baseline_frame":
+		if req.AudienceID == "" {
+			return errors.New("audience_id is required for purpose=baseline_frame")
+		}
+	case "evidence_frame":
+		if req.TriggerID == "" {
+			return errors.New("trigger_id is required for purpose=evidence_frame")
+		}
+	case "":
+		return errors.New("purpose is required")
+	default:
+		return fmt.Errorf("unsupported purpose: %s", req.Purpose)
+	}
+
 	return nil
 }
 

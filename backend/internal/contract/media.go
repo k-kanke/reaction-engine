@@ -3,13 +3,19 @@ package contract
 import "encoding/json"
 
 // UploadURLRequest is the body of POST /sessions/{session_id}/media/upload-url.
+// architecture.md's two Upload URL request examples (画像フロー § Media API)
+// diverge by purpose: baseline_frame carries AudienceID/TileID (a
+// per-participant crop) while evidence_frame carries TriggerID instead (a
+// room-level tab screenshot tied to the trigger that caused it, not to any
+// one participant) — see validateUploadURLRequest in internal/media/server.go.
 type UploadURLRequest struct {
 	Purpose         string          `json:"purpose"`
 	ContentType     string          `json:"content_type"`
 	CaptureID       string          `json:"capture_id"`
 	TMs             int64           `json:"t_ms"`
-	AudienceID      string          `json:"audience_id"`
+	AudienceID      string          `json:"audience_id,omitempty"`
 	TileID          string          `json:"tile_id,omitempty"`
+	TriggerID       string          `json:"trigger_id,omitempty"`
 	FeatureSnapshot json.RawMessage `json:"feature_snapshot,omitempty"`
 }
 
