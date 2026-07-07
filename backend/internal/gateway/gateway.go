@@ -102,9 +102,10 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 // processing, and — when the sample carries a trigger — cache that trigger
 // and hand it to the Realtime Worker (internal/realtime, Step 5 of
 // plan/mood-wave-contract-migration.md) for cooldown/LLM-budget gating and
-// a feedback decision. Durable persistence of the resulting trigger_event/
-// feedback_event is Step 6 — for now HandleTrigger's feedback_event only
-// goes back to Chrome over this connection.
+// a feedback decision. When a trigger is accepted, the resulting
+// trigger_event/feedback_event are written back to Chrome over this
+// connection and separately enqueued for Durable Writer (Step 6) to
+// persist to trigger_events/feedback_events + JSONL.
 func (h *Handler) handleMoodWaveSample(ctx context.Context, conn *websocket.Conn, raw json.RawMessage) {
 	var msg contract.MoodWaveSampleMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
@@ -149,6 +150,43 @@ func (h *Handler) handleMoodWaveSample(ctx context.Context, conn *websocket.Conn
 
 	if err := wsjson.Write(ctx, conn, feedback); err != nil {
 		log.Printf("gateway: write feedback_event failed: %v", err)
+	}
+
+	h.enqueueTriggerAndFeedback(ctx, msg, feedback)
+}
+
+// enqueueTriggerAndFeedback publishes the trigger_event/feedback_event for
+// one accepted trigger to the durable local event bus, for Durable Writer
+// (Step 6) to persist. It sets a fresh EventID on its own copy of feedback
+// so that ID never reaches Chrome (the WS write in handleMoodWaveSample
+// already happened, using the zero-EventID value architecture.md's
+// Chrome-facing example has).
+func (h *Handler) enqueueTriggerAndFeedback(ctx context.Context, msg contract.MoodWaveSampleMessage, feedback contract.FeedbackEvent) {
+	trigger := *msg.Trigger
+
+	triggerEvent := contract.TriggerEvent{
+		EventID:   "evt_trig_" + uuid.NewString(),
+		SessionID: msg.SessionID,
+		TriggerID: trigger.TriggerID,
+		Type:      trigger.Type,
+		Source:    trigger.Source,
+		TMs:       msg.TMs,
+		PeakTMs:   trigger.PeakTMs,
+		Delta:     trigger.Delta,
+	}
+
+	feedback.EventID = "evt_fb_" + uuid.NewString()
+
+	payload := contract.FeatureEventPayload{
+		EventID:            triggerEvent.EventID,
+		SessionID:          msg.SessionID,
+		TMs:                msg.TMs,
+		ServerReceivedAtMs: time.Now().UnixMilli(),
+		TriggerEvents:      []contract.TriggerEvent{triggerEvent},
+		FeedbackEvents:     []contract.FeedbackEvent{feedback},
+	}
+	if err := h.events.Enqueue(ctx, featureEventsTopic, triggerEvent.EventID, payload); err != nil {
+		log.Printf("gateway: enqueue trigger/feedback event failed: %v", err)
 	}
 }
 
