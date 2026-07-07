@@ -114,6 +114,16 @@ let moodTriggerArmed = true;
 let nodActiveSince = null;
 let lastNodTriggerTs = 0;
 let activeExcursion = null; // {moment, startTs} 発火中(偏差が戻るまで)の盛り上がり区間
+// architecture.md の mood_wave_sample.trigger: ローカルtriggerは
+// updateMoodMonitor(250ms周期)で発火するが、送信は sendMoodWaveSample
+// (1Hz)側で行うため、次のtickまでここに積んでおく。
+let pendingTrigger = null; // {trigger_id, type, source, peak_t_ms, delta}
+
+function consumePendingTrigger() {
+  const trigger = pendingTrigger;
+  pendingTrigger = null;
+  return trigger;
+}
 // セッション全体の波形(1秒粒度)。全体フィードバック用に開始〜終了まで保持し、
 // 次のキャプチャ開始時にリセットする。1時間で約14KB×50B≒700KBと軽量。
 const MOOD_TIMELINE_INTERVAL_MS = 1000;
@@ -327,7 +337,7 @@ async function startCapture() {
     setupAudioAnalysis(stream);
 
     analysisTimer = window.setInterval(runAnalysisFrame, ANALYSIS_INTERVAL_MS);
-    eventTimer = window.setInterval(sendFeatureEvent, EVENT_INTERVAL_MS);
+    eventTimer = window.setInterval(sendMoodWaveSample, EVENT_INTERVAL_MS);
     vadTimer = window.setInterval(sampleVad, VAD_INTERVAL_MS);
     captureStartTs = Date.now();
     captureFrame(); // 開始直後に1枚
@@ -430,7 +440,7 @@ async function startVideoFileAnalysis() {
   video.addEventListener("ended", stopVideoFileAnalysis, { once: true });
 
   analysisTimer = window.setInterval(runAnalysisFrame, ANALYSIS_INTERVAL_MS);
-  eventTimer = window.setInterval(sendFeatureEvent, EVENT_INTERVAL_MS);
+  eventTimer = window.setInterval(sendMoodWaveSample, EVENT_INTERVAL_MS);
   startMoodMonitor();
   setStatus("Analyzing file", "active");
   logEvent({ type: "video_file_started", message: file.name });
@@ -1506,7 +1516,7 @@ function captureFrame() {
 // captureBaselineFrames uploads one WebP crop per currently-tracked face to
 // Media API (plan/backend-local-docker-runbook.md Phase 10.2), each paired
 // with the compact feature_snapshot from that same instant. Images never go
-// over the Gateway WebSocket; only realtime_feature/feedback_event does.
+// over the Gateway WebSocket; only mood_wave_sample/feedback_event does.
 function captureBaselineFrames() {
   if (Date.now() - baselineCaptureStartTs > BASELINE_CAPTURE_DURATION_MS) {
     if (baselineTimer) window.clearInterval(baselineTimer);
@@ -1711,30 +1721,85 @@ function sendDiagnostic(type, message) {
   logEvent(event);
 }
 
-function sendFeatureEvent() {
+// architecture.md の mood_wave_sample: raw feature (face_tracks 等) は
+// サーバーへ送らず、room_engagement から合成した mood/attention の偏差と
+// 少数の signals だけを 1Hz で送る。moodEma/moodBaseline は
+// updateMoodMonitor が250ms周期で計算済みのものをそのまま使う。
+function sendMoodWaveSample() {
+  const eng = latestFeatures.room_engagement ?? {};
+  const speech = latestFeatures.speech ?? {};
+  const calibrating = eng.calibrating ?? true;
+  const speechRatio = Math.max(speech.self?.speech_ratio ?? 0, speech.other?.speech_ratio ?? 0);
+
+  const moodValue = moodEma ?? 0;
+  const moodBaselineValue = moodBaseline ?? 0;
+  const attentionDev = attentionEma == null || attentionBaseline == null ? 0 : attentionEma - attentionBaseline;
+
+  // confidence の簡易ヒューリスティック: 較正中/EMA未確定は0、それ以外は
+  // 可視顔数に応じて上げる。実データでの調整余地あり(仮値)。
+  const confidence =
+    calibrating || moodEma == null ? 0 : clamp(0.5 + 0.1 * (eng.visible_faces ?? 0), 0, 1);
+
   const event = {
-    type: "realtime_feature",
+    type: "mood_wave_sample",
+    schema_version: 1,
     session_id: sessionId,
     t_ms: Date.now(),
     meeting_provider: "google_meet",
     source: "chrome_side_panel",
-    features: latestFeatures,
-    // リアルタイムフィードバック用の雰囲気波形の現在値。受け側はこの1Hz
-    // ストリームを窓で貯めれば任意の長さ(例: 直近30秒)の波形を再構成できる。
-    // 毎秒 IndexedDB にも保存されるため、エクスポートすると全セッション分が残る。
-    mood: moodEma == null ? null : {
-      value: round(moodEma),
-      baseline: round(moodBaseline),
-      dev: round(moodEma - moodBaseline)
+    // 受け側はこの1Hzストリームを窓で貯めれば任意の長さ(例: 直近30秒)の
+    // 波形を再構成できる。
+    mood: {
+      value: round(moodValue),
+      baseline: round(moodBaselineValue),
+      y: round(moodValue - moodBaselineValue)
+    },
+    attention_y: round(attentionDev),
+    signals: {
+      visible_faces: eng.visible_faces ?? 0,
+      nod_ratio: eng.nod_ratio ?? 0,
+      speech_ratio: round(speechRatio),
+      brow_flag: eng.brow_flag ?? false
+    },
+    quality: {
+      calibrating,
+      confidence: round(confidence)
+    },
+    client_model_version: {
+      mood_wave: "chrome-mood-wave-v1"
     }
   };
+
+  // ローカルtriggerがこのtickまでに発火していれば同梱する(evidence_frame
+  // のMedia API連携はplan/mood-wave-contract-migration.mdのStep 7/8待ち。
+  // 先に繋ぐとImage Analysis Workerがpurposeを見ずbaselineを壊しうるため、
+  // 現状はtrigger情報のみ送りevidence_frameは送らない)。
+  const trigger = consumePendingTrigger();
+  if (trigger) {
+    event.trigger = trigger;
+  }
 
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(event));
   }
 
-  storeFeatureEvent(event);
   logEvent(event);
+
+  // mood_wave_sample はWSに送る圧縮版で、raw feature (face_tracks等) を
+  // 含まない。ローカルの Unified Report / JSON export 機能はraw featureの
+  // 時系列を必要とするため、こちらは従来どおりIndexedDBにだけ保存する
+  // (サーバーには一切送らない — architecture.md の「raw feature は
+  // Chrome内部の計算材料であり、通常のサーバー保存対象ではない」はサーバー
+  // 送信を禁じているのであってローカル保存を禁じてはいない)。
+  storeFeatureEvent({
+    type: "realtime_feature",
+    session_id: sessionId,
+    t_ms: event.t_ms,
+    meeting_provider: "google_meet",
+    source: "chrome_side_panel",
+    features: latestFeatures,
+    mood: event.mood
+  });
 }
 
 async function toggleWebSocket() {
@@ -2397,21 +2462,29 @@ function captureMoment(trigger) {
   }
 
   renderMoments();
-  // 画像本体は送らずメタデータのみWSへ(検証・将来のタイムライン記録用)
-  const event = {
-    type: "moment_trigger",
+
+  // architecture.md の trigger は WebSocket 上の独立メッセージではなく、
+  // 次に送る mood_wave_sample に同梱する(sendMoodWaveSample 側で消費)。
+  // 画像(evidence_frame)は Media API 連携が繋がるまで送らない
+  // (plan/mood-wave-contract-migration.md Step 7/8 待ち)。
+  const triggerType = trigger.direction === "nod" ? "nod" : trigger.direction === "rise" ? "wave_rise" : "wave_drop";
+  pendingTrigger = {
+    trigger_id: `trig_${crypto.randomUUID()}`,
+    type: triggerType,
+    source: "chrome",
+    peak_t_ms: trigger.peak_t_ms,
+    delta: trigger.delta
+  };
+  logEvent({
+    type: "local_moment_trigger",
     session_id: sessionId,
     t_ms: trigger.t_ms,
-    peak_t_ms: trigger.peak_t_ms,
-    direction: trigger.direction,
-    delta: trigger.delta,
+    ...pendingTrigger,
     snapshot_t_ms: moment.snapshot_t_ms,
     snapshot_lag_ms: moment.snapshot_t_ms == null ? null : trigger.peak_t_ms - moment.snapshot_t_ms,
     has_snapshot: moment.blob != null,
     snapshot_buffer_size: snapshotBuffer.length
-  };
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
-  logEvent(event);
+  });
 
   // rise/drop は「区間」として継続時間を追跡する(nod は瞬間イベントなので対象外)
   if (trigger.direction !== "nod") {
