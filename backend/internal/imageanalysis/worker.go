@@ -44,7 +44,22 @@ func NewWorker(store Store, cache Cache, mediaStore media.MediaReader) *Worker {
 // media file is reachable, derive a fake visual summary and an updated
 // (deterministic, non-LLM) participant baseline, persist both, and cache
 // them in Redis with baseline_status "ready".
+//
+// Step 8 of plan/mood-wave-contract-migration.md restricts this to
+// purpose=baseline_frame only. architecture.md: "Realtime Worker は
+// evidence frame を画像解析 worker に通さない...Image Analysis Worker は
+// baseline frame から baseline_visual_profile を作るのが主責務で、evidence
+// frame の非同期解析は全体FBや監査で必要になった場合だけ行う". Before this
+// guard, an evidence_frame media_uploaded event (now possible since Step 7
+// wired Media API to accept them) would have been processed as if it were
+// a baseline_frame — overwriting that participant's baseline with a
+// feature_snapshot from a totally different capture context (a
+// trigger-driven moment, not baseline calibration).
 func (w *Worker) ProcessMediaUploaded(ctx context.Context, payload contract.MediaUploadedEventPayload) error {
+	if payload.Purpose != "baseline_frame" {
+		return nil
+	}
+
 	capture, err := w.Store.GetCaptureSnapshot(ctx, payload.SessionID, payload.CaptureID)
 	if err != nil {
 		return fmt.Errorf("get capture snapshot: %w", err)
