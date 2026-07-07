@@ -19,18 +19,28 @@ type FaceTrack struct {
 }
 
 // FeedbackEvent is returned to the Chrome extension over the same
-// WebSocket connection. One is sent per audience_id in the triggering
-// realtime_feature message, since baseline-aware correction (Phase 9) is
-// per participant.
+// WebSocket connection, per architecture.md's "Feedback Event（Gateway ->
+// Chrome / Pub/Sub）" contract. Under the mood_wave_sample model feedback is
+// keyed by trigger (TriggerID), not by participant: AudienceID is kept as
+// an optional field for the transition (see
+// plan/mood-wave-contract-migration.md Step 4/5, which decide whether the
+// Realtime Worker still populates it once realtime_feature is retired) but
+// is omitted from the wire payload when empty.
 type FeedbackEvent struct {
-	Type         string `json:"type"`
-	SessionID    string `json:"session_id"`
-	AudienceID   string `json:"audience_id"`
-	TMs          int64  `json:"t_ms"`
-	FeedbackType string `json:"feedback_type"`
-	Severity     string `json:"severity"`
-	Message      string `json:"message"`
-	Source       string `json:"source"`
+	Type          string   `json:"type"`
+	SessionID     string   `json:"session_id"`
+	AudienceID    string   `json:"audience_id,omitempty"`
+	TMs           int64    `json:"t_ms"`
+	TriggerID     string   `json:"trigger_id,omitempty"`
+	FeedbackType  string   `json:"feedback_type"`
+	Severity      string   `json:"severity"`
+	Message       string   `json:"message"`
+	ReasonCodes   []string `json:"reason_codes,omitempty"`
+	EvidenceQuote *string  `json:"evidence_quote,omitempty"`
+	Source        string   `json:"source"`
+	ModelVersion  string   `json:"model_version,omitempty"`
+	Confidence    float64  `json:"confidence,omitempty"`
+	CooldownMs    int      `json:"cooldown_ms,omitempty"`
 }
 
 // CompactFeature is what the gateway stores in the Redis recent window per
