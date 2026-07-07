@@ -12,7 +12,7 @@ let PREVIEW_HEIGHT = 360;
 const MEDIAPIPE_MODEL_PATH = "models/blaze_face_short_range.tflite";
 const MEDIAPIPE_LANDMARKER_MODEL_PATH = "models/face_landmarker.task";
 const GESTURE_HISTORY_MS = 3500;
-const NOD_MIN_PITCH_DELTA = 0.08;
+const NOD_MIN_PITCH_DELTA = 0.04; // 実測: 通常の頷きのピッチ振幅は0.05〜0.08程度
 const NOD_MIN_PHASE_MS = 120;
 
 const elements = {
@@ -41,7 +41,10 @@ const elements = {
   uploadControls: document.querySelector(".upload-controls"),
   unifiedReportButton: document.getElementById("unifiedReportButton"),
   unifiedReportStatus: document.getElementById("unifiedReportStatus"),
-  unifiedReport: document.getElementById("unifiedReport")
+  unifiedReport: document.getElementById("unifiedReport"),
+  moodWave: document.getElementById("moodWave"),
+  momentsGrid: document.getElementById("momentsGrid"),
+  momentsEmpty: document.getElementById("momentsEmpty")
 };
 
 const canvas = elements.preview;
@@ -80,6 +83,41 @@ const BASELINE_CAPTURE_INTERVAL_MS = 5000; // 数秒おきにWebPを生成
 const BASELINE_CAPTURE_DURATION_MS = 60 * 1000; // 最初の60秒だけ
 let baselineTimer = null;
 let baselineCaptureStartTs = 0;
+// --- 雰囲気波形 + モーメント検出: room_engagement をローカルで合成した
+// mood スコアを波形表示し、短時間で大きく動いた瞬間のタブ全体スクショを
+// 直近リングバッファから確保する。すべてメモリ内のみ(永続化なし)。 ---
+const MOOD_WAVE_WINDOW_MS = 60000; // 波形に表示する幅
+const MOOD_TRIGGER_DELTA = 0.08; // ベースラインからの偏差|dev|がこれを超えたら発火
+const MOOD_TRIGGER_REARM_RATIO = 0.6; // 偏差がこの割合以下に戻ったら再武装(ヒステリシス)
+// 頷きは瞬間的なジェスチャーでEMA平滑化に埋もれるため、mood偏差とは独立の
+// 専用チャンネルで発火させる(将来の笑い声・声量急変も同パターンで追加する)
+const NOD_TRIGGER_RATIO = 0.34; // 可視の顔のうちこの割合以上が頷いていたら
+const NOD_TRIGGER_MIN_MS = 500; // この時間継続したら発火
+const NOD_TRIGGER_COOLDOWN_MS = 10000;
+const MOOD_EMA_ALPHA = 0.35; // 表情検出フリッカー対策の平滑化係数(250ms毎)
+const MOOD_BASELINE_ALPHA = 0.02; // 波形の中心線となる移動ベースライン(時定数≒12秒)
+const MOOD_WAVE_GAIN = 0.15; // 波形の縦スケール: ベースライン偏差±この値で上下端に達する
+const MOOD_TRIGGER_COOLDOWN_MS = 10000; // 発火後の連射防止
+const MOOD_TRIGGER_MIN_SAMPLES = 8; // 起動直後の誤発火防止
+const SNAPSHOT_INTERVAL_MS = 250; // 解析と同周期でバッファし、発火時刻とのずれを最小化
+const SNAPSHOT_BUFFER_MS = 15000; // 直近15秒だけメモリ保持(約60枚≒2MB)
+const SNAPSHOT_WIDTH = 480;
+const MAX_MOMENTS = 12; // メモリに保持する moment 上限
+let moodHistory = []; // {t_ms, mood, attention} ※値は移動ベースラインからの偏差(±)
+let moodEma = null;
+let moodBaseline = null;
+let attentionEma = null;
+let attentionBaseline = null;
+let moodTriggerMarks = []; // {t_ms, direction}
+let lastMoodTriggerTs = 0;
+let moodTriggerArmed = true;
+let nodActiveSince = null;
+let lastNodTriggerTs = 0;
+let activeExcursion = null; // {moment, startTs} 発火中(偏差が戻るまで)の盛り上がり区間
+let snapshotTimer = null;
+let snapshotCanvas = null;
+let snapshotBuffer = []; // {t_ms, blob}
+let moments = []; // {t_ms, direction, delta, snapshot_t_ms, blob, url, features}
 let audioContext = null;
 let micStream = null;
 let micRequestError = null;
@@ -289,6 +327,7 @@ async function startCapture() {
     captureStartTs = Date.now();
     captureFrame(); // 開始直後に1枚
     frameTimer = window.setInterval(captureFrame, FRAME_CAPTURE_INTERVAL_MS);
+    startMoodMonitor();
     baselineCaptureStartTs = Date.now();
     baselineTimer = window.setInterval(captureBaselineFrames, BASELINE_CAPTURE_INTERVAL_MS);
     setStatus("Capturing", "active");
@@ -309,6 +348,7 @@ function stopCapture() {
   eventTimer = null;
   vadTimer = null;
   frameTimer = null;
+  stopMoodMonitor();
   teardownAudioAnalysis();
 
   if (stream) {
@@ -386,6 +426,7 @@ async function startVideoFileAnalysis() {
 
   analysisTimer = window.setInterval(runAnalysisFrame, ANALYSIS_INTERVAL_MS);
   eventTimer = window.setInterval(sendFeatureEvent, EVENT_INTERVAL_MS);
+  startMoodMonitor();
   setStatus("Analyzing file", "active");
   logEvent({ type: "video_file_started", message: file.name });
 }
@@ -402,6 +443,7 @@ function stopVideoFileAnalysis() {
   if (eventTimer) window.clearInterval(eventTimer);
   analysisTimer = null;
   eventTimer = null;
+  stopMoodMonitor();
 
   const video = elements.sourceVideo;
   video.pause();
@@ -447,6 +489,7 @@ async function runAnalysisFrame() {
     latestFeatures = buildFeatures(trackedFaces, motionScore);
     drawDebugFrame(trackedFaces, latestFeatures);
     updateMetrics(latestFeatures);
+    updateMoodMonitor(latestFeatures);
   } finally {
     analysisRunning = false;
   }
@@ -1214,7 +1257,8 @@ function detectNodGesture(audienceId) {
 
   for (let i = 1; i < smoothed.length; i += 1) {
     const delta = smoothed[i].pitch - smoothed[i - 1].pitch;
-    const direction = Math.abs(delta) < 0.015 ? 0 : Math.sign(delta);
+    // 0.015では実際の頷き(1ステップ0.01前後)がほぼ全て「静止」扱いになる
+    const direction = Math.abs(delta) < 0.005 ? 0 : Math.sign(delta);
 
     if (!direction) continue;
     if (previousDirection && direction !== previousDirection) {
@@ -1242,7 +1286,8 @@ function detectNodGesture(audienceId) {
 
   return {
     nod_count: nodCount,
-    nod_score: round(clamp(maxAmplitude / 0.22, 0, 1))
+    // 実測レンジに合わせ、振幅0.10でスコア1.0(旧0.22は実際の頷きでは到達不能)
+    nod_score: round(clamp(maxAmplitude / 0.1, 0, 1))
   };
 }
 
@@ -2138,6 +2183,335 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+// --- 雰囲気波形 + モーメント検出 ---
+
+function startMoodMonitor() {
+  moodHistory = [];
+  moodTriggerMarks = [];
+  snapshotBuffer = [];
+  moodEma = null;
+  moodBaseline = null;
+  attentionEma = null;
+  attentionBaseline = null;
+  lastMoodTriggerTs = 0;
+  moodTriggerArmed = true;
+  nodActiveSince = null;
+  lastNodTriggerTs = 0;
+  activeExcursion = null;
+  if (snapshotTimer) window.clearInterval(snapshotTimer);
+  snapshotTimer = window.setInterval(captureSnapshotFrame, SNAPSHOT_INTERVAL_MS);
+  drawMoodWave();
+}
+
+function stopMoodMonitor() {
+  finalizeExcursion(Date.now()); // 進行中の区間があれば閉じる
+  if (snapshotTimer) window.clearInterval(snapshotTimer);
+  snapshotTimer = null;
+  snapshotBuffer = [];
+  moodHistory = [];
+  moodTriggerMarks = [];
+  drawMoodWave();
+}
+
+// room_engagement の合成値。attention_mean はベースライン偏差(0中心±0.02程度)
+// なので 0.5 中心に増幅して使う。係数は実ログの分布に合わせた仮値。
+function computeMoodScore(features) {
+  const eng = features.room_engagement ?? {};
+  const speech = features.speech ?? {};
+  const valence = clamp(((eng.valence_mean ?? 0) + 1) / 2, 0, 1); // -1..1 → 0..1
+  const attention = clamp(0.5 + 2.5 * (eng.attention_mean ?? 0), 0, 1); // 偏差を増幅
+  const nod = clamp(eng.nod_ratio ?? 0, 0, 1);
+  const speechRatio = Math.max(speech.self?.speech_ratio ?? 0, speech.other?.speech_ratio ?? 0);
+  return {
+    mood: clamp(0.4 * valence + 0.25 * attention + 0.2 * nod + 0.15 * speechRatio, 0, 1),
+    attention: round(attention)
+  };
+}
+
+function updateMoodMonitor(features) {
+  // 較正中は room_engagement が全て0固定のため、そのまま使うと較正明けに
+  // 段差が生じて誤発火する。較正明けの実測値からEMA/ベースラインを始める。
+  if (features.room_engagement?.calibrating) return;
+
+  const now = Date.now();
+  const { mood: rawMood, attention: rawAttention } = computeMoodScore(features);
+
+  // 短いEMAでフリッカーを均し、長いEMA(移動ベースライン)との差分=偏差を波形にする
+  moodEma = moodEma == null ? rawMood : moodEma + MOOD_EMA_ALPHA * (rawMood - moodEma);
+  moodBaseline = moodBaseline == null ? moodEma : moodBaseline + MOOD_BASELINE_ALPHA * (moodEma - moodBaseline);
+  attentionEma = attentionEma == null ? rawAttention : attentionEma + MOOD_EMA_ALPHA * (rawAttention - attentionEma);
+  attentionBaseline =
+    attentionBaseline == null ? attentionEma : attentionBaseline + MOOD_BASELINE_ALPHA * (attentionEma - attentionBaseline);
+
+  moodHistory.push({
+    t_ms: now,
+    mood: round(moodEma - moodBaseline),
+    attention: round(attentionEma - attentionBaseline)
+  });
+
+  const cutoff = now - MOOD_WAVE_WINDOW_MS;
+  while (moodHistory.length && moodHistory[0].t_ms < cutoff) moodHistory.shift();
+  moodTriggerMarks = moodTriggerMarks.filter((mark) => mark.t_ms >= cutoff);
+
+  detectMoodTrigger(now);
+  detectNodTrigger(now, features);
+  drawMoodWave();
+}
+
+function detectNodTrigger(now, features) {
+  const ratio = features.room_engagement?.nod_ratio ?? 0;
+  if (ratio < NOD_TRIGGER_RATIO) {
+    nodActiveSince = null;
+    return;
+  }
+  if (nodActiveSince == null) nodActiveSince = now;
+  if (now - nodActiveSince < NOD_TRIGGER_MIN_MS) return;
+  if (now - lastNodTriggerTs < NOD_TRIGGER_COOLDOWN_MS) return;
+
+  lastNodTriggerTs = now;
+  moodTriggerMarks.push({ t_ms: now, direction: "nod" });
+  captureMoment({ t_ms: now, peak_t_ms: now, direction: "nod", delta: round(ratio) });
+}
+
+function detectMoodTrigger(now) {
+  const latest = moodHistory[moodHistory.length - 1];
+  if (!latest) return;
+  const dev = latest.mood; // ベースラインからの偏差(±)
+
+  // 発火後はベースライン付近に戻るまで再武装しない。
+  // ピーク→平常への「戻り」を発火として扱わないためのヒステリシス。
+  if (!moodTriggerArmed) {
+    if (Math.abs(dev) < MOOD_TRIGGER_DELTA * MOOD_TRIGGER_REARM_RATIO) {
+      moodTriggerArmed = true;
+      finalizeExcursion(now); // 盛り上がり区間の終了=継続時間が確定
+    }
+    return;
+  }
+
+  if (moodHistory.length < MOOD_TRIGGER_MIN_SAMPLES) return;
+  if (now - lastMoodTriggerTs < MOOD_TRIGGER_COOLDOWN_MS) return;
+  if (Math.abs(dev) < MOOD_TRIGGER_DELTA) return;
+
+  const direction = dev > 0 ? "rise" : "drop";
+  moodTriggerArmed = false;
+  lastMoodTriggerTs = now;
+  moodTriggerMarks.push({ t_ms: now, direction });
+  // 発火条件を満たしたまさにその時刻のフレームを使う
+  captureMoment({ t_ms: now, peak_t_ms: now, direction, delta: round(Math.abs(dev)) });
+}
+
+// タブ全体(sourceVideo)を縮小JPEG化してリングバッファに積む
+function captureSnapshotFrame() {
+  const video = elements.sourceVideo;
+  if (!video || !video.videoWidth) return;
+
+  if (!snapshotCanvas) snapshotCanvas = document.createElement("canvas");
+  const w = SNAPSHOT_WIDTH;
+  const h = Math.round((video.videoHeight / video.videoWidth) * w) || 270;
+  snapshotCanvas.width = w;
+  snapshotCanvas.height = h;
+  snapshotCanvas.getContext("2d").drawImage(video, 0, 0, w, h);
+
+  const tMs = Date.now();
+  snapshotCanvas.toBlob(
+    (blob) => {
+      if (!blob) return;
+      snapshotBuffer.push({ t_ms: tMs, blob });
+      if (snapshotBuffer.length === 1) {
+        sendDiagnostic("snapshot_buffer_started", `first frame ${w}x${h} ~${Math.round(blob.size / 1024)}KB`);
+      }
+      const cutoff = Date.now() - SNAPSHOT_BUFFER_MS;
+      while (snapshotBuffer.length && snapshotBuffer[0].t_ms < cutoff) snapshotBuffer.shift();
+    },
+    "image/jpeg",
+    0.6
+  );
+}
+
+function findClosestSnapshot(tMs) {
+  let best = null;
+  let bestDiff = Infinity;
+  for (const snap of snapshotBuffer) {
+    const diff = Math.abs(snap.t_ms - tMs);
+    if (diff < bestDiff) {
+      best = snap;
+      bestDiff = diff;
+    }
+  }
+  return best;
+}
+
+function captureMoment(trigger) {
+  const snap = findClosestSnapshot(trigger.peak_t_ms);
+  const moment = {
+    t_ms: trigger.t_ms,
+    direction: trigger.direction,
+    delta: trigger.delta,
+    snapshot_t_ms: snap?.t_ms ?? null,
+    blob: snap?.blob ?? null,
+    url: snap ? URL.createObjectURL(snap.blob) : null,
+    features: structuredClone(latestFeatures)
+  };
+
+  moments.unshift(moment);
+  while (moments.length > MAX_MOMENTS) {
+    const removed = moments.pop();
+    if (removed.url) URL.revokeObjectURL(removed.url);
+  }
+
+  renderMoments();
+  // 画像本体は送らずメタデータのみWSへ(検証・将来のタイムライン記録用)
+  const event = {
+    type: "moment_trigger",
+    session_id: sessionId,
+    t_ms: trigger.t_ms,
+    peak_t_ms: trigger.peak_t_ms,
+    direction: trigger.direction,
+    delta: trigger.delta,
+    snapshot_t_ms: moment.snapshot_t_ms,
+    snapshot_lag_ms: moment.snapshot_t_ms == null ? null : trigger.peak_t_ms - moment.snapshot_t_ms,
+    has_snapshot: moment.blob != null,
+    snapshot_buffer_size: snapshotBuffer.length
+  };
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
+  logEvent(event);
+
+  // rise/drop は「区間」として継続時間を追跡する(nod は瞬間イベントなので対象外)
+  if (trigger.direction !== "nod") {
+    activeExcursion = { moment, startTs: trigger.t_ms };
+  }
+}
+
+// 偏差がベースライン付近へ戻った時点で盛り上がり区間を閉じ、継続時間を確定する
+function finalizeExcursion(now) {
+  if (!activeExcursion) return;
+  const { moment, startTs } = activeExcursion;
+  activeExcursion = null;
+
+  moment.duration_ms = now - startTs;
+  renderMoments();
+
+  const event = {
+    type: "moment_update",
+    session_id: sessionId,
+    t_ms: startTs,
+    direction: moment.direction,
+    duration_ms: moment.duration_ms
+  };
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(event));
+  logEvent(event);
+}
+
+function renderMoments() {
+  const grid = elements.momentsGrid;
+  if (!grid) return;
+
+  elements.momentsEmpty.style.display = moments.length ? "none" : "";
+  grid.textContent = "";
+
+  for (const moment of moments) {
+    const card = document.createElement("figure");
+    card.className = "moment";
+
+    if (moment.url) {
+      const img = document.createElement("img");
+      img.src = moment.url;
+      img.alt = "moment snapshot";
+      img.title = "クリックでJPEGを保存";
+      img.addEventListener("click", () => downloadMoment(moment));
+      card.appendChild(img);
+    }
+
+    const caption = document.createElement("figcaption");
+    const time = document.createElement("span");
+    time.textContent = new Date(moment.t_ms).toLocaleTimeString("ja-JP", { hour12: false });
+    const dir = document.createElement("span");
+    dir.className = `moment-dir ${moment.direction}`;
+    const dirLabel = moment.direction === "rise" ? "↑" : moment.direction === "drop" ? "↓" : "NOD";
+    const duration = moment.duration_ms != null ? ` · ${(moment.duration_ms / 1000).toFixed(1)}s` : "";
+    dir.textContent = `${dirLabel} ${moment.delta.toFixed(2)}${duration}`;
+    caption.append(time, dir);
+    card.appendChild(caption);
+
+    grid.appendChild(card);
+  }
+}
+
+function downloadMoment(moment) {
+  if (!moment.url) return;
+  const a = document.createElement("a");
+  a.href = moment.url;
+  a.download = `moment_${sessionId}_${moment.t_ms}.jpg`;
+  a.click();
+}
+
+function drawMoodWave() {
+  const cv = elements.moodWave;
+  if (!cv) return;
+
+  const g = cv.getContext("2d");
+  const W = cv.width;
+  const H = cv.height;
+  const now = Date.now();
+  const t0 = now - MOOD_WAVE_WINDOW_MS;
+  const toX = (t) => ((t - t0) / MOOD_WAVE_WINDOW_MS) * W;
+  // 中心線=移動ベースライン。偏差±MOOD_WAVE_GAIN で上下端に達する
+  const toY = (dev) => H / 2 - (clamp(dev, -MOOD_WAVE_GAIN, MOOD_WAVE_GAIN) / MOOD_WAVE_GAIN) * (H / 2 - 4);
+
+  g.clearRect(0, 0, W, H);
+
+  // ベースライン(中心線)
+  g.strokeStyle = "rgba(230, 234, 242, 0.12)";
+  g.lineWidth = 1;
+  g.setLineDash([3, 5]);
+  g.beginPath();
+  g.moveTo(0, H / 2);
+  g.lineTo(W, H / 2);
+  g.stroke();
+  g.setLineDash([]);
+
+  for (const mark of moodTriggerMarks) {
+    g.strokeStyle =
+      mark.direction === "rise"
+        ? "rgba(240, 166, 62, 0.55)"
+        : mark.direction === "nod"
+          ? "rgba(70, 211, 154, 0.55)"
+          : "rgba(122, 162, 232, 0.55)";
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(toX(mark.t_ms), 0);
+    g.lineTo(toX(mark.t_ms), H);
+    g.stroke();
+  }
+
+  if (moodHistory.length < 2) return;
+
+  // mood 偏差エリアの塗り(中心線との間。上=盛り上がり、下=冷え込み)
+  g.fillStyle = "rgba(240, 166, 62, 0.15)";
+  g.beginPath();
+  g.moveTo(toX(moodHistory[0].t_ms), H / 2);
+  for (const s of moodHistory) g.lineTo(toX(s.t_ms), toY(s.mood));
+  g.lineTo(toX(moodHistory[moodHistory.length - 1].t_ms), H / 2);
+  g.closePath();
+  g.fill();
+
+  drawWaveLine(g, moodHistory, (s) => s.attention, toX, toY, "rgba(128, 144, 166, 0.45)", 1);
+  drawWaveLine(g, moodHistory, (s) => s.mood, toX, toY, "#f0a63e", 2);
+}
+
+function drawWaveLine(g, samples, pick, toX, toY, color, width) {
+  g.strokeStyle = color;
+  g.lineWidth = width;
+  g.beginPath();
+  for (let i = 0; i < samples.length; i += 1) {
+    const x = toX(samples[i].t_ms);
+    const y = toY(pick(samples[i]));
+    if (i === 0) g.moveTo(x, y);
+    else g.lineTo(x, y);
+  }
+  g.stroke();
+}
+
 // --- Session Storage (IndexedDB) ---
 
 const SESSION_DB_NAME = "reaction_engine_sessions";
@@ -2229,3 +2603,4 @@ function clamp(value, min, max) {
 }
 
 drawEmptyPreview();
+drawMoodWave();

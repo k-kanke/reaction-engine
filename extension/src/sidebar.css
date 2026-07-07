@@ -228,6 +228,92 @@ body {
   font-weight: 500;
 }
 
+.mood-wave {
+  background: var(--well);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: block;
+  height: 48px;
+  margin-top: 10px;
+  width: 100%;
+}
+
+.wave-legend {
+  display: flex;
+  gap: 12px;
+  margin-top: 6px;
+}
+
+.legend-item {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.legend-item::before {
+  border-radius: 1px;
+  content: "";
+  display: inline-block;
+  height: 2px;
+  margin-right: 5px;
+  vertical-align: middle;
+  width: 12px;
+}
+
+.legend-mood::before {
+  background: var(--amber);
+}
+
+.legend-attn::before {
+  background: rgba(128, 144, 166, 0.65);
+}
+
+.moments-grid {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: repeat(2, 1fr);
+}
+
+.moment {
+  background: var(--well);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 0;
+  overflow: hidden;
+}
+
+.moment img {
+  aspect-ratio: 16 / 9;
+  cursor: pointer;
+  display: block;
+  object-fit: cover;
+  width: 100%;
+}
+
+.moment figcaption {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  justify-content: space-between;
+  padding: 4px 7px;
+}
+
+.moment-dir.rise {
+  color: var(--amber);
+}
+
+.moment-dir.drop {
+  color: #7aa2e8;
+}
+
+.moment-dir.nod {
+  color: var(--live);
+}
+
 .controls {
   display: grid;
   gap: 8px;
