@@ -2,253 +2,474 @@
 
 ## 目的
 
-Reaction Engine は、Google Meet 上の発表・商談・授業・社内共有で、発表者にリアルタイムな反応フィードバックとセッション後レポートを返す。
+Reaction Engine は、Google Meet 上の発表・商談・授業・社内共有で、発表者にリアルタイムな反応フィードバックとセッション後の全体フィードバックレポートを返す。
 
-重要な設計原則は、**動画や画像を常時サーバーへ送らない**こと。Chrome 拡張内で映像・音声を特徴量に変換し、サーバーには特徴量イベント、transcript、必要最小限の代表フレーム/短いクリップだけを送る。
+重要な設計原則は、**動画・画像・raw feature を常時サーバーへ送らない**こと。Chrome 拡張はブラウザ内で映像・音声から特徴量を抽出し、その特徴量をさらに `mood_wave_sample` という軽量な時系列点に圧縮して送る。サーバーはこの `(t_ms, y)` 系列、transcript、必要時だけ upload された画像を組み合わせて LLM 入力を作る。
 
-このアーキテクチャは Google Cloud の managed services を中心に構成する。
+画像は2種類に分ける。
+
+- `baseline_frame`: セッション開始時に数枚だけ取得し、通常時の見え方・参加者構成・表情基準を作るために使う
+- `evidence_frame`: trigger 発火時の文脈補強用。Chrome 側の短期リングバッファから必要な画像だけ upload する
 
 ## Google Cloud サービス対応表
 
 | 論理コンポーネント | Google Cloud サービス | 役割 |
 | --- | --- | --- |
-| Chrome Extension | Chrome MV3 | Meet 画面/音声取得（self+other）、Edge Vision、feature event / 音声チャンク送信 |
-| WebSocket Gateway | Cloud Run service | `realtime_feature` / `audio_chunk` 受信、Redis/Pub/Sub への分岐、`feedback_event` 返却 |
-| システム演算層 | Cloud Run WebSocket Gateway 内 | window 集計、変化率、signal summary、transcript window 組み立て、~10秒ごとの Realtime LLM 呼び出し、decision log の計算 |
-| Realtime Transcription | Speech-to-Text streaming | self/other 音声チャンクの即時文字起こし（session_idごとに2ストリーム） |
-| Realtime LLM | Vertex AI / Gemini Flash | ~10秒間隔で反応サマリ+発話内容から feedback を生成（timeout + rule fallback） |
-| Media API | Cloud Run service | baseline frame 用 signed upload URL 発行、media_ref 登録 |
-| Realtime state | Memorystore for Redis | 直近 window、transcript window、latest state、feedback cooldown |
-| Durable event pipeline | Pub/Sub | compact raw feature、signal summary、transcript_chunk、decision log を後続 worker に渡す durable queue |
-| Image analysis event pipeline | Pub/Sub | media upload 完了 event を Image Analysis Worker に渡す |
-| Durable Writer | Cloud Run service / Cloud Run worker | Pub/Sub を購読し、Cloud Storage / Cloud SQL に保存 |
-| Image Analysis Worker | Cloud Run service / Cloud Run Jobs | 画像と画像取得時 snapshot から participant baseline / visual summary を計算 |
-| Compact raw feature storage | Cloud Storage | compact raw feature JSONL、transcript JSONL、代表フレーム、短いクリップ |
-| Baseline frame storage | Cloud Storage | baseline 用 screenshot / manifest |
-| App database | Cloud SQL for PostgreSQL | session、participant、capture snapshot、participant baseline、visual summary、signal summary、transcript、decision log、feedback history、report |
-| Post-session jobs | Cloud Run Jobs | セッション後分析、レポート生成（文字起こしは実施済みのため ASR は行わない） |
-| LLM report | Vertex AI / Gemini | 反応タイムライン、改善提案、レポート生成 |
+| Chrome Extension | Chrome MV3 | Meet 画面/音声取得、Edge Vision/Audio、`mood_wave_sample` 生成、baseline/evidence frame の取得 |
+| WebSocket Gateway | Cloud Run service | `mood_wave_sample` / `audio_chunk` 受信、Redis/Pub/Sub への分岐、`feedback_event` 返却 |
+| Realtime Worker | Cloud Run service / Gateway 内 worker | mood wave window 構築、Chrome trigger 受理、LLM evidence pack 作成、realtime feedback 生成 |
+| Realtime Transcription | Speech-to-Text streaming | self/other 音声チャンクの即時文字起こし |
+| Realtime LLM | Vertex AI / Gemini Flash | 直近30秒の mood wave、transcript、baseline/evidence frame から realtime feedback を生成 |
+| Media API | Cloud Run service | baseline/evidence frame 用 signed upload URL 発行、media_ref 登録、upload complete 受付 |
+| Realtime state | Memorystore for Redis | mood wave recent buffer、transcript recent window、trigger/cooldown |
+| Durable event pipeline | Pub/Sub | mood sample、transcript、trigger、feedback、media event を後続 worker に渡す durable queue |
+| Durable Writer | Cloud Run service / worker | Pub/Sub を購読し、Cloud Storage / Cloud SQL に保存 |
+| Image Analysis Worker | Cloud Run service / Jobs | baseline frame から baseline visual profile を作る。evidence frame はリアルタイムLLMへ画像参照として直接渡し、必要な場合だけ事後分析で非同期解析する |
+| Object storage | Cloud Storage | mood wave JSONL、transcript JSONL、baseline/evidence frames、report PDF |
+| App database | Cloud SQL for PostgreSQL | sessions、media_refs、baseline_visual_profiles、evidence_frame_analyses、transcripts、feedback_events、reports |
+| Post-session jobs | Cloud Run Jobs | 全体波形・transcript・realtime feedback・画像 evidence からレポート生成 |
+| LLM report | Vertex AI / Gemini | セッション後の全体フィードバック、改善提案、レポート本文生成 |
+| PDF renderer | Cloud Run Jobs / service | report JSON から PDF を生成 |
+| Gmail sender | Gmail API / Workspace API | 生成済み PDF レポートを送信 |
 | Analytics optional | BigQuery | セッション横断分析、評価、集計 |
-| Secrets | Secret Manager | DB password、API keys、署名鍵 |
-| Observability | Cloud Logging / Cloud Monitoring | logs、metrics、alerts、latency/cost 監視（Realtime LLM呼び出しコスト含む） |
+| Secrets | Secret Manager | DB password、API keys、署名鍵、Gmail OAuth credentials |
+| Observability | Cloud Logging / Cloud Monitoring | logs、metrics、alerts、latency/cost 監視 |
 
 ## 全体像
 
-全体像は、3つのフローに分けて読む。
+全体像は、4つのフローに分けて読む。
 
-- リアルタイムフロー: 発表中に特徴量を受け取り、即時 feedback を返す
-- 全体フィードバックフロー: セッション後の保存・集計・レポート生成を行う
-- 画像処理フロー: screenshot の upload URL と `media_ref` を発行し、画像取得時の `feature_snapshot` から人ごとの baseline / visual summary を作る
+- **Chrome edge flow**: ブラウザ内で raw feature を抽出し、`mood_wave_sample` に圧縮する
+- **リアルタイムFBフロー**: 発表中に mood wave / transcript / 必要画像から即時 feedback を返す
+- **画像フロー**: baseline frame と trigger 時 evidence frame を signed upload し、LLM evidence として使える形にする
+- **全体FBレポートフロー**: セッション後に全体波形・transcript・feedback履歴・画像 evidence から PDF レポートを作り、Gmail で送る
 
-画像処理フローは、リアルタイムフローの特徴量 window を参照しない。Chrome 拡張は画像本体を Cloud Storage に直接 upload し、画像取得時の compact `feature_snapshot` を Media API 経由で `capture_snapshots` に保存する。Image Analysis Worker は、この画像と `capture_snapshots.feature_snapshot` だけを入力にして、参加者ごとの `participant_baseline` と `visual_summary` を作る。
-
-画像処理フローとリアルタイムフローは、生の特徴量や画像参照を共有しない。共有するのは、画像解析後に Redis / Cloud SQL へ保存された `participant_baselines` と `visual_summaries` だけ。Gateway は画像解析を同期的には待たず、Redis に反映済みの結果を次回以降の feedback で参照する。
+raw feature は Chrome 内部の計算材料であり、通常のサーバー保存対象ではない。サーバー側の source of truth は `mood_wave_sample`、`transcript_chunk`、`trigger_event`、`feedback_event`、`media_ref`、画像解析結果である。
 
 ```mermaid
 flowchart TB
   presenter["発表者"]
   meet["Google Meet"]
 
-  subgraph extension["Chrome Extension"]
-    capture["画面/音声キャプチャ<br/>(self音声+相手タブ音声)"]
-    edge["Edge Vision / Audio<br/>顔検出・頭部姿勢・動き・音声特徴量"]
-    sidebar["Sidebar UI<br/>スコア・フィードバック表示"]
+  subgraph chrome["Chrome Extension"]
+    capture["画面/音声キャプチャ"]
+    features["Edge Feature Extraction<br/>face / gaze / motion / nod / VAD"]
+    waveLocal["Mood Wave Composer<br/>mood_wave_sample(t_ms, y)"]
+    ring["Evidence Frame Ring Buffer<br/>直近15-30秒をメモリ保持"]
+    sidepanel["Sidebar UI<br/>簡易波形・feedback表示"]
   end
 
-  subgraph realtime["リアルタイムフロー"]
+  subgraph realtime["リアルタイムFBフロー"]
     gateway["Cloud Run<br/>WebSocket Gateway"]
-    sttStream["Speech-to-Text streaming<br/>self/other 各1本"]
-    redis[("Memorystore for Redis<br/>ZSET/HASH recent state + transcript")]
-    systemCompute["システム演算層<br/>window集計・signal summary・transcript window・decision log"]
-    llmRealtime["Vertex AI / Gemini Flash<br/>~10秒ごとの realtime reasoning (timeout付き)"]
-    decision["Realtime Decision<br/>LLM出力 + rule fallback・template・cooldown"]
+    stt["Speech-to-Text streaming<br/>self/other"]
+    redis[("Memorystore for Redis<br/>mood recent / transcript recent / cooldown")]
+    rtWorker["Realtime Worker<br/>30s window・trigger・evidence pack"]
+    rtLlm["Vertex AI / Gemini Flash<br/>realtime feedback"]
+    decision["Feedback Decision<br/>LLM + rule fallback + cooldown"]
   end
 
-  subgraph durable["全体フィードバックフロー"]
-    pubsub["Pub/Sub<br/>feature-events topic"]
-    writer["Cloud Run Durable Writer<br/>batch persist / retry"]
-    storage[("Cloud Storage<br/>compact raw feature JSONL / signal summaries / decision logs / transcript JSONL / clips")]
-    cloudsql[("Cloud SQL for PostgreSQL<br/>sessions / baselines / visual summaries / transcripts / reports")]
-    jobs["Cloud Run Jobs<br/>post-session analysis（ASRは行わない）"]
-    vertex["Vertex AI / Gemini"]
-    bq[("BigQuery optional<br/>analytics / evaluation")]
-  end
-
-  subgraph baselineImage["画像処理フロー"]
+  subgraph media["画像フロー"]
     mediaApi["Cloud Run<br/>Media API"]
-    baselineStorage[("Cloud Storage<br/>baseline frames / manifest")]
-    mediaRef["media_ref<br/>capture_id + t_ms + audience_id"]
-    imagePubsub["Pub/Sub<br/>media-analysis-events topic"]
-    imageWorker["Cloud Run<br/>Image Analysis Worker"]
-    visionLlm["Vertex AI / Gemini Vision<br/>画像 + feature_snapshot"]
+    mediaStore[("Cloud Storage<br/>baseline/evidence frames")]
+    mediaTopic["Pub/Sub<br/>media-analysis-events"]
+    imageWorker["Image Analysis Worker"]
+    visionLlm["Vertex AI / Gemini Vision"]
+    visualProfile[("Cloud SQL / Redis<br/>baseline visual profile")]
+  end
+
+  subgraph durable["永続化フロー"]
+    eventTopic["Pub/Sub<br/>analysis-events"]
+    writer["Durable Writer"]
+    objectStore[("Cloud Storage<br/>mood-wave JSONL / transcript JSONL / reports")]
+    cloudsql[("Cloud SQL<br/>sessions / feedback / media / reports")]
+  end
+
+  subgraph post["全体FBレポートフロー"]
+    postJob["Post-session Job"]
+    reportLlm["Vertex AI / Gemini<br/>post-session report"]
+    pdf["PDF Renderer"]
+    gmail["Gmail Sender"]
   end
 
   presenter --> meet
   meet --> capture
-  capture --> edge
-  edge -->|realtime_feature + audio_chunk / WebSocket| gateway
+  capture --> features
+  features --> waveLocal
+  capture --> ring
+  waveLocal --> sidepanel
 
-  gateway -->|compact raw feature| redis
-  gateway -->|self/other PCM chunk| sttStream
-  sttStream -->|final transcript_chunk| redis
-  redis --> systemCompute
-  systemCompute -->|signal summary + transcript window| llmRealtime
-  llmRealtime -->|feedback候補 + evidence timeout失敗時は空| decision
-  systemCompute -->|rule fallback + decision log| decision
+  waveLocal -->|mood_wave_sample / WebSocket| gateway
+  capture -->|audio_chunk / WebSocket| gateway
+  gateway -->|audio stream| stt
+  stt -->|transcript_chunk| redis
+  gateway -->|mood_wave_sample| redis
+  redis --> rtWorker
+
+  waveLocal -->|trigger付き mood_wave_sample| gateway
+  ring -->|trigger時に選択した frame| mediaApi
+
+  waveLocal -->|baseline frame upload URL request at session start| mediaApi
+  mediaApi -->|signed upload URL| waveLocal
+  waveLocal -->|PUT baseline frame| mediaStore
+  ring -->|PUT evidence frame| mediaStore
+  mediaApi -->|media_uploaded| mediaTopic
+  mediaTopic --> imageWorker
+  imageWorker -->|read image| mediaStore
+  imageWorker -->|image analysis| visionLlm
+  imageWorker --> visualProfile
+  visualProfile -.->|baseline/evidence refs| rtWorker
+
+  rtWorker -->|30s mood window + transcript + frame refs| rtLlm
+  rtLlm --> decision
+  rtWorker -->|rule fallback| decision
   decision -->|feedback_event| gateway
-  gateway --> sidebar
-  sidebar --> presenter
+  gateway --> sidepanel
+  sidepanel --> presenter
 
-  systemCompute -->|compact raw feature + signal summary + transcript_chunk + decision log| pubsub
-  pubsub --> writer
-  writer -->|raw JSONL + transcript JSONL| storage
-  writer -->|signal summary / transcript / decision log / feedback history| cloudsql
-  writer -.->|optional load jobs| bq
+  gateway -->|mood sample / transcript / trigger / feedback| eventTopic
+  mediaApi -->|media metadata| eventTopic
+  eventTopic --> writer
+  writer --> objectStore
+  writer --> cloudsql
 
-  edge -->|baseline frame upload URL request| mediaApi
-  mediaApi -->|signed upload URL| edge
-  edge -->|PUT baseline frame| baselineStorage
-  mediaApi -->|media_ref| edge
-  edge -->|media_ref registration| mediaApi
-  mediaApi --> mediaRef
-  mediaApi -->|media_ref / capture snapshot| cloudsql
-  mediaApi -->|media_uploaded| imagePubsub
-  imagePubsub --> imageWorker
-  imageWorker -->|read image by media_ref| baselineStorage
-  cloudsql -.->|read capture snapshot| imageWorker
-  imageWorker -->|image + feature_snapshot| visionLlm
-  visionLlm -->|visual summary| imageWorker
-  imageWorker -->|participant_baselines / visual_summaries| cloudsql
-  imageWorker -.->|baseline / visual_summary cache| redis
-  cloudsql -.->|baseline source| gateway
+  objectStore --> postJob
+  cloudsql --> postJob
+  visualProfile --> postJob
+  postJob --> reportLlm
+  reportLlm --> pdf
+  pdf --> objectStore
+  pdf --> cloudsql
+  pdf --> gmail
+  gmail --> presenter
 
-  storage --> jobs
-  cloudsql --> jobs
-  jobs --> vertex
-  jobs -->|report| cloudsql
-
-  style baselineImage fill:#fff7cc,stroke:#facc15,stroke-width:2px,color:#111827
-  classDef baselineNode fill:#fffbeb,stroke:#f59e0b,stroke-width:1px,color:#111827
-  class mediaApi,baselineStorage,mediaRef,imagePubsub,imageWorker,visionLlm baselineNode
+  style realtime fill:#eef6ff,stroke:#60a5fa,stroke-width:2px,color:#111827
+  style media fill:#fff7cc,stroke:#facc15,stroke-width:2px,color:#111827
+  style post fill:#f0fdf4,stroke:#22c55e,stroke-width:2px,color:#111827
 ```
 
 ## 概要データフロー
 
-この図は、実装サービス名ではなく役割名で見たデータフロー。詳細な Google Cloud 構成を見る前に、どのデータがどのフローで使われるかを把握するための図。
+この図は、どのデータがどこで作られ、どの server / worker が処理し、どの LLM 入力に使われるかを示す。
 
 ```mermaid
 flowchart TB
-  user["発表者"]
-  meeting["オンライン会議"]
-  extension["ブラウザ拡張<br/>画面・音声取得"]
-  feature["特徴量抽出<br/>顔・姿勢・視線・動き・音声"]
-
-  subgraph realtimeFlow["リアルタイムフロー"]
+  subgraph chromeFlow["Chrome edge flow"]
     direction TB
-    realtimeServer["リアルタイム受信サーバー"]
-    speechToText["音声文字起こし<br/>self/other ストリーミング"]
-    temporaryState["短期状態ストア<br/>直近特徴量・発話テキスト・画像解析結果・抑制状態"]
-    compute["システム演算層<br/>変化率・平均との差分・発話内容の要約"]
-    realtimeReasoning["リアルタイム意味判断<br/>発言内容と反応変化 約10秒間隔 timeout付き"]
-    realtimeDecision["即時判定<br/>LLM出力 + ルール安全網・抑制・文言選択"]
-    presenterFeedback["発表中フィードバック"]
+    meeting["会議映像・音声"]
+    edge["ブラウザ内特徴量抽出<br/>face / gaze / motion / nod / VAD"]
+    sample["mood_wave_sample<br/>(t_ms, y, attention_y, quality)"]
+    audio["audio_chunk<br/>self / other PCM"]
+    baseline["baseline_frame<br/>セッション開始時に5枚"]
+    ring["evidence frame ring buffer<br/>直近15-30秒をメモリ保持"]
+
+    meeting -->|常時キャプチャ中| edge
+    edge -->|1Hz程度で生成| sample
+    edge -->|常時/小チャンク| audio
+    edge -->|セッション開始時だけ| baseline
+    meeting -->|常時/短期保持のみ| ring
   end
 
-  subgraph imageFlow["画像処理フロー"]
+  subgraph realtimeFlow["Realtime feedback flow"]
     direction TB
-    uploadUrl["画像URL発行<br/>signed upload URL"]
-    imageStore["画像ストレージ<br/>baseline frames"]
-    mediaRefData["画像参照データ<br/>media_ref・時刻・参加者ID"]
-    imageWorker["画像解析ワーカー<br/>画像 + feature_snapshot"]
-    visualData["参加者基準値・画像要約<br/>個人差補正データ"]
+    gatewayIn["r-gateway<br/>WebSocket受信<br/>mood/audio ingress"]
+    realtimeBuf["Redis recent buffer<br/>直近 mood wave / transcript"]
+    stt["Google Speech-to-Text<br/>streaming"]
+    transcript["transcript_chunk"]
+    trigger["r-gateway / Realtime Worker<br/>Chrome trigger受理<br/>cooldown / LLM budget判定"]
+    rtPack["r-gateway / Realtime Worker<br/>realtime evidence pack<br/>直近30s wave + transcript + images"]
+    rtLlm["Vertex AI / Gemini Flash<br/>realtime LLM"]
+    rtFeedback["r-gateway<br/>feedback_event返却"]
+
+    gatewayIn -->|mood sampleを蓄積| realtimeBuf
+    gatewayIn -->|audioを中継| stt
+    realtimeBuf -->|trigger付きsample到着時| trigger
+    stt -->|finalのみ| transcript
+    transcript -->|常時蓄積| realtimeBuf
+    realtimeBuf -->|LLM context作成時| rtPack
+    trigger -->|cooldown通過時| rtPack
+    rtPack -->|LLM解析時| rtLlm
+    rtLlm -->|生成後| rtFeedback
   end
 
-  subgraph overallFlow["全体フィードバックフロー"]
+  subgraph imageFlow["Image evidence flow"]
     direction TB
-    eventQueue["分析イベントキュー"]
-    durableWriter["永続化ワーカー"]
-    durableStore["分析データ保管<br/>特徴量・判定根拠・履歴"]
-    reportWorker["セッション後分析ワーカー"]
-    report["全体フィードバック<br/>時系列・改善提案・レポート"]
+    mediaApi["r-media-api<br/>upload_url / media_ref発行<br/>upload complete受付"]
+    evidence["evidence_frame<br/>trigger時だけ upload"]
+    mediaStore["Cloud Storage<br/>baseline / evidence frames"]
+    mediaRefs["Cloud SQL media_refs<br/>media metadata"]
+    imageWorker["r-image-worker<br/>画像解析 worker"]
+    imageAnalysis["baseline visual profile<br/>post-session optional image analysis"]
+
+    ring -->|trigger発火時に選択| evidence
+    baseline -->|セッション開始時だけ upload-url要求| mediaApi
+    evidence -->|trigger発火時だけ upload-url要求| mediaApi
+    mediaApi -->|upload_url / media_ref返却| evidence
+    evidence -->|画像本体をPUT| mediaStore
+    baseline -->|画像本体をPUT| mediaStore
+    mediaApi -->|media_ref確保/complete反映| mediaRefs
+    mediaRefs -->|baseline upload時| imageWorker
+    mediaStore -->|baseline画像読込| imageWorker
+    imageWorker -->|baseline解析結果| imageAnalysis
   end
 
-  user --> meeting
-  meeting --> extension
-  extension --> feature
+  subgraph durableFlow["Durable storage flow"]
+    direction TB
+    durable["Pub/Sub / local_events<br/>analysis-events / media-events"]
+    writer["r-writer<br/>Durable Writer worker"]
+    stored["Cloud Storage JSONL / Cloud SQL<br/>mood wave・transcript・trigger・feedback・media"]
+    sessionData["セッション全体データ<br/>全体波形・全transcript・feedback履歴・画像解析"]
 
-  feature -->|特徴量イベント| realtimeServer
-  extension -->|self/other 音声チャンク| speechToText
-  speechToText -->|発話テキスト| temporaryState
-  realtimeServer --> temporaryState
-  temporaryState -->|直近ウィンドウ・発話参照| compute
-  compute -->|演算結果・抑制状態更新| temporaryState
-  compute -->|反応サマリ+発話内容| realtimeReasoning
-  realtimeReasoning --> realtimeDecision
-  compute -->|フォールバック用ルール判断| realtimeDecision
-  realtimeDecision --> presenterFeedback
-  presenterFeedback --> user
+    durable -->|受信イベントを永続化| writer
+    writer -->|append / upsert| stored
+    stored -->|セッション終了後| sessionData
+  end
 
-  compute -->|発話を含む要約済み分析イベント| eventQueue
-  eventQueue --> durableWriter
-  durableWriter --> durableStore
-  durableStore --> reportWorker
-  reportWorker --> report
-  report --> user
+  subgraph postFlow["Post-session report flow"]
+    direction TB
+    reportPack["r-post-session-job<br/>post-session report pack作成"]
+    reportLlm["Vertex AI / Gemini<br/>report generation"]
+    pdf["PDF Renderer job/service<br/>PDF report生成"]
+    mail["Gmail Sender job/service<br/>Gmail delivery"]
 
-  extension -->|画像URL要求| uploadUrl
-  uploadUrl -->|upload URL + media_ref| extension
-  extension -->|画像本体を直接upload| imageStore
-  uploadUrl --> mediaRefData
-  imageStore --> imageWorker
-  mediaRefData --> imageWorker
-  imageWorker --> visualData
-  visualData -.->|Redisへ反映| temporaryState
-  visualData -.->|個人差補正| compute
-  visualData -.->|基準値補正| reportWorker
+    reportPack -->|レポート生成時| reportLlm
+    reportLlm -->|生成後| pdf
+    pdf -->|送信要求時| mail
+  end
 
-  style imageFlow fill:#fff7cc,stroke:#facc15,stroke-width:2px,color:#111827
+  sample -->|常時送信 / WebSocket| gatewayIn
+  audio -->|常時送信 / WebSocket| gatewayIn
+  mediaRefs -->|trigger画像のmedia_refを参照| rtPack
+  mediaStore -->|LLM入力時に画像参照| rtPack
+  imageAnalysis -->|baseline比較用に参照| rtPack
+  imageAnalysis -->|全体FBで参照| reportPack
+  gatewayIn -->|mood/transcript/trigger publish| durable
+  rtFeedback -->|feedback生成時 publish| durable
+  mediaApi -->|mediaイベント publish| durable
+  sessionData -->|全体FB作成時| reportPack
+
+  subgraph legendFlow["Legend"]
+    direction TB
+    legendServer["Server / API"]
+    legendWorker["Worker / Job"]
+    legendManaged["Managed service"]
+  end
+
+  classDef server fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#111827
+  classDef worker fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#111827
+  classDef managed fill:#fee2e2,stroke:#ef4444,stroke-width:1.5px,color:#111827
+  class gatewayIn,trigger,rtPack,rtFeedback,mediaApi server
+  class imageWorker,writer,reportPack,pdf,mail worker
+  class stt,rtLlm,reportLlm managed
+  class legendServer server
+  class legendWorker worker
+  class legendManaged managed
+
+  style chromeFlow fill:#f8fafc,stroke:#64748b,stroke-width:2px,color:#111827
   style realtimeFlow fill:#eef6ff,stroke:#60a5fa,stroke-width:2px,color:#111827
-  style overallFlow fill:#f0fdf4,stroke:#22c55e,stroke-width:2px,color:#111827
+  style imageFlow fill:#fff7cc,stroke:#facc15,stroke-width:2px,color:#111827
+  style durableFlow fill:#f5f3ff,stroke:#8b5cf6,stroke-width:2px,color:#111827
+  style postFlow fill:#f0fdf4,stroke:#22c55e,stroke-width:2px,color:#111827
+  style legendFlow fill:#ffffff,stroke:#d1d5db,stroke-width:1px,color:#111827
 ```
 
 ## Chrome 拡張の責務
 
-Chrome 拡張はリアルタイム分析の一次処理を担当する。
+Chrome 拡張はリアルタイム分析の一次処理を担当する。サーバーに raw feature を垂れ流さず、ブラウザ内で `mood_wave_sample` に圧縮する。
 
 - Google Meet の画面/タブ/音声をユーザー同意のもと取得する
-- `video -> canvas -> detector -> tracker -> features` の流れで特徴量を抽出する
+- `video -> canvas -> detector -> tracker -> features` の流れで raw feature を抽出する
 - MediaPipe Face Detector / Face Landmarker で顔 bbox と顔ランドマークを取得する
-- motion score、簡易 head pose、簡易 gaze、簡易 attention score、nod gesture を生成する
-- self（マイク）/ other（タブ音声）それぞれの audio level、silence、speaking rate を VAD で算出する
-- self/other の音声を PCM チャンクとして `realtime_feature` と同じ WebSocket コネクションに送る（別コネクションは張らない）
-- `realtime_feature` を WebSocket で Cloud Run Gateway に送る
+- motion、head pose、gaze、eye/mouth openness、nod gesture、VAD を算出する
+- raw feature から `room_engagement` を作り、`mood_wave_sample` を生成する
+- sidebar には簡易 mood wave を描画する
+- WebSocket には基本的に `mood_wave_sample` と `audio_chunk` を送る
+- baseline frame はセッション開始時に5枚程度だけ upload する
+- evidence frame は常時 upload しない。短期リングバッファに保持し、Chrome 側 trigger 発火時だけ必要画像を upload する
 - Gateway からの `feedback_event` を sidebar に表示する
-- baseline 取得期間は、数秒おきに screenshot を WebP で生成する
-- baseline frame は WebSocket ではなく Media API の signed upload URL で Cloud Storage に直接 upload する
-- 画像取得時の compact `feature_snapshot` を Media API に送り、画像処理フロー内の `capture_snapshots` として保存する
-- 代表フレーム/短いクリップが必要な場合だけ upload 経路を使う
 
-現状は Meet DOM の参加者名・タイル ID との紐づけ、本格的な視線推定は未実装。音声は self/other の VAD（音量ベース）までは実装済みだが、PCM チャンクの WebSocket 送信・Speech-to-Text streaming 連携・Realtime LLM 呼び出しは未実装（設計段階）。
+現状実装では、Chrome 側に `moodHistory`、`moodTimeline`、`snapshotBuffer` があり、簡易 mood wave と moment snapshot はすでにブラウザ内で成立している。今後は WebSocket payload を `realtime_feature` 中心から `mood_wave_sample` 中心へ寄せる。
 
-## Media API / Baseline Frame Upload
+## Mood Wave
 
-baseline 用 screenshot は realtime WebSocket path に混ぜない。画像本体は重いため、Cloud Run Media API が signed upload URL と `media_ref` を発行し、Chrome 拡張が Cloud Storage に直接 upload する。
+`mood_wave_sample` は、LLM へ直接渡す raw feature ではなく、サーバーで window 化・要約されるための軽量な時系列点である。
 
-Gateway に画像本体や `media_ref` は送らない。画像処理フローでは、Media API が `media_ref`、`t_ms`、`audience_id`、`tile_id`、`feature_snapshot` を `capture_snapshots` として保存する。これにより、画像解析 worker はリアルタイムフローの Redis window を見に行かず、画像処理フロー内の snapshot だけで baseline / visual summary を作れる。
+Chrome 側の算出は次の考え方にする。
 
-推奨 baseline capture:
+```text
+raw video/audio
+  -> face / motion / gaze / nod / VAD
+  -> room_engagement
+  -> raw mood score
+  -> short EMA
+  -> long EMA baseline
+  -> y = mood_ema - mood_baseline
+```
+
+現状の mood 合成式:
+
+```text
+valence = clamp((valence_mean + 1) / 2, 0, 1)
+attention = clamp(0.5 + 2.5 * attention_mean, 0, 1)
+nod = nod_ratio
+speech_ratio = max(self.speech_ratio, other.speech_ratio)
+
+mood = 0.40 * valence
+     + 0.25 * attention
+     + 0.20 * nod
+     + 0.15 * speech_ratio
+
+y = mood_ema - mood_baseline
+attention_y = attention_ema - attention_baseline
+```
+
+サーバーへ送る最小 payload:
+
+```json
+{
+  "type": "mood_wave_sample",
+  "schema_version": 1,
+  "session_id": "sess_123",
+  "t_ms": 1783067121751,
+  "meeting_provider": "google_meet",
+  "source": "chrome_side_panel",
+  "mood": {
+    "value": 0.58,
+    "baseline": 0.52,
+    "y": 0.06
+  },
+  "attention_y": -0.02,
+  "signals": {
+    "visible_faces": 5,
+    "nod_ratio": 0.2,
+    "speech_ratio": 0.7,
+    "brow_flag": false
+  },
+  "quality": {
+    "calibrating": false,
+    "confidence": 0.82
+  },
+  "client_model_version": {
+    "mood_wave": "chrome-mood-wave-v1"
+  }
+}
+```
+
+`y` が波形の y 軸、`t_ms` が x 軸である。Chrome は window を送らない。サーバー側が `mood_wave_sample` を recent buffer に蓄積し、LLM 呼び出し時に任意の window を切り出す。
+
+サーバー側で行う演算は、raw feature 解析ではない。顔検出、視線推定、頷き検出、表情特徴、VAD、mood 合成、Chrome 側 trigger 判定は Chrome 側で完了させる。サーバー側は `mood_wave_sample` の時系列に対して、window 化、統計要約、cooldown、transcript alignment、LLM evidence pack 作成だけを行う。
+
+## リアルタイムFBフロー
+
+リアルタイムFBフローは、直近30秒の mood wave、同じ時間帯の transcript、baseline frame、trigger 時 evidence frame を LLM に渡して feedback を作る。
+
+処理:
+
+1. Chrome が `mood_wave_sample` を 1Hz 程度で Gateway に送る
+2. Chrome が self/other の `audio_chunk` を同じ WebSocket に多重化して送る
+3. Gateway は audio を Speech-to-Text streaming へ中継し、final のみ `transcript_chunk` にする
+4. Gateway / Realtime Worker は Redis に mood sample と transcript を蓄積する
+5. Chrome がローカル trigger を検出したら、ring buffer から該当時刻付近の evidence frame を選ぶ
+6. Chrome が Media API に upload-url を要求し、`upload_url` と予約済み `media_ref` を取得する
+7. Chrome が `trigger_id` と `evidence_frame.media_ref`（`upload_status: uploading`）を付けた `mood_wave_sample` を Gateway に送る
+8. Chrome は並行して signed upload URL へ evidence frame を PUT し、完了後に Media API へ complete 通知する
+9. Realtime Worker は trigger 付き sample を受理し、cooldown / LLM budget を確認する
+10. Realtime Worker は直近30秒の `mood_wave_window`、`transcript_window`、baseline/evidence frame refs を組み立てる
+11. LLM context 作成時に evidence frame が `uploaded` なら画像を使い、未完了なら短い待機後に画像なしで進む
+12. Gemini Flash に realtime evidence pack を渡す
+13. LLM が間に合わない場合は rule fallback で feedback を作る
+14. cooldown / wording policy を通して `feedback_event` を返す
+
+Realtime LLM 入力:
+
+```json
+{
+  "purpose": "realtime_feedback",
+  "session_id": "sess_123",
+  "window": {
+    "start_t_ms": 1783067091751,
+    "end_t_ms": 1783067121751,
+    "duration_sec": 30,
+    "trigger_t_ms": 1783067120000,
+    "trigger_type": "wave_drop"
+  },
+  "mood_wave": {
+    "points": [
+      { "t_ms": 1783067092000, "y": 0.03, "attention_y": 0.01 },
+      { "t_ms": 1783067093000, "y": 0.02, "attention_y": 0.00 },
+      { "t_ms": 1783067094000, "y": -0.01, "attention_y": -0.03 }
+    ],
+    "summary": {
+      "overall": "declined",
+      "start_y": 0.03,
+      "end_y": -0.12,
+      "min_y": -0.14,
+      "max_y": 0.04,
+      "slope_per_sec": -0.006,
+      "volatility": 0.04
+    },
+    "quality": {
+      "visible_faces_avg": 5.2,
+      "confidence_avg": 0.82
+    }
+  },
+  "transcript_window": [
+    {
+      "speaker": "self",
+      "t_start_ms": 1783067101000,
+      "t_end_ms": 1783067108000,
+      "text": "ここから価格戦略について説明します"
+    }
+  ],
+  "baseline_frames": [
+    {
+      "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/baseline/frame_001.webp"
+    }
+  ],
+  "evidence_frames": [
+    {
+      "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/evidence/frame_1783067120000.webp",
+      "t_ms": 1783067120000
+    }
+  ]
+}
+```
+
+`mood_wave.points` はサーバー側で構築する。Chrome が `mood_wave_window` を送る必要はない。
+
+## 画像フロー
+
+### Baseline Frame
+
+baseline frame は参加者ごとの基準作成と LLM の比較材料に使う。セッション開始直後に5枚程度だけ取得する。
+
+推奨:
 
 - duration: session 開始後 30秒程度
-- interval: 3〜5秒
-- frame count: 6〜10枚
+- frame count: 5枚
 - format: `image/webp`
 - quality: 0.6〜0.8
+- upload: Media API の signed upload URL 経由
+
+baseline frame は WebSocket には流さない。Media API が `media_ref` を発行し、Chrome が Cloud Storage に直接 PUT する。
+
+### Evidence Frame
+
+evidence frame は常時 upload しない。Chrome の side panel document 上の短期リングバッファに保持し、trigger 発火時だけ必要な画像を upload する。
+
+推奨:
+
+- buffer window: 15〜30秒
+- capture interval: 250〜1000ms
+- format: `image/jpeg` or `image/webp`
+- upload trigger: Chrome 側のローカル moment trigger
+- selection: trigger_t_ms に最も近い1〜数枚
+
+### Media API
 
 API:
 
 ```text
 POST /sessions/{session_id}/media/upload-url
-POST /sessions/{session_id}/media
 POST /sessions/{session_id}/media/{capture_id}/complete
 ```
 
@@ -259,622 +480,369 @@ Upload URL request:
   "purpose": "baseline_frame",
   "content_type": "image/webp",
   "capture_id": "cap_123",
-  "t_ms": 12345,
+  "t_ms": 1783067000000,
   "audience_id": "aud_1",
   "tile_id": "tile_1",
-  "feature_snapshot": {
-    "attention_score": 0.55,
-    "motion_score": 0.02,
-    "gaze_estimate": "screen",
-    "head_pose_estimate": { "yaw": 0.01, "pitch": -0.1, "roll": -0.2 },
-    "mouth_openness": 0.01,
-    "eye_openness": { "left": 0.4, "right": 0.5 },
-    "face_bbox": { "x": 0.28, "y": 0.45, "w": 0.138, "h": 0.244 }
+  "mood_wave_sample_ref": {
+    "t_ms": 1783067000000,
+    "nearest_sample_lag_ms": 120
   }
 }
 ```
+
+Evidence frame の場合:
+
+```json
+{
+  "purpose": "evidence_frame",
+  "content_type": "image/jpeg",
+  "capture_id": "cap_ev_123",
+  "t_ms": 1783067120000,
+  "trigger_id": "trig_123",
+  "mood_wave_sample_ref": {
+    "t_ms": 1783067120000,
+    "nearest_sample_lag_ms": -80
+  }
+}
+```
+
+Media API は upload URL request の時点で `upload_url` と `media_ref` を返し、`media_refs.upload_status = pending` として予約する。Chrome はこの `media_ref` を trigger 付き `mood_wave_sample` に載せて Gateway へ送る。画像本体の PUT 完了は待たない。
 
 Upload URL response:
 
 ```json
 {
   "upload_url": "https://storage.googleapis.com/...",
-  "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/baseline/frames/12345-aud_1.webp",
+  "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/evidence/cap_ev_123.jpg",
   "expires_at": "2026-07-03T12:00:00Z"
 }
 ```
 
-media_ref registration:
+Chrome はその後、signed upload URL へ画像本体を PUT し、Media API に complete 通知を送る。Media API は complete 後に `media_refs.upload_status = uploaded` へ更新し、`media_uploaded` event を publish する。
 
-```json
-{
-  "type": "media_ref",
-  "purpose": "baseline_frame",
-  "capture_id": "cap_123",
-  "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/baseline/frames/12345-aud_1.webp",
-  "upload_status": "uploaded",
-  "t_ms": 12345,
-  "audience_id": "aud_1",
-  "tile_id": "tile_1",
-  "content_type": "image/webp",
-  "nearest_feature_event_id": "evt_123",
-  "feature_snapshot_ref": "capture_snapshots.cap_123"
-}
-```
+Realtime Worker は evidence frame を画像解析 worker に通さない。LLM context 作成時に `media_ref` の upload が完了していれば、その画像参照を Gemini Flash に直接渡す。未完了なら短い待機後に画像なしで進む。Image Analysis Worker は baseline frame から `baseline_visual_profile` を作るのが主責務で、evidence frame の非同期解析は全体FBや監査で必要になった場合だけ行う。
 
-Media API は upload URL 発行時に、`capture_id`、`media_ref`、`t_ms`、`audience_id`、`tile_id`、`feature_snapshot` を Cloud SQL の `capture_snapshots` に保存する。`feature_snapshot` は画像解析 worker の入力用 snapshot であり、通常の realtime feature event の source of truth ではない。
+## WebSocket Gateway / Realtime Worker
 
-Chrome 拡張は upload 完了後、Media API に complete 通知を送る。`media_ref` は画像処理フロー内の metadata として扱い、`realtime_feature` には同梱しない。特徴量送信は画像 upload の完了を待たない。
+Gateway は WebSocket の入口であり、Realtime Worker は trigger 付き mood sample と transcript から LLM 入力を作る。MVP では同じ Cloud Run service 内に置いてよいが、責務は分ける。
 
-`media/{capture_id}/complete` を受けた Media API は Cloud Storage object の存在を確認し、`capture_snapshots.upload_status = uploaded` と `media_refs.upload_status = uploaded` に更新してから Pub/Sub topic `media-analysis-events` に `media_uploaded` event を publish する。
+Realtime Worker の演算範囲は軽量な mood wave 時系列処理に限定する。サーバー側で raw feature から `mood_wave_sample` を再計算しない。
 
-Image Analysis Worker はこの event を起点に、`capture_snapshots` から `feature_snapshot` を読み、`media_ref` が指す画像と合わせて `participant_baselines` と `visual_summaries` を作る。画像処理フローの主目的は「画像だけの独立解析」ではなく、「画像 + 画像取得時の特徴量 snapshot」から人ごとの基準値をリアルタイム利用できる形に変換すること。
+Gateway:
 
-## Cloud Run WebSocket Gateway
+- `mood_wave_sample` を validate し、`event_id` / `server_received_at_ms` を付与する
+- Redis recent buffer に `mood_wave_sample` を保存する
+- Pub/Sub `analysis-events` に durable event として publish する
+- `audio_chunk` を Speech-to-Text streaming に中継する
+- Realtime Worker からの `feedback_event` を Chrome に返す
 
-Cloud Run Gateway は Chrome 拡張から WebSocket で `realtime_feature` と `audio_chunk` を受け取り、Gateway 内の **システム演算層** でリアルタイムの演算処理まで担当する。
+Realtime Worker:
 
-システム演算層は、feature event ごとの軽量な rule 計算（低遅延）と、~10秒間隔の LLM 呼び出し（意味判断）の2段構えで動く。結果は2方向に分岐する。
+- Redis から直近30秒の mood sample と transcript を読む
+- mood sample の点列から start / end / min / max / mean / slope / volatility / threshold duration を計算する
+- Chrome から届いた trigger 付き sample を受理し、cooldown / LLM budget を判定する
+- LLM 用に `mood_wave_window` と summary を構築する
+- baseline/evidence frame refs を evidence pack に入れる
+- LLM feedback または rule fallback を作る
+- cooldown を適用する
+- 顔検出、ランドマーク処理、視線推定、頷き検出、VAD、mood 合成は行わない
 
-- **リアルタイム feedback path**: LLM 出力（予算内に応答があれば）または rule の signal summary / decision log から `feedback_event` を返す。
-- **永続化 path**: compact raw feature、signal summary、transcript_chunk、decision log を Pub/Sub に publish する。
-
-1. **Memorystore for Redis**
-   - compact raw feature、transcript_chunk（final）を保存する
-   - 直近 window / transcript window / latest state / computed state / cooldown に使う
-   - リアルタイム feedback の判定で読む
-   - 物理的に別の短期 state store を増やすのではなく、同じ Redis 内で key を分ける
-
-2. **Speech-to-Text streaming**
-   - session_id ごとに self/other 各1本の streaming セッションを維持する
-   - Gateway は audio_chunk をそのまま streaming セッションへ転送する
-   - 確定（final）結果のみ `transcript_chunk` として組み立てる
-
-3. **Pub/Sub**
-   - compact raw feature、signal summary、transcript_chunk、decision log を publish する
-   - Durable Writer / 後分析 pipeline へ渡す
-   - Gateway は Cloud Storage や Cloud SQL へ同期保存しない
+Redis key:
 
 ```text
-on realtime_feature:
+mood_wave:recent:{session_id}
+transcript:recent:{session_id}:{speaker}
+trigger:recent:{session_id}
+feedback:cooldown:{session_id}
+session:state:{session_id}
+```
+
+擬似処理:
+
+```text
+on mood_wave_sample:
   validate payload
   assign event_id
-  set server_received_at_ms
-
-  Redis pipeline:
-    for each audience feature:
-      ZADD features:recent:{session_id}:{audience_id} t_ms compact_payload
-      ZREMRANGEBYSCORE features:recent:{session_id}:{audience_id} -inf now-60000
-    HSET session:state:{session_id} latest_feature compact_payload latest_t_ms t_ms
-    EXPIRE features:recent:{session_id}:{audience_id} 3600
-    EXPIRE session:state:{session_id} 3600
+  ZADD mood_wave:recent:{session_id} t_ms sample
+  ZREMRANGEBYSCORE mood_wave:recent:{session_id} -inf now-10min
+  HSET session:state:{session_id} latest_mood_sample sample
+  publish analysis-events mood_wave_sample
 
 on audio_chunk:
-  forward pcm to Speech-to-Text streaming session (speaker=self|other)
-  on STT final result:
-    assign event_id
+  forward pcm to Speech-to-Text streaming
+  on STT final:
     ZADD transcript:recent:{session_id}:{speaker} t_start_ms transcript_chunk
-    EXPIRE transcript:recent:{session_id}:{speaker} 3600
+    publish analysis-events transcript_chunk
 
-every ~10s (per session):
-  read 5s / 10s / 30s recent feature windows per audience + transcript window
-  read baseline / cooldown / latest computed state
-  calculate signal_summary
-  call Gemini Flash(signal_summary, transcript_window) with timeout budget
-  if response within budget:
-    use LLM feedback candidate + evidence quote
-  else:
-    fall back to rule + template decision
-  evaluate feedback decision with cooldown
-  create decision_log
-  HSET session:computed:{session_id}:{audience_id} latest_signal_summary latest_decision_log
-  HSET feedback:cooldown:{session_id}:{audience_id} feedback_type last_emitted_at_ms
+every 1s or on sample:
+  read recent 30s mood_wave + transcript
+  calculate wave summary (min/max/mean/slope/volatility/duration)
+  if sample has trigger:
+    validate trigger_id / evidence_frame media_ref
+    apply cooldown and LLM budget
 
-  Pub/Sub:
-    publish topic feature-events with compact_raw_feature + signal_summary + transcript_chunk + decision_log
+on accepted trigger:
+  build mood_wave_window from Redis samples
+  build transcript_window
+  attach baseline/evidence media_refs
+  call Gemini Flash with timeout
+  if timeout/error:
+    use rule fallback
+  emit feedback_event
+  publish trigger_event + feedback_event
 ```
 
-Cloud Run の WebSocket は long-running request なので、request timeout と reconnect を前提にする。接続先 Cloud Run instance が変わっても問題ないよう、session state は instance memory ではなく Memorystore / Pub/Sub 側に置く。
+## Pub/Sub / Durable Writer
 
-### Cloud Run のスケール単位
-
-1つの Google Meet session に対して、発表者の Chrome 拡張から Gateway へ張る WebSocket は基本的に1本にする。その1本の WebSocket 内に、参加者ごとの `audience_id` を含む feature event をまとめて流す。
-
-```text
-WebSocket connection
-  session_id: sess_123
-  feature events:
-    audience_id: aud_1
-    audience_id: aud_2
-    audience_id: aud_3
-```
-
-Cloud Run が直接 `audience_id` の数を見て scale out するわけではない。Cloud Run の水平スケールは、主に同時リクエスト数、WebSocket 接続数、CPU 使用率、メモリ使用量によって決まる。WebSocket は接続中の long-running HTTP request として扱われるため、1つの接続は基本的に同じ Cloud Run instance に張り付く。
-
-```text
-Meet session A -> WebSocket 1本 -> Cloud Run Gateway instance 1
-Meet session B -> WebSocket 1本 -> Cloud Run Gateway instance 1
-Meet session C -> WebSocket 1本 -> Cloud Run Gateway instance 2
-```
-
-そのため、1つの大きな Meet session 内の参加者20人分の処理が、自動的に複数の Gateway instance に分散されるわけではない。参加者数が増えると、1本の WebSocket 内の payload 量、Redis 書き込み回数、window 集計量、Pub/Sub publish 量、CPU 使用率が増える。その結果として Cloud Run 全体の負荷が上がり、別 session や別接続の処理は追加 instance に分散される。
-
-設計上の分離単位は、Cloud Run instance ではなく `session_id + audience_id` にする。
-
-```text
-features:recent:{session_id}:{audience_id}
-session:computed:{session_id}:{audience_id}
-session:baseline:{session_id}:{audience_id}
-feedback:cooldown:{session_id}:{audience_id}
-```
-
-音声の transcript は session 全体と speaker 単位で扱う。
-
-```text
-transcript:recent:{session_id}:{speaker}
-```
-
-Gateway は、1接続内で複数参加者分の feature event を受け取り、`session_id + audience_id` ごとに Redis window と computed state を更新する。重い画像解析は Gateway では実行せず、Chrome 拡張側または画像処理フローの worker に分離する。
-
-## システム演算層
-
-システム演算層は Cloud Run WebSocket Gateway 内に置く。目的は、raw な瞬間値をそのまま feedback や LLM に渡さず、低コストで安定した signal に変換すること。
-
-入力:
-
-- Chrome 拡張から届いた latest `realtime_feature`
-- Memorystore for Redis の recent window（特徴量 + transcript）
-- Speech-to-Text streaming が確定した `transcript_chunk`
-- session baseline
-- feedback cooldown state
-
-出力:
-
-- `compact_raw_feature`
-- `signal_summary`
-- `transcript_chunk`
-- `decision_log`（LLM出力 or rule fallback の判断根拠を含む）
-- optional `feedback_event`
-
-この層で計算した `signal_summary` と `decision_log` を、リアルタイム feedback と後続の保存/分析の両方で使う。つまり、同じ演算を Durable Writer や後分析 worker で繰り返さない。Realtime LLM 呼び出し（~10秒間隔）はこの層から行い、timeout / quota超過時は rule + template によるフォールバックに切り替える。
-
-## Memorystore for Redis
-
-Memorystore for Redis はリアルタイム判定用の短期 state として使う。
-
-主な key:
-
-```text
-features:recent:{session_id}:{audience_id}
-transcript:recent:{session_id}:{speaker}
-session:state:{session_id}
-session:computed:{session_id}:{audience_id}
-session:baseline:{session_id}:{audience_id}
-session:visual_summary:{session_id}:{audience_id}
-session:baseline_status:{session_id}:{audience_id}
-feedback:cooldown:{session_id}:{audience_id}
-```
-
-用途:
-
-- 参加者ごとの直近 10秒/30秒の feature window
-- speaker ごとの直近~10秒の transcript_chunk（final）window
-- latest feature state
-- latest signal summary / latest decision log
-- 画像解析 worker が作った participant baseline / visual summary
-- baseline_status（warming_up / ready / failed）
-- reconnect 時の session state
-- feedback cooldown
-- baseline / smoothing 用の一時状態
-
-`features:recent:*` / `transcript:recent:*` は演算前の直近 window、`session:computed:*` は演算後のリアルタイム参照 state、`session:baseline:*` / `session:visual_summary:*` は画像処理フローで作った参加者ごとの基準値 cache、`session:baseline_status:*` は Gateway が補正を使えるか判断する state、`feedback:cooldown:*` は同じ feedback を出しすぎないための抑制 state。どれも同じ Memorystore for Redis の key であり、別の短期状態ストアを追加するわけではない。
-
-TTL で消える前提。セッション後分析の source of truth にはしない。
-
-## Pub/Sub
-
-Pub/Sub は durable event pipeline として使う。Redis Stream の代わりに、Google Cloud managed service としての Pub/Sub を採用する。
+Pub/Sub は durable event pipeline として使う。Redis は短期 state であり、セッション後分析の source of truth にはしない。
 
 Topic:
 
 ```text
-feature-events
+analysis-events
+media-analysis-events
 ```
 
-Subscription:
-
-```text
-feature-events-durable-writer
-```
-
-Pub/Sub message:
+`analysis-events` message examples:
 
 ```json
 {
   "event_id": "evt_123",
-  "type": "realtime_analysis_event",
+  "type": "mood_wave_sample",
   "schema_version": 1,
   "session_id": "sess_123",
   "t_ms": 1783067121751,
   "server_received_at_ms": 1783067121800,
+  "payload": {}
+}
+```
+
+```json
+{
+  "event_id": "evt_fb_123",
+  "type": "feedback_event",
+  "schema_version": 1,
+  "session_id": "sess_123",
+  "t_ms": 1783067123000,
   "payload": {
-    "compact_raw_feature": {},
-    "signal_summary": {},
-    "transcript_chunk": {},
-    "decision_log": {}
+    "feedback_type": "reaction_down_candidate",
+    "source": "llm",
+    "trigger_id": "trig_123"
   }
 }
 ```
 
-`transcript_chunk` は Speech-to-Text streaming が確定（final）した区間がある場合のみ含む。無い場合は省略する。
-
-Pub/Sub は最終保存先ではない。Cloud Run Durable Writer が subscribe し、保存成功後に ack する。失敗時は retry / dead-letter topic を使う。
-
-画像解析 worker 用には別 topic を使う。
-
-Topic:
-
-```text
-media-analysis-events
-```
-
-Message:
-
-```json
-{
-  "event_id": "evt_media_123",
-  "type": "media_uploaded",
-  "schema_version": 1,
-  "session_id": "sess_123",
-  "capture_id": "cap_123",
-  "audience_id": "aud_1",
-  "tile_id": "tile_1",
-  "t_ms": 12345,
-  "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/baseline/frames/12345-aud_1.webp",
-  "purpose": "baseline_frame"
-}
-```
-
-## Durable Writer
-
-Durable Writer は Cloud Run service または Cloud Run worker として動かす。Pub/Sub subscription から realtime analysis event を受け取り、後分析用データとして保存する。
-
-処理:
+Durable Writer:
 
 1. Pub/Sub から message を受け取る
 2. `event_id` で冪等性を確保する
-3. session_id ごとに batch / buffer する
-4. compact raw feature、transcript_chunk、signal summary / decision log を JSONL として Cloud Storage に保存する
-5. signal summary、transcript、decision log、feedback history を Cloud SQL に upsert する
-6. 保存成功後に Pub/Sub message を ack する
-7. 保存失敗時は nack / retry、繰り返し失敗は dead-letter topic に送る
+3. session_id ごとに batch / chunk 化する
+4. Cloud Storage に JSONL を保存する
+5. Cloud SQL に検索・一覧・レポート参照用 metadata を upsert する
+6. 保存成功後に ack する
 
 主な保存先:
 
 ```text
 Cloud Storage:
-  gs://reaction-engine-sessions/sessions/{session_id}/features/compact-raw/part-0001.jsonl
-  gs://reaction-engine-sessions/sessions/{session_id}/features/signal-summary/part-0001.jsonl
-  gs://reaction-engine-sessions/sessions/{session_id}/features/decision-log/part-0001.jsonl
-  gs://reaction-engine-sessions/sessions/{session_id}/capture-snapshots/part-0001.jsonl
-  gs://reaction-engine-sessions/sessions/{session_id}/media-refs/part-0001.jsonl
+  gs://reaction-engine-sessions/sessions/{session_id}/mood-wave/part-0001.jsonl
   gs://reaction-engine-sessions/sessions/{session_id}/transcript/part-0001.jsonl
-  gs://reaction-engine-sessions/sessions/{session_id}/frames/...
-  gs://reaction-engine-sessions/sessions/{session_id}/clips/...
+  gs://reaction-engine-sessions/sessions/{session_id}/triggers/part-0001.jsonl
+  gs://reaction-engine-sessions/sessions/{session_id}/feedback/part-0001.jsonl
+  gs://reaction-engine-sessions/sessions/{session_id}/reports/report.pdf
 
-Cloud SQL for PostgreSQL:
+Cloud SQL:
   sessions
-  participants
-  capture_snapshots
-  participant_baselines
-  visual_summaries
-  signal_summaries
-  transcripts
   media_refs
-  decision_logs
-  session_summaries
+  baseline_visual_profiles
+  evidence_frame_analyses
+  transcripts
+  trigger_events
   feedback_events
   reports
+  report_deliveries
 ```
 
-Cloud Storage の JSONL は append ではなく、一定件数/一定時間ごとの chunk file として作る。重複は `event_id` で後分析時に dedupe できるようにする。
+Cloud SQL に `mood_wave_sample` 全件を insert しない。高頻度時系列は Cloud Storage JSONL を primary archive にし、Cloud SQL は session metadata、イベント索引、レポート参照を持つ。
 
-`capture_snapshots` と `media_refs` は Durable Writer ではなく Media API が作成・更新する。Realtime feature の保存経路とは分ける。
+## 全体FBレポートフロー
 
-`capture_snapshots` は Image Analysis Worker の primary lookup 用なので Cloud SQL を主保存先にする。Cloud Storage の `capture-snapshots/*.jsonl` は archive / reprocess 用であり、worker の通常経路では Cloud SQL を `capture_id` で読む。
-
-## Image Analysis Worker
-
-Image Analysis Worker は Cloud Run service または Cloud Run Jobs として動かす。画像 upload 完了後の `media_uploaded` event を受け取り、Cloud SQL の `capture_snapshots.feature_snapshot` と画像を入力にして、参加者ごとの `participant_baselines` と `visual_summaries` を作る。
-
-Realtime LLM とは別の worker にする。Realtime LLM は発表中の feedback 候補を作る処理で、Image Analysis Worker は参加者ごとの基準値・画像由来の補正データを作る処理。Gateway は画像解析 worker の完了を同期的には待たず、Redis に入った結果だけを次回以降の feedback に使う。
+全体フィードバックフローは、セッション終了後に起動する。リアルタイムで使った材料を再利用し、より長い文脈で LLM がレポートを作る。
 
 入力:
 
-- Pub/Sub topic `media-analysis-events`
-- Cloud Storage の baseline frames
-- Cloud SQL の `capture_snapshots`
-- `capture_snapshots.feature_snapshot`
-- Cloud SQL / Cloud Storage manifest の `media_ref`
-
-join key:
-
-```text
-primary: capture_id
-```
+- Cloud Storage の `mood_wave_sample` JSONL
+- Cloud Storage / Cloud SQL の transcript
+- trigger_events
+- realtime feedback history
+- baseline frames / baseline visual profile
+- evidence frame refs / 必要時の事後画像解析結果
+- session metadata
 
 処理:
 
-1. `media_uploaded` event から `capture_id` / `session_id` / `audience_id` / `t_ms` / `media_ref` を受け取る。
-2. `capture_id` で `capture_snapshots` を Cloud SQL から読む。
-3. `media_ref` が指す画像を Cloud Storage から読む。
-4. `feature_snapshot` が無い場合は画像解析を実行せず、`baseline_status = failed` または `insufficient_snapshot` として扱う。
-5. 画像 + `feature_snapshot` を Vision model / Gemini Vision に渡し、visual summary を作る。
-6. 複数 sample から `participant_baselines` を更新する。
-7. Redis に `session:baseline:*` / `session:visual_summary:*` / `session:baseline_status:*` を保存する。
-8. Cloud SQL に `participant_baselines` / `visual_summaries` / `media_refs` を保存する。
+1. session end で Post-session Job を起動する
+2. mood wave samples から全体波形を再構築する
+3. 1分単位、5分単位、trigger 前後などに window summary を作る
+4. transcript を timestamp で mood wave と align する
+5. realtime feedback と trigger を参照し、重要区間を抽出する
+6. baseline visual profile と evidence frame refs を evidence として加える。必要なら事後画像解析結果も加える
+7. Gemini で全体 feedback report を生成する
+8. report JSON を Cloud SQL / Cloud Storage に保存する
+9. PDF renderer が PDF を生成し Cloud Storage に保存する
+10. Gmail sender が PDF を添付して送信する
+11. delivery status を Cloud SQL に保存する
 
-保存する baseline / visual summary 例:
+LLM 入力は全点列をそのまま渡さず、全体波形の summary と重要区間の点列を組み合わせる。
 
 ```json
 {
-  "session_id": "sess_123",
-  "audience_id": "aud_1",
-  "baseline": {
-    "attention_score_avg": 0.61,
-    "motion_score_avg": 0.05,
-    "gaze_screen_ratio": 0.72,
-    "head_pose_center": { "yaw": 0.03, "pitch": -0.08, "roll": 0.01 },
-    "eye_openness_avg": { "left": 0.42, "right": 0.44 }
+  "purpose": "post_session_report",
+  "session": {
+    "session_id": "sess_123",
+    "duration_min": 42
   },
-  "visual_summary": {
-    "face_quality": "usable",
-    "lighting": "normal",
-    "camera_angle": "front",
-    "baseline_expression": "neutral"
+  "wave_overview": {
+    "overall": "mostly_stable_with_two_drops",
+    "peak_positive_sections": ["00:08:10-00:10:30"],
+    "drop_sections": ["00:18:20-00:21:00", "00:33:10-00:35:00"]
   },
-  "sample_count": 8,
-  "source_media_refs": ["gs://reaction-engine-sessions/sessions/sess_123/baseline/frames/12345-aud_1.webp"],
-  "confidence": 0.74
+  "important_windows": [
+    {
+      "start": "00:18:20",
+      "end": "00:21:00",
+      "mood_wave_summary": {
+        "overall": "declined",
+        "min_y": -0.14,
+        "slope_per_sec": -0.006
+      },
+      "transcript_summary": "価格説明に入った区間",
+      "evidence_refs": ["gs://.../evidence/frame_001.jpg"]
+    }
+  ],
+  "realtime_feedback_history": [],
+  "baseline_context": {}
 }
 ```
 
-baseline ができるまでの最初の 30〜60秒は `baseline_status = warming_up` として扱う。Gateway のシステム演算層は、baseline が未準備なら session default threshold で控えめに feedback を出し、`baseline_status = ready` になった参加者から個人差補正と visual summary を使う。
-
-## リアルタイム分析
-
-リアルタイム判定は Cloud Run Gateway 内のシステム演算層で行う。Gateway は Memorystore for Redis の直近 window だけを見る。Cloud SQL や Cloud Storage を判定のたびに読まない。
-
-入力:
-
-- `face_count`
-- `face_visible`
-- `attention_score`
-- `motion_score`
-- `gaze_estimate`
-- `head_pose_estimate`
-- `gestures`
-- `audio_level`, `silence_ms`, `speaking_rate`（self/other 別）
-- 直近~10秒の `transcript_chunk`（self/other 別）
-- `participant_baseline`（Image Analysis Worker が作成）
-- `visual_summary`（Image Analysis Worker が作成）
-- `baseline_status`（warming_up / ready / failed）
-
-システム演算層で計算する signal summary:
-
-- latest
-- 5秒平均
-- 10秒平均
-- 直前 window との差分
-- session baseline との差分
-- visual summary による補正
-- slope
-- low / high state の継続時間
-- confidence
-- cooldown state
-
-signal summary と transcript window は、~10秒間隔で Gemini Flash に渡す。LLM には「この時間窓でどんな発言をしていて、反応がどう変化したか」を timeout 付きで判断させ、応答が予算内に得られた場合はその feedback 候補（reason + 発言の抜粋）を使う。timeout・エラー・quota超過の場合は、rule + template + cooldown による従来のフォールバック判断を使う。どちらの経路でも同じ cooldown / wording policy を通してから `feedback_event` を返す。
-
-出力（LLMが応答した場合）:
-
-```json
-{
-  "type": "feedback_event",
-  "session_id": "sess_123",
-  "t_ms": 65000,
-  "feedback_type": "reaction_down_candidate",
-  "severity": "low",
-  "message": "価格の話をしている間、視線が画面から逸れる参加者が増えている可能性があります。説明を区切って質問を挟むとよさそうです。",
-  "reason_codes": ["attention_score_drop", "motion_drop"],
-  "evidence_quote": "ここから価格戦略について説明します",
-  "source": "llm",
-  "model_version": "gemini-flash-realtime",
-  "confidence": 0.64,
-  "cooldown_ms": 30000
-}
-```
-
-出力（フォールバック時、`source: "rule"` で `evidence_quote` は null）:
-
-```json
-{
-  "type": "feedback_event",
-  "session_id": "sess_123",
-  "t_ms": 65000,
-  "feedback_type": "reaction_down_candidate",
-  "severity": "low",
-  "message": "一部の反応が薄くなっている可能性があります。ここで一度確認を挟むとよさそうです。",
-  "reason_codes": ["attention_score_drop", "motion_drop"],
-  "evidence_quote": null,
-  "source": "rule",
-  "confidence": 0.5,
-  "cooldown_ms": 30000
-}
-```
-
-フィードバックは断定的な感情推定にしない。同じ時間窓に発言と反応変化が同時に見えても、それは相関であって因果の証明ではないため、言い切らない表現にする。発表者がすぐ取れる小さい行動に落とす。
-
-LLM呼び出しの頻度・レイテンシ・コスト・失敗率は Cloud Monitoring / Cost Dashboard で継続的に監視する。
-
-## セッション後分析
-
-セッション後分析は、Memorystore state ではなく Durable Writer が保存した Cloud Storage の compact raw feature JSONL と signal summary / decision log を基本入力にする。
-
-入力:
-
-- Cloud Storage の compact raw feature JSONL
-- Cloud Storage / Cloud SQL の signal summary
-- Cloud Storage / Cloud SQL の decision log（リアルタイムLLMの判断結果を含む）
-- Cloud Storage / Cloud SQL の transcript chunk（会議中の streaming STT で確定済み）
-- Cloud SQL の `visual_summaries`
-- Cloud SQL の `capture_snapshots`
-- feedback history
-- session summary
-- 代表フレーム/短いクリップ
-
-処理:
-
-1. Cloud Run Job を session end で起動する
-2. feature timeline と transcript を timestamp で align する（transcript は既に session と同じ時計で記録済みなので、事後ASRのようなずれ補正は不要）
-3. Cloud SQL の `visual_summaries` / `participant_baselines` を参加者ごとの補正情報として読む
-4. attention / motion / gaze / audio の変化点を検出する
-5. 変化点前後の発話内容、画像解析 worker が作った visual summary、リアルタイムLLMが既に出した decision log を evidence としてまとめる
-6. Vertex AI / Gemini で report / coaching suggestion を生成する
-7. report を Cloud SQL に保存する
-8. 必要に応じて BigQuery に評価・分析用データを export する
-
-## 録画アップロード分析（オプション）
-
-リアルタイム経路（realtime feature + streaming STT）は単体で完結する。録画アップロード分析は、その精度を上げるための **任意（オプション）機能** であり必須ではない。
-
-前提となる動線:
-
-- 録画は Google Workspace 有料プランの Google Meet 録画機能で取得する（主催者の Google Drive の Meet Recordings に保存される）。拡張側では録画しない。
-- ユーザーが会議後に、その録画ファイルを任意でアップロードする（アップロードは明示的なユーザー操作）。
-
-分析ロジックは現行と同じ:
-
-- フィードバック生成ロジックは、リアルタイム／セッション後分析と同一。すなわち **特徴量の変化量**（attention / gaze / motion / audio などの変化点）と、**文字起こしによる発話内容** を突き合わせて evidence を作り、Vertex AI / Gemini で report / coaching suggestion を生成する。
-- 録画は「新しい分析ロジック」を持ち込むのではなく、**同じ分析に、より高品質な入力を与える**だけである。
-
-録画で精度が上がる理由:
-
-- リアルタイムは edge 処理のためフレーム間引き・取りこぼし・低解像度がある。録画は **全フレーム・フル解像度で vision（MediaPipe）を再解析** でき、feature timeline が密で正確になる。
-- リアルタイムの streaming STT に対し、録画は **フル音声を asynchronous Speech-to-Text でバッチ認識** できるため、transcript の欠落・誤りが減る。
-- → ユーザーには「録画をアップロードすると分析精度が上がる」という位置づけで提示する。
-
-GCP 上の処理（既存のセッション後分析を再利用）:
-
-1. Media API で録画ファイルの signed upload URL を発行し、Cloud Storage に直接 upload、session_id に紐付けて media_ref を登録する。
-2. アップロード完了を契機に、録画あり用の Cloud Run Job を起動する。
-3. 録画映像から vision を再解析し、高精度な feature timeline を生成する。
-4. 録画音声を asynchronous Speech-to-Text で文字起こしし、session と同じ時計に align する（録画のタイムベースを session の絶対時刻へマップする）。
-5. 以降は既存のセッション後分析（変化点検出 → evidence 集約 → Gemini で report / coaching 生成）と同じ処理を通す。
-6. 既存のリアルタイム由来レポートを、録画由来の高精度版で補強または差し替える。
-
-注意:
-
-- 録画は顔映像・生音声を含むため、consent と retention を feature event / baseline frame より厳しく扱う。`Session.consent` に録画アップロード分析用の独立した同意項目を持たせる。
-- リアルタイム経路が「生 PCM を保存しない／事後ASRを行わない」方針なのに対し、録画パスは **ユーザーが明示的にアップロードした録画に限り** asynchronous STT と映像再解析を行う例外として扱う。
-- 処理後の録画本体の保持方針（保持しない／一定期間で削除など）を明示する。
+PDF / Gmail は分析本体とは分離する。レポート生成に成功して PDF 送信に失敗した場合でも、report 自体は保存済みとして扱い、delivery retry を別管理する。
 
 ## Speech-to-Text / Transcript
 
-文字起こしは会議中に Speech-to-Text streaming でリアルタイムに行う。事後の非同期認識（asynchronous recognition）は行わない。
+文字起こしは会議中に Speech-to-Text streaming でリアルタイムに行う。
 
-- Chrome 拡張が self（マイク）/ other（タブ音声）の PCM チャンクを既存の feature 用 WebSocket に相乗りさせて送る
-- Cloud Run Gateway が session_id ごとに self/other 各1本の Speech-to-Text streaming セッションを維持し、audio_chunk をそのまま中継する
+- Chrome 拡張が self（マイク）/ other（タブ音声）の PCM チャンクを既存 WebSocket に相乗りさせて送る
+- Gateway が session_id ごとに self/other 各1本の Speech-to-Text streaming セッションを維持する
 - 1ストリームの継続時間上限があるため、Gateway が会議中に定期的にストリームを再接続する
-- 確定（final）した結果のみ `transcript_chunk`（`speaker: self|other`, `t_start_ms`, `t_end_ms`, `text`, `confidence`, `is_final`）として組み立て、Memorystore recent window と Pub/Sub の両方に送る
+- 確定（final）した結果のみ `transcript_chunk` として組み立てる
+- transcript は Redis recent window と Pub/Sub durable event の両方に流す
 - 中間(interim)結果は永続化しない
-- 生の PCM 音声はどこにも保存しない。保存するのは確定済みテキストのみ
+- 生の PCM 音声は保存しない
 
-これにより、`transcript_chunk` はリアルタイム分析（~10秒ごとの Realtime LLM 呼び出し）とセッション後分析の両方で同じデータをそのまま使う。
+`transcript_chunk` はリアルタイムFBと全体FBレポートの両方で同じ source of truth として使う。
 
 ## データ契約
 
-### Realtime Feature Event
+### Mood Wave Sample（Chrome -> Gateway）
 
 ```json
 {
-  "event_id": "evt_123",
-  "type": "realtime_feature",
+  "type": "mood_wave_sample",
   "schema_version": 1,
   "session_id": "sess_123",
   "t_ms": 1783067121751,
-  "server_received_at_ms": 1783067121800,
   "meeting_provider": "google_meet",
   "source": "chrome_side_panel",
-  "features": {
-    "face_visible": true,
-    "face_count": 1,
-    "face_tracks": [
-      {
-        "audience_id": "aud_1",
-        "face_bbox": { "x": 0.28, "y": 0.45, "w": 0.138, "h": 0.244 },
-        "gaze_estimate": "screen",
-        "head_pose_estimate": { "yaw": 0.009, "pitch": -0.113, "roll": -0.195 },
-        "gestures": { "nod_count": 0, "nod_score": 0 }
-      }
-    ],
-    "motion_score": 0.002,
-    "attention_score": 0.551,
-    "gaze_estimate": "screen",
-    "client_model_version": {
-      "face_detector": "mediapipe-blaze-face-short-range-v1",
-      "face_landmarker": "mediapipe-face-landmarker-v1"
-    }
+  "mood": {
+    "value": 0.58,
+    "baseline": 0.52,
+    "y": 0.06
+  },
+  "attention_y": -0.02,
+  "signals": {
+    "visible_faces": 5,
+    "nod_ratio": 0.2,
+    "speech_ratio": 0.7,
+    "brow_flag": false
+  },
+  "quality": {
+    "calibrating": false,
+    "confidence": 0.82
   }
 }
 ```
 
-`event_id` と `server_received_at_ms` は Gateway 側で付与する。Chrome 拡張から送られる時点では未設定でもよい。
-
-画像処理フロー用の `media_ref` / `feature_snapshot` は `realtime_feature` には入れない。画像取得時は別途 Media API に `capture_snapshot` として送る。
-
-### Capture Snapshot（クライアント→Media API）
-
-画像取得時の compact feature snapshot。Image Analysis Worker の primary input として Cloud SQL の `capture_snapshots.feature_snapshot` に保存する。
+trigger がない通常 sample は上記の軽量 payload のまま送る。Chrome 側で trigger が発火した場合は、まず Media API から `upload_url` と予約済み `media_ref` を取得し、その `media_ref` を `upload_status: "uploading"` として `trigger` / `evidence_frame` に同梱する。画像本体の upload 完了は待たない。
 
 ```json
 {
-  "capture_id": "cap_123",
+  "type": "mood_wave_sample",
+  "schema_version": 1,
   "session_id": "sess_123",
-  "audience_id": "aud_1",
-  "tile_id": "tile_1",
-  "t_ms": 12345,
-  "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/baseline/frames/12345-aud_1.webp",
-  "upload_status": "pending",
-  "feature_snapshot": {
-    "attention_score": 0.55,
-    "motion_score": 0.02,
-    "gaze_estimate": "screen",
-    "head_pose_estimate": { "yaw": 0.01, "pitch": -0.1, "roll": -0.2 },
-    "mouth_openness": 0.01,
-    "eye_openness": { "left": 0.4, "right": 0.5 },
-    "face_bbox": { "x": 0.28, "y": 0.45, "w": 0.138, "h": 0.244 }
+  "t_ms": 1783067120000,
+  "meeting_provider": "google_meet",
+  "source": "chrome_side_panel",
+  "mood": {
+    "value": 0.43,
+    "baseline": 0.55,
+    "y": -0.12
+  },
+  "attention_y": -0.08,
+  "signals": {
+    "visible_faces": 5,
+    "nod_ratio": 0.0,
+    "speech_ratio": 0.72,
+    "brow_flag": false
+  },
+  "quality": {
+    "calibrating": false,
+    "confidence": 0.82
+  },
+  "trigger": {
+    "trigger_id": "trig_123",
+    "type": "wave_drop",
+    "source": "chrome",
+    "peak_t_ms": 1783067120000,
+    "delta": 0.12
+  },
+  "evidence_frame": {
+    "capture_id": "cap_ev_123",
+    "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/evidence/trig_123.jpg",
+    "upload_status": "uploading",
+    "snapshot_t_ms": 1783067119800,
+    "snapshot_lag_ms": -200,
+    "content_type": "image/jpeg"
   }
 }
 ```
 
-`feature_snapshot` には画像解析に必要な compact feature だけを入れる。full landmarks / face_parts は原則入れない。必要な場合だけ debug / sampling / anomaly 用として Cloud Storage に別保存する。
+画像 upload 完了後は、Chrome または Media API 経由で upload complete event が流れ、同じ `trigger_id` / `capture_id` / `media_ref` に紐づく。
 
-### Audio Chunk（クライアント→Gateway）
+```json
+{
+  "type": "evidence_upload_complete",
+  "session_id": "sess_123",
+  "trigger_id": "trig_123",
+  "capture_id": "cap_ev_123",
+  "media_ref": "gs://reaction-engine-sessions/sessions/sess_123/evidence/trig_123.jpg",
+  "upload_status": "uploaded"
+}
+```
+
+### Audio Chunk（Chrome -> Gateway）
 
 ```json
 {
   "type": "audio_chunk",
   "session_id": "sess_123",
   "speaker": "self",
-  "t_ms": 12345,
+  "t_ms": 1783067121751,
   "sample_rate": 16000,
   "pcm": "<base64 or binary frame>"
 }
 ```
 
-既存の feature 用 WebSocket コネクションに相乗りさせる。バイナリフレームで送る場合は `speaker`/`t_ms` を先頭の小さなヘッダに埋め込む。
-
-### Transcript Chunk（Gateway→永続化）
+### Transcript Chunk（Gateway -> Pub/Sub / Redis）
 
 ```json
 {
@@ -883,60 +851,68 @@ GCP 上の処理（既存のセッション後分析を再利用）:
   "schema_version": 1,
   "session_id": "sess_123",
   "speaker": "self",
-  "t_start_ms": 12000,
-  "t_end_ms": 17000,
+  "t_start_ms": 1783067101000,
+  "t_end_ms": 1783067108000,
   "text": "ここから価格戦略について説明します",
   "confidence": 0.91,
   "is_final": true
 }
 ```
 
-`speaker` は `self`（発信者マイク）/ `other`（タブ音声＝参加者側）。Speech-to-Text streaming の確定（final）結果のみを発行する。
+### Feedback Event（Gateway -> Chrome / Pub/Sub）
+
+```json
+{
+  "type": "feedback_event",
+  "session_id": "sess_123",
+  "t_ms": 1783067123000,
+  "trigger_id": "trig_123",
+  "feedback_type": "reaction_down_candidate",
+  "severity": "low",
+  "message": "価格の話に入ったあたりで反応が少し下がっている可能性があります。ここで一度確認を挟むとよさそうです。",
+  "reason_codes": ["mood_wave_drop", "attention_y_drop"],
+  "evidence_quote": "ここから価格戦略について説明します",
+  "source": "llm",
+  "model_version": "gemini-flash-realtime",
+  "confidence": 0.64,
+  "cooldown_ms": 30000
+}
+```
 
 ## 保存方針
 
-| データ | 用途 | Google Cloud 保存先 |
+| データ | 用途 | 保存先 |
 | --- | --- | --- |
-| 直近 feature window | リアルタイム判定 | Memorystore for Redis ZSET |
-| self/other 音声チャンク（PCM） | Speech-to-Text streaming への中継 | 保存しない（Gateway→STTへ転送するのみ） |
-| transcript_chunk | リアルタイムLLM判断根拠・後分析 | Pub/Sub -> Cloud Storage / Cloud SQL |
-| latest session state | realtime state / reconnect | Memorystore for Redis HASH |
-| compact raw feature | 再集計・後分析 source of truth | Pub/Sub -> Cloud Storage |
-| capture snapshot | 画像解析 worker の入力 snapshot | Cloud SQL JSONB primary / Cloud Storage JSONL archive |
-| media_ref | 画像処理フロー内の画像参照 | Media API -> Cloud SQL / Cloud Storage manifest |
-| signal summary | リアルタイム判断根拠・後分析 | Pub/Sub -> Cloud Storage / Cloud SQL |
-| decision log | feedback の根拠・評価（LLM判断含む） | Pub/Sub -> Cloud Storage / Cloud SQL |
-| baseline frame | baseline 計算・LLM evidence の画像本体 | Signed upload -> Cloud Storage |
-| baseline manifest | baseline frame と feature event の対応 | Cloud Storage / Cloud SQL |
-| participant baseline | 個人差補正・しきい値補正 | Cloud SQL / Memorystore cache |
-| visual summary | 画像解析由来の参加者プロファイル・補正情報 | Cloud SQL / Memorystore cache |
-| session metadata | lifecycle / consent / role | Cloud SQL for PostgreSQL |
-| session summary | レポート・一覧表示 | Cloud SQL for PostgreSQL |
-| feedback history | UI / 評価 / report | Cloud SQL for PostgreSQL |
-| 代表フレーム/短いクリップ | evidence / 詳細分析 | Cloud Storage |
-| 横断分析用データ | analytics / evaluation | BigQuery optional |
+| raw feature | Chrome 内部の計算材料 | 通常保存しない |
+| `mood_wave_sample` | リアルタイム判定・全体波形再構築 | Redis recent / Pub/Sub -> Cloud Storage JSONL |
+| `audio_chunk` PCM | Speech-to-Text streaming 中継 | 保存しない |
+| `transcript_chunk` | LLM evidence・全体レポート | Redis recent / Pub/Sub -> Cloud Storage / Cloud SQL |
+| `baseline_frame` | LLM比較材料・baseline visual profile | Signed upload -> Cloud Storage |
+| `evidence_frame` | trigger 時の文脈補強 | Trigger時のみ signed upload -> Cloud Storage |
+| `media_ref` | 画像参照 metadata | Media API -> Cloud SQL |
+| `baseline_visual_profile` | baseline frame 解析結果 | Cloud SQL / Redis cache |
+| evidence post-analysis optional | evidence frame の事後補助解析 | 必要時のみ Cloud SQL / Cloud Storage |
+| `trigger_event` | feedback 発火根拠・後分析 | Pub/Sub -> Cloud Storage / Cloud SQL |
+| `feedback_event` | UI表示・履歴・レポート | Pub/Sub -> Cloud Storage / Cloud SQL |
+| `report` JSON | 全体FB本文 | Cloud SQL / Cloud Storage |
+| `report.pdf` | Gmail送信用成果物 | Cloud Storage |
+| `report_delivery` | Gmail送信状態 | Cloud SQL |
 
 ## MVP 実装順
 
-1. Chrome 拡張の feature event を安定化する
-2. Cloud Run WebSocket Gateway を実装する
-3. Memorystore for Redis に recent state を保存する
-4. Gateway 内で signal summary と decision log（rule ベース）を作る
-5. Memorystore recent window から簡単な `feedback_event` を返す
-6. Pub/Sub topic `feature-events` に compact raw feature + signal summary + decision log を publish する
-7. Cloud Run Durable Writer で Pub/Sub から JSONL を Cloud Storage に保存する
-8. Cloud SQL に session metadata / signal summary / decision log / feedback history を保存する
-9. Chrome 拡張から self/other の音声チャンクを既存WebSocketに相乗りさせて送る
-10. Cloud Run Gateway に session_id ごとの Speech-to-Text streaming セッション（self/other）を追加し、`transcript_chunk` を組み立てる
-11. `transcript_chunk` を Memorystore recent window と Pub/Sub の両経路に流す
-12. システム演算層に ~10秒間隔の Gemini Flash 呼び出し（signal summary + transcript window、timeout付き）を追加し、rule fallback と統合する
-13. Media API で baseline frame の signed upload URL、`media_ref`、`capture_snapshots.feature_snapshot` 保存を実装する
-14. Chrome 拡張が画像取得時の compact `feature_snapshot` を Media API に渡す。`media_ref` は `realtime_feature` に同梱しない
-15. `media-analysis-events` と Image Analysis Worker を追加する
-16. Image Analysis Worker が画像 + `capture_snapshots.feature_snapshot` から participant baseline / visual summary を作る
-17. participant baseline / visual summary を Cloud SQL に保存し、Memorystore に cache する
-18. session end で Cloud Run Job を起動する
-19. compact raw JSONL + signal summary + transcript + participant baseline + visual summary からセッション後レポートを生成する
+1. Chrome 拡張の既存 `mood` 計算を `mood_wave_sample` payload に整理する
+2. Gateway が `mood_wave_sample` を受け取り、Redis recent に保存する
+3. Pub/Sub `analysis-events` と Durable Writer で mood sample JSONL を保存する
+4. 音声チャンク送信と Speech-to-Text streaming を接続し、`transcript_chunk` を作る
+5. Chrome 側 trigger 発火時に Media API から upload_url / media_ref を取得し、uploading 状態の trigger_id / media_ref 付き sample を送る
+6. Realtime Worker が trigger 付き sample を受理し、直近30秒の mood wave window と transcript window を作る
+7. Media API で baseline frame の signed upload を実装し、セッション開始時に5枚保存する
+8. Realtime LLM に mood wave + transcript + baseline/evidence frame refs を渡して feedback を作る
+9. feedback_event を Chrome に返し、Pub/Sub / Cloud SQL に保存する
+10. Image Analysis Worker で baseline visual profile を作る。evidence frame 解析は必要時の事後処理に限定する
+11. session end で Post-session Job を起動し、全体FB report JSON を生成する
+12. PDF renderer で report PDF を生成する
+13. Gmail sender で PDF を送信し、delivery status を保存する
 
 ## 技術選定
 
@@ -949,37 +925,34 @@ GCP 上の処理（既存のセッション後分析を再利用）:
 - Backend Redis: `go-redis` + Memorystore for Redis
 - Backend GCP SDK: `cloud.google.com/go/*`
 - Edge Vision: MediaPipe Tasks Vision
-- Edge Audio: Web Audio API（AudioWorklet で self/other PCM抽出）
-- Realtime Transport: WebSocket（特徴量 + 音声チャンクを同一コネクションで多重化）
-- WebSocket Gateway: Go service on Cloud Run
-- Realtime State: Memorystore for Redis
-- Realtime Transcription: Speech-to-Text streaming（session_idごとにself/other各1本）
-- Realtime LLM: Vertex AI / Gemini Flash（~10秒間隔、timeout + rule fallback）
+- Edge Audio: Web Audio API
+- Realtime Transport: WebSocket（mood wave sample + audio chunk を同一コネクションで多重化）
+- Realtime Transcription: Speech-to-Text streaming
+- Realtime LLM: Vertex AI / Gemini Flash
 - Durable Event Pipeline: Pub/Sub
-- Durable Writer: Go Cloud Run service / worker
 - Durable Storage: Cloud Storage JSONL
-- Media Upload: Cloud Run signed upload API + Cloud Storage signed URL
-- Image Analysis Worker: Go Cloud Run service / Jobs + Pub/Sub + Vertex AI / Gemini Vision
-- App DB: Cloud SQL for PostgreSQL
-- Post-session Workers: Cloud Run Jobs（ASRは行わず、変化点検出・レポート生成のみ）
-- LLM Report: Vertex AI / Gemini（post-session report + realtime reasoning）
+- Media Upload: Cloud Run Media API + Cloud Storage signed URL
+- Image Analysis: Vertex AI / Gemini Vision
+- Post-session Workers: Cloud Run Jobs
+- PDF: HTML to PDF renderer or headless Chromium service
+- Gmail: Gmail API / Workspace API
 - Analytics: BigQuery optional
 - Observability: Cloud Logging / Cloud Monitoring
 - Secrets: Secret Manager
 
 ## 設計上の注意
 
+- Chrome から raw feature を常時送らない。通常の realtime payload は `mood_wave_sample` と `audio_chunk` に限定する。
+- Chrome が `mood_wave_window` を送る必要はない。window 化・summary 作成・cooldown・LLM evidence pack 作成はサーバー側で行う。
 - Cloud Run WebSocket は timeout / reconnect を前提にする。
-- Cloud Run instance memory に session state を置かない。状態は Memorystore / Cloud SQL / Cloud Storage に逃がす。
-- Pub/Sub は at-least-once delivery 前提なので、Durable Writer は `event_id` で冪等にする。
-- Cloud Storage JSONL は chunk file として保存し、後分析時に `event_id` で dedupe する。
-- Cloud SQL に compact raw feature を全件 insert しない。Cloud SQL は metadata、signal summary、decision log、report、feedback history を持つ。
-- full face landmarks / face_parts は常時保存しない。debug mode、sampling、anomaly segment、明示的な consent がある場合だけ保存する。
-- baseline frame は WebSocket に流さない。signed upload URL で Cloud Storage に直接 upload し、Pub/Sub には `media_ref` / manifest だけを流す。
-- baseline frame は顔画像を含むため、consent と retention を feature event より厳しく扱う。
-- BigQuery は MVP では必須ではない。セッション横断分析や評価が必要になった段階で追加する。
-- self/other の生 PCM 音声はどこにも保存しない。Gateway は Speech-to-Text streaming への中継のみ行い、保存するのは確定済み `transcript_chunk`（テキスト）だけにする。
-- 発話内容のテキスト化・保存は音量ベースのVAD利用より機微度が高いため、`Session.consent` に `transcribe_audio` を独立した同意項目として持たせる。
-- Speech-to-Text streaming は1ストリームの継続時間に上限があるため、Gateway は会議中に session_id ごとの self/other ストリームを定期的に再接続する。
-- Realtime LLM 呼び出しは厳格な timeout を必須にし、timeout・エラー・quota超過時は必ず rule + template フォールバックに切り替える。呼び出し頻度・レイテンシ・コストは常時監視する。
-- 同じ時間窓に発言内容と反応変化が同時に見えても、それは相関であって因果の証明ではない。feedback の文言・レポートの `evidence` は言い切らない表現にする。
+- Cloud Run instance memory に session state を置かない。状態は Redis / Cloud SQL / Cloud Storage に逃がす。
+- Redis は短期 state。セッション後分析の source of truth にはしない。
+- Cloud SQL に mood sample 全件を insert しない。高頻度時系列は Cloud Storage JSONL に置く。
+- baseline frame は最初に少数だけ upload する。WebSocket に画像本体を流さない。
+- evidence frame は trigger 時だけ upload する。Chrome 側では短期リングバッファに限定する。
+- baseline/evidence frame は顔画像を含むため、consent と retention を mood sample より厳しく扱う。
+- 生 PCM 音声は保存しない。保存するのは確定済み transcript のみ。
+- 発話内容のテキスト化・保存は機微度が高いため、`Session.consent` に `transcribe_audio` を独立した同意項目として持たせる。
+- Realtime LLM 呼び出しは timeout 必須。失敗時は rule fallback に切り替える。
+- feedback と report は因果を断定しない。同じ時間帯に発言と反応変化が見えても相関として扱う。
+- PDF 生成と Gmail 送信は post-session report 生成から分離し、delivery retry を別管理する。
