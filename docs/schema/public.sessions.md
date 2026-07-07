@@ -6,7 +6,7 @@
 
 | Name | Type | Default | Nullable | Children | Parents | Comment |
 | ---- | ---- | ------- | -------- | -------- | ------- | ------- |
-| session_id | text |  | false | [public.participants](public.participants.md) [public.capture_snapshots](public.capture_snapshots.md) [public.media_refs](public.media_refs.md) [public.participant_baselines](public.participant_baselines.md) [public.visual_summaries](public.visual_summaries.md) [public.signal_summaries](public.signal_summaries.md) [public.decision_logs](public.decision_logs.md) [public.transcripts](public.transcripts.md) [public.feedback_events](public.feedback_events.md) [public.reports](public.reports.md) |  |  |
+| session_id | text |  | false | [public.participants](public.participants.md) [public.capture_snapshots](public.capture_snapshots.md) [public.media_refs](public.media_refs.md) [public.participant_baselines](public.participant_baselines.md) [public.visual_summaries](public.visual_summaries.md) [public.signal_summaries](public.signal_summaries.md) [public.decision_logs](public.decision_logs.md) [public.transcripts](public.transcripts.md) [public.feedback_events](public.feedback_events.md) [public.reports](public.reports.md) [public.trigger_events](public.trigger_events.md) |  |  |
 | meeting_provider | text |  | false |  |  |  |
 | status | text | 'active'::text | false |  |  |  |
 | consent | jsonb | '{}'::jsonb | false |  |  |  |
@@ -42,6 +42,7 @@ erDiagram
 "public.transcripts" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
 "public.feedback_events" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
 "public.reports" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
+"public.trigger_events" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
 
 "public.sessions" {
   text session_id
@@ -72,6 +73,7 @@ erDiagram
   jsonb feature_snapshot
   timestamp_with_time_zone created_at
   timestamp_with_time_zone uploaded_at
+  text trigger_id
 }
 "public.media_refs" {
   uuid id
@@ -83,6 +85,7 @@ erDiagram
   text upload_status
   timestamp_with_time_zone created_at
   timestamp_with_time_zone uploaded_at
+  text trigger_id
 }
 "public.participant_baselines" {
   uuid id
@@ -156,6 +159,18 @@ erDiagram
   text session_id FK
   jsonb report
   timestamp_with_time_zone generated_at
+  timestamp_with_time_zone created_at
+}
+"public.trigger_events" {
+  uuid id
+  text event_id
+  text session_id FK
+  text trigger_id
+  text type
+  text source
+  bigint t_ms
+  bigint peak_t_ms
+  double_precision delta
   timestamp_with_time_zone created_at
 }
 ```

@@ -69,6 +69,7 @@ erDiagram
   jsonb feature_snapshot
   timestamp_with_time_zone created_at
   timestamp_with_time_zone uploaded_at
+  text trigger_id
 }
 ```
 
