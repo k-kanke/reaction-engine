@@ -9,10 +9,9 @@ import (
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
 )
 
-// Store persists transcript_chunk and decision_log rows to the
-// local/Cloud SQL `transcripts` and `decision_logs` tables (migration
-// 000001_initial_schema), per Phase 11/12 of
-// plan/backend-local-docker-runbook.md.
+// Store persists transcript_chunk, trigger_event, and feedback_event rows
+// to their local/Cloud SQL tables (migrations 000001_initial_schema and
+// 000003_add_trigger_events).
 type Store struct {
 	pool *pgxpool.Pool
 }
@@ -21,9 +20,9 @@ func NewStore(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-// EnsureSession upserts a minimal sessions row so transcripts/decision_logs
-// (both FK on session_id) can be inserted before a dedicated Session API
-// exists. Mirrors internal/media.PGStore.EnsureSession.
+// EnsureSession upserts a minimal sessions row so transcripts/trigger_events/
+// feedback_events (all FK on session_id) can be inserted before a dedicated
+// Session API exists. Mirrors internal/media.PGStore.EnsureSession.
 func (s *Store) EnsureSession(ctx context.Context, sessionID string) error {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO sessions (session_id, meeting_provider)
@@ -50,24 +49,6 @@ func (s *Store) InsertTranscriptChunk(ctx context.Context, chunk contract.Transc
 		chunk.Text,
 		chunk.Confidence,
 		chunk.IsFinal,
-	)
-	return err
-}
-
-// InsertDecisionLog inserts one decision_logs row, deduped by event_id
-// (same at-least-once concern as InsertTranscriptChunk).
-func (s *Store) InsertDecisionLog(ctx context.Context, d contract.DecisionLog) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO decision_logs (event_id, session_id, audience_id, t_ms, source, decision)
-		VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-		ON CONFLICT (event_id) DO NOTHING
-	`,
-		d.EventID,
-		d.SessionID,
-		d.AudienceID,
-		d.TMs,
-		d.Source,
-		[]byte(d.Decision),
 	)
 	return err
 }

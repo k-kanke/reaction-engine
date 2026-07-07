@@ -41,14 +41,29 @@ func main() {
 
 	store := postsession.NewPGStore(pool)
 
-	compactFeatures, err := writer.ReadCompactRawFeatures(jsonlDir, *sessionID)
+	moodWaveSamples, err := writer.ReadMoodWaveSamples(jsonlDir, *sessionID)
 	if err != nil {
-		log.Fatalf("post-session-job: read compact raw features failed: %v", err)
+		log.Fatalf("post-session-job: read mood wave samples failed: %v", err)
+	}
+
+	triggerEvents, err := store.ListTriggerEvents(ctx, *sessionID)
+	if err != nil {
+		log.Fatalf("post-session-job: list trigger events failed: %v", err)
+	}
+
+	feedbackEvents, err := store.ListFeedbackEvents(ctx, *sessionID)
+	if err != nil {
+		log.Fatalf("post-session-job: list feedback events failed: %v", err)
 	}
 
 	transcripts, err := store.ListTranscripts(ctx, *sessionID)
 	if err != nil {
 		log.Fatalf("post-session-job: list transcripts failed: %v", err)
+	}
+
+	evidenceRefs, err := store.ListEvidenceMediaRefs(ctx, *sessionID)
+	if err != nil {
+		log.Fatalf("post-session-job: list evidence media refs failed: %v", err)
 	}
 
 	baselines, err := store.ListParticipantBaselines(ctx, *sessionID)
@@ -61,12 +76,7 @@ func main() {
 		log.Fatalf("post-session-job: list visual summaries failed: %v", err)
 	}
 
-	signalSummaries, err := store.ListSignalSummaries(ctx, *sessionID)
-	if err != nil {
-		log.Fatalf("post-session-job: list signal summaries failed: %v", err)
-	}
-
-	report := postsession.BuildReport(*sessionID, compactFeatures, transcripts, baselines, visualSummaries, signalSummaries, time.Now())
+	report := postsession.BuildReport(*sessionID, moodWaveSamples, triggerEvents, feedbackEvents, transcripts, evidenceRefs, baselines, visualSummaries, time.Now())
 
 	reportJSON, err := json.Marshal(report)
 	if err != nil {
@@ -82,5 +92,5 @@ func main() {
 		log.Fatalf("post-session-job: insert report failed: %v", err)
 	}
 
-	log.Printf("post-session-job: report generated for session_id=%s report_id=%s participants=%d", *sessionID, reportID, len(report.Participants))
+	log.Printf("post-session-job: report generated for session_id=%s report_id=%s important_windows=%d", *sessionID, reportID, len(report.ImportantWindows))
 }

@@ -13,12 +13,6 @@ import (
 )
 
 const (
-	// recentWindow is the trim horizon for the old (Phase 0-13)
-	// features:recent:* per-participant buffer. Superseded by
-	// moodWaveRecentTrimWindow below once Step 4 of
-	// plan/mood-wave-contract-migration.md retires realtime_feature.
-	recentWindow = 60 * time.Second
-
 	// moodWaveRecentTrimWindow mirrors architecture.md's Redis pseudocode
 	// ("ZREMRANGEBYSCORE mood_wave:recent:{session_id} -inf now-10min"):
 	// the session-level mood wave ZSET keeps 10 minutes of history so the
@@ -49,30 +43,6 @@ func (c *Client) Ping(ctx context.Context) error {
 
 func (c *Client) Close() error {
 	return c.rdb.Close()
-}
-
-func featuresRecentKey(sessionID, audienceID string) string {
-	return fmt.Sprintf("features:recent:%s:%s", sessionID, audienceID)
-}
-
-// StoreRecentFeature appends a compact feature to the session/audience
-// recent window (ZSET scored by t_ms), trims entries older than the
-// window, and refreshes the key TTL.
-func (c *Client) StoreRecentFeature(ctx context.Context, feature contract.CompactFeature) error {
-	payload, err := json.Marshal(feature)
-	if err != nil {
-		return err
-	}
-
-	key := featuresRecentKey(feature.SessionID, feature.AudienceID)
-	cutoff := feature.ServerReceivedAtMs - recentWindow.Milliseconds()
-
-	pipe := c.rdb.Pipeline()
-	pipe.ZAdd(ctx, key, redis.Z{Score: float64(feature.TMs), Member: payload})
-	pipe.ZRemRangeByScore(ctx, key, "-inf", fmt.Sprintf("%d", cutoff))
-	pipe.Expire(ctx, key, keyTTL)
-	_, err = pipe.Exec(ctx)
-	return err
 }
 
 func transcriptRecentKey(sessionID, speaker string) string {

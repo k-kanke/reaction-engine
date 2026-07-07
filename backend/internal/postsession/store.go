@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/k-kanke/reaction-engine/backend/internal/contract"
 )
 
 // ParticipantBaseline mirrors the columns of one participant_baselines row
@@ -139,6 +141,102 @@ func (s *PGStore) ListTranscripts(ctx context.Context, sessionID string) ([]Tran
 			return nil, err
 		}
 		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ListTriggerEvents returns every trigger_events row for sessionID, oldest
+// first — the anchors BuildReport (Step 10) slices important_windows
+// around.
+func (s *PGStore) ListTriggerEvents(ctx context.Context, sessionID string) ([]contract.TriggerEvent, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT event_id, session_id, trigger_id, type, source, t_ms, peak_t_ms, delta
+		FROM trigger_events
+		WHERE session_id = $1
+		ORDER BY t_ms
+	`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []contract.TriggerEvent
+	for rows.Next() {
+		var t contract.TriggerEvent
+		if err := rows.Scan(&t.EventID, &t.SessionID, &t.TriggerID, &t.Type, &t.Source, &t.TMs, &t.PeakTMs, &t.Delta); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ListFeedbackEvents returns every feedback_events row for sessionID,
+// oldest first, for BuildReport's realtime_feedback_history (Step 10).
+func (s *PGStore) ListFeedbackEvents(ctx context.Context, sessionID string) ([]contract.FeedbackEvent, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT event_id, session_id, audience_id, t_ms, feedback_type, severity, message,
+		       reason_codes, evidence_quote, source, model_version, confidence, cooldown_ms
+		FROM feedback_events
+		WHERE session_id = $1
+		ORDER BY t_ms
+	`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []contract.FeedbackEvent
+	for rows.Next() {
+		var f contract.FeedbackEvent
+		var audienceID, modelVersion *string
+		var reasonCodes json.RawMessage
+		if err := rows.Scan(
+			&f.EventID, &f.SessionID, &audienceID, &f.TMs, &f.FeedbackType, &f.Severity, &f.Message,
+			&reasonCodes, &f.EvidenceQuote, &f.Source, &modelVersion, &f.Confidence, &f.CooldownMs,
+		); err != nil {
+			return nil, err
+		}
+		f.Type = "feedback_event"
+		if audienceID != nil {
+			f.AudienceID = *audienceID
+		}
+		if modelVersion != nil {
+			f.ModelVersion = *modelVersion
+		}
+		if len(reasonCodes) > 0 {
+			if err := json.Unmarshal(reasonCodes, &f.ReasonCodes); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// ListEvidenceMediaRefs returns every uploaded evidence_frame media_ref for
+// sessionID, paired with the trigger_id it was captured for (media_refs
+// rows with a NULL trigger_id — i.e. baseline_frame captures — are
+// excluded by the WHERE clause, not just by purpose, since only
+// evidence_frame captures set it, per Step 7).
+func (s *PGStore) ListEvidenceMediaRefs(ctx context.Context, sessionID string) ([]EvidenceMediaRef, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT trigger_id, media_ref
+		FROM media_refs
+		WHERE session_id = $1 AND purpose = 'evidence_frame' AND upload_status = 'uploaded' AND trigger_id IS NOT NULL
+	`, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []EvidenceMediaRef
+	for rows.Next() {
+		var ref EvidenceMediaRef
+		if err := rows.Scan(&ref.TriggerID, &ref.MediaRef); err != nil {
+			return nil, err
+		}
+		out = append(out, ref)
 	}
 	return out, rows.Err()
 }
