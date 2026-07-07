@@ -30,9 +30,13 @@ type FaceTrack struct {
 // an optional field for the transition (see
 // plan/mood-wave-contract-migration.md Step 4/5, which decide whether the
 // Realtime Worker still populates it once realtime_feature is retired) but
-// is omitted from the wire payload when empty.
+// is omitted from the wire payload when empty. EventID is likewise omitted
+// on the wire (architecture.md's Chrome-facing example has none) — the
+// gateway only sets it on the copy it hands to Durable Writer for
+// idempotent feedback_events persistence (Step 6).
 type FeedbackEvent struct {
 	Type          string   `json:"type"`
+	EventID       string   `json:"event_id,omitempty"`
 	SessionID     string   `json:"session_id"`
 	AudienceID    string   `json:"audience_id,omitempty"`
 	TMs           int64    `json:"t_ms"`
@@ -46,6 +50,25 @@ type FeedbackEvent struct {
 	ModelVersion  string   `json:"model_version,omitempty"`
 	Confidence    float64  `json:"confidence,omitempty"`
 	CooldownMs    int      `json:"cooldown_ms,omitempty"`
+}
+
+// TriggerEvent mirrors one row of the trigger_events table (migration
+// 000003_add_trigger_events, Step 1 of
+// plan/mood-wave-contract-migration.md). The gateway builds one only for
+// triggers the Realtime Worker accepted (i.e. that produced a
+// FeedbackEvent) — rejected/cooldown-suppressed triggers are never
+// persisted, matching architecture.md's リアルタイムFBフロー step 14
+// ("publish trigger_event + feedback_event") being the last step, after
+// acceptance.
+type TriggerEvent struct {
+	EventID   string  `json:"event_id"`
+	SessionID string  `json:"session_id"`
+	TriggerID string  `json:"trigger_id"`
+	Type      string  `json:"type"`
+	Source    string  `json:"source"`
+	TMs       int64   `json:"t_ms"`
+	PeakTMs   int64   `json:"peak_t_ms"`
+	Delta     float64 `json:"delta"`
 }
 
 // CompactFeature is what the gateway stores in the Redis recent window per
@@ -62,21 +85,19 @@ type CompactFeature struct {
 // FeatureEventPayload is the local_events payload the gateway publishes to
 // the "feature-events" topic for durable processing (local stand-in for
 // Pub/Sub, per plan/backend-local-docker-runbook.md Phase 5). Exactly one
-// of MoodWaveSample (from mood_wave_sample, Step 4), TranscriptChunks (from
-// audio_chunk), Features + DecisionLogs (legacy realtime_feature, kept only
-// for internal/postsession until Step 10) is populated per event, since
-// each message type is enqueued independently.
-//
-// The Durable Writer does not persist MoodWaveSample yet — that is Step 8
-// of plan/mood-wave-contract-migration.md. Until then, mood_wave_sample
-// events round-trip through local_events and get acked without a durable
-// copy, matching the transitional state the plan document calls out.
+// of MoodWaveSample (from mood_wave_sample), TriggerEvents+FeedbackEvents
+// (from an accepted trigger, Step 5/6), TranscriptChunks (from audio_chunk),
+// Features + DecisionLogs (legacy realtime_feature, kept only for
+// internal/postsession until Step 10) is populated per event, since each
+// message/decision is enqueued independently.
 type FeatureEventPayload struct {
 	EventID            string                 `json:"event_id"`
 	SessionID          string                 `json:"session_id"`
 	TMs                int64                  `json:"t_ms"`
 	ServerReceivedAtMs int64                  `json:"server_received_at_ms"`
 	MoodWaveSample     *MoodWaveSampleMessage `json:"mood_wave_sample,omitempty"`
+	TriggerEvents      []TriggerEvent         `json:"trigger_events,omitempty"`
+	FeedbackEvents     []FeedbackEvent        `json:"feedback_events,omitempty"`
 	Features           []CompactFeature       `json:"features,omitempty"`
 	TranscriptChunks   []TranscriptChunk      `json:"transcript_chunks,omitempty"`
 	DecisionLogs       []DecisionLog          `json:"decision_logs,omitempty"`

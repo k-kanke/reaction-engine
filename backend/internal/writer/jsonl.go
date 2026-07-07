@@ -57,3 +57,28 @@ func AppendTranscriptChunk(baseDir, sessionID string, chunk any) error {
 func AppendDecisionLog(baseDir, sessionID string, log any) error {
 	return appendJSONLine(log, baseDir, "sessions", sessionID, "features", "decision-log")
 }
+
+// AppendMoodWaveSample appends one mood_wave_sample as a JSON line to
+// {baseDir}/sessions/{sessionID}/mood-wave/part-0001.jsonl, matching
+// architecture.md's Cloud Storage layout
+// (gs://reaction-engine-sessions/sessions/{session_id}/mood-wave/part-0001.jsonl)
+// and its "Cloud SQL に mood_wave_sample 全件を insert しない" storage
+// policy — this JSONL file is mood_wave_sample's only durable copy
+// (Step 6 of plan/mood-wave-contract-migration.md).
+func AppendMoodWaveSample(baseDir, sessionID string, sample any) error {
+	return appendJSONLine(sample, baseDir, "sessions", sessionID, "mood-wave")
+}
+
+// AppendTriggerEvent appends one trigger_event as a JSON line to
+// {baseDir}/sessions/{sessionID}/triggers/part-0001.jsonl, matching
+// architecture.md's Cloud Storage layout.
+func AppendTriggerEvent(baseDir, sessionID string, trigger any) error {
+	return appendJSONLine(trigger, baseDir, "sessions", sessionID, "triggers")
+}
+
+// AppendFeedbackEvent appends one feedback_event as a JSON line to
+// {baseDir}/sessions/{sessionID}/feedback/part-0001.jsonl, matching
+// architecture.md's Cloud Storage layout.
+func AppendFeedbackEvent(baseDir, sessionID string, feedback any) error {
+	return appendJSONLine(feedback, baseDir, "sessions", sessionID, "feedback")
+}

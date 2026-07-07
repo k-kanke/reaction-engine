@@ -2,6 +2,7 @@ package writer
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -67,6 +68,68 @@ func (s *Store) InsertDecisionLog(ctx context.Context, d contract.DecisionLog) e
 		d.TMs,
 		d.Source,
 		[]byte(d.Decision),
+	)
+	return err
+}
+
+// InsertTriggerEvent inserts one trigger_events row (migration
+// 000003_add_trigger_events, Step 1 of
+// plan/mood-wave-contract-migration.md), deduped by event_id (same
+// at-least-once concern as InsertTranscriptChunk).
+func (s *Store) InsertTriggerEvent(ctx context.Context, t contract.TriggerEvent) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO trigger_events (event_id, session_id, trigger_id, type, source, t_ms, peak_t_ms, delta)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (event_id) DO NOTHING
+	`,
+		t.EventID,
+		t.SessionID,
+		t.TriggerID,
+		t.Type,
+		t.Source,
+		t.TMs,
+		t.PeakTMs,
+		t.Delta,
+	)
+	return err
+}
+
+// InsertFeedbackEvent inserts one feedback_events row (migration
+// 000001_initial_schema), deduped by event_id (same at-least-once concern
+// as InsertTranscriptChunk). AudienceID/ModelVersion are nullable text
+// columns; empty string on FeedbackEvent maps to NULL via NULLIF so a
+// FeedbackEvent that never set them (the common mood_wave_sample-driven
+// path) doesn't store empty strings where the schema means "absent".
+func (s *Store) InsertFeedbackEvent(ctx context.Context, f contract.FeedbackEvent) error {
+	var reasonCodes []byte
+	if len(f.ReasonCodes) > 0 {
+		var err error
+		reasonCodes, err = json.Marshal(f.ReasonCodes)
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO feedback_events
+			(event_id, session_id, audience_id, t_ms, feedback_type, severity, message,
+			 reason_codes, evidence_quote, source, model_version, confidence, cooldown_ms)
+		VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7, $8::jsonb, $9, $10, NULLIF($11, ''), $12, $13)
+		ON CONFLICT (event_id) DO NOTHING
+	`,
+		f.EventID,
+		f.SessionID,
+		f.AudienceID,
+		f.TMs,
+		f.FeedbackType,
+		f.Severity,
+		f.Message,
+		reasonCodes,
+		f.EvidenceQuote,
+		f.Source,
+		f.ModelVersion,
+		f.Confidence,
+		f.CooldownMs,
 	)
 	return err
 }
