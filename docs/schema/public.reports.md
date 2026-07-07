@@ -6,11 +6,13 @@
 
 | Name | Type | Default | Nullable | Children | Parents | Comment |
 | ---- | ---- | ------- | -------- | -------- | ------- | ------- |
-| id | uuid | gen_random_uuid() | false |  |  |  |
+| id | uuid | gen_random_uuid() | false | [public.report_deliveries](public.report_deliveries.md) |  |  |
 | session_id | text |  | false |  | [public.sessions](public.sessions.md) |  |
 | report | jsonb |  | false |  |  |  |
 | generated_at | timestamp with time zone | now() | false |  |  |  |
 | created_at | timestamp with time zone | now() | false |  |  |  |
+| pdf_path | text |  | true |  |  |  |
+| pdf_generated_at | timestamp with time zone |  | true |  |  |  |
 
 ## Constraints
 
@@ -31,6 +33,7 @@
 ```mermaid
 erDiagram
 
+"public.report_deliveries" }o--|| "public.reports" : "FOREIGN KEY (report_id) REFERENCES reports(id)"
 "public.reports" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
 
 "public.reports" {
@@ -38,6 +41,17 @@ erDiagram
   text session_id FK
   jsonb report
   timestamp_with_time_zone generated_at
+  timestamp_with_time_zone created_at
+  text pdf_path
+  timestamp_with_time_zone pdf_generated_at
+}
+"public.report_deliveries" {
+  uuid id
+  uuid report_id FK
+  text recipient
+  text status
+  timestamp_with_time_zone sent_at
+  text error
   timestamp_with_time_zone created_at
 }
 "public.sessions" {

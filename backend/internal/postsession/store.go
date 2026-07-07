@@ -274,3 +274,63 @@ func (s *PGStore) InsertReport(ctx context.Context, sessionID string, report jso
 	`, sessionID, []byte(report), generatedAt).Scan(&id)
 	return id, err
 }
+
+// GetLatestReport returns the most recently generated_at reports row for
+// sessionID (Step 11 of plan/mood-wave-contract-migration.md's
+// pdf-renderer reads this to build the PDF).
+func (s *PGStore) GetLatestReport(ctx context.Context, sessionID string) (id string, report json.RawMessage, err error) {
+	err = s.pool.QueryRow(ctx, `
+		SELECT id, report
+		FROM reports
+		WHERE session_id = $1
+		ORDER BY generated_at DESC
+		LIMIT 1
+	`, sessionID).Scan(&id, &report)
+	return id, report, err
+}
+
+// UpdateReportPDF records where pdf-renderer wrote the report's PDF
+// (Step 11). pdfPath is a media_ref-style reference (local://... or, once
+// GCS is wired, gs://...), matching how capture_snapshots/media_refs
+// store media_ref rather than a raw filesystem path.
+func (s *PGStore) UpdateReportPDF(ctx context.Context, reportID, pdfPath string, generatedAt time.Time) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE reports SET pdf_path = $2, pdf_generated_at = $3
+		WHERE id = $1
+	`, reportID, pdfPath, generatedAt)
+	return err
+}
+
+// GetReportPDFPath returns the latest report's id and pdf_path for
+// sessionID (Step 11's gmail-sender reads this; pdfPath is "" if
+// pdf-renderer hasn't run yet).
+func (s *PGStore) GetReportPDFPath(ctx context.Context, sessionID string) (reportID, pdfPath string, err error) {
+	var path *string
+	err = s.pool.QueryRow(ctx, `
+		SELECT id, pdf_path
+		FROM reports
+		WHERE session_id = $1
+		ORDER BY generated_at DESC
+		LIMIT 1
+	`, sessionID).Scan(&reportID, &path)
+	if err != nil {
+		return "", "", err
+	}
+	if path != nil {
+		pdfPath = *path
+	}
+	return reportID, pdfPath, nil
+}
+
+// InsertReportDelivery inserts one report_deliveries row (migration
+// 000004_add_report_delivery, Step 11) and returns its generated id.
+// sentAt/errMsg are nil for a failed delivery attempt that never sent.
+func (s *PGStore) InsertReportDelivery(ctx context.Context, reportID, recipient, status string, sentAt *time.Time, errMsg *string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO report_deliveries (report_id, recipient, status, sent_at, error)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id
+	`, reportID, recipient, status, sentAt, errMsg).Scan(&id)
+	return id, err
+}

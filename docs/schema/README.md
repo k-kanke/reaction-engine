@@ -15,9 +15,10 @@
 | [public.decision_logs](public.decision_logs.md) | 8 |  | BASE TABLE |
 | [public.transcripts](public.transcripts.md) | 10 |  | BASE TABLE |
 | [public.feedback_events](public.feedback_events.md) | 15 |  | BASE TABLE |
-| [public.reports](public.reports.md) | 5 |  | BASE TABLE |
+| [public.reports](public.reports.md) | 7 |  | BASE TABLE |
 | [public.local_events](public.local_events.md) | 7 |  | BASE TABLE |
 | [public.trigger_events](public.trigger_events.md) | 10 |  | BASE TABLE |
+| [public.report_deliveries](public.report_deliveries.md) | 7 |  | BASE TABLE |
 
 ## Relations
 
@@ -37,6 +38,7 @@ erDiagram
 "public.feedback_events" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
 "public.reports" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
 "public.trigger_events" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
+"public.report_deliveries" }o--|| "public.reports" : "FOREIGN KEY (report_id) REFERENCES reports(id)"
 
 "public.schema_migrations" {
   bigint version
@@ -158,6 +160,8 @@ erDiagram
   jsonb report
   timestamp_with_time_zone generated_at
   timestamp_with_time_zone created_at
+  text pdf_path
+  timestamp_with_time_zone pdf_generated_at
 }
 "public.local_events" {
   bigint id
@@ -178,6 +182,15 @@ erDiagram
   bigint t_ms
   bigint peak_t_ms
   double_precision delta
+  timestamp_with_time_zone created_at
+}
+"public.report_deliveries" {
+  uuid id
+  uuid report_id FK
+  text recipient
+  text status
+  timestamp_with_time_zone sent_at
+  text error
   timestamp_with_time_zone created_at
 }
 ```
