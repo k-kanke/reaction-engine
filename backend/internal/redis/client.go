@@ -122,6 +122,31 @@ func (c *Client) GetLatestTranscript(ctx context.Context, sessionID, speaker str
 	return chunk, true, nil
 }
 
+// GetTranscriptWindow returns every cached transcript_chunk for
+// session_id + speaker with t_start_ms in [sinceTMs, +inf), oldest first.
+// Used by the Realtime Worker (Step 5) to build the transcript_window half
+// of a realtime evidence pack, alongside GetLatestTranscript's
+// single-chunk read for the (now-dormant) old feedback path.
+func (c *Client) GetTranscriptWindow(ctx context.Context, sessionID, speaker string, sinceTMs int64) ([]contract.TranscriptChunk, error) {
+	vals, err := c.rdb.ZRangeByScore(ctx, transcriptRecentKey(sessionID, speaker), &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", sinceTMs),
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	chunks := make([]contract.TranscriptChunk, 0, len(vals))
+	for _, v := range vals {
+		var chunk contract.TranscriptChunk
+		if err := json.Unmarshal([]byte(v), &chunk); err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks, nil
+}
+
 func baselineKey(sessionID, audienceID string) string {
 	return fmt.Sprintf("session:baseline:%s:%s", sessionID, audienceID)
 }
@@ -134,18 +159,67 @@ func baselineStatusKey(sessionID, audienceID string) string {
 	return fmt.Sprintf("session:baseline_status:%s:%s", sessionID, audienceID)
 }
 
-// SetBaselineReady caches a participant's baseline and visual summary and
-// marks baseline_status "ready", per
-// plan/backend-local-docker-runbook.md Phase 8. Gateway feedback logic
-// (Phase 9+) reads these to apply baseline-aware corrections once ready;
-// until then it should treat the participant as warming_up.
-func (c *Client) SetBaselineReady(ctx context.Context, sessionID, audienceID string, baseline, visualSummary []byte) error {
+func baselineMediaRefKey(sessionID, audienceID string) string {
+	return fmt.Sprintf("session:baseline_media_ref:%s:%s", sessionID, audienceID)
+}
+
+// baselineParticipantsKey is a SET of every audience_id with a ready
+// baseline for session_id, so ListReadyBaselineMediaRefs (the Realtime
+// Worker's evidence pack, Step 5 of plan/mood-wave-contract-migration.md)
+// can enumerate baseline_frames without an audience_id index elsewhere —
+// mood_wave_sample is session-level, so nothing else names participants.
+func baselineParticipantsKey(sessionID string) string {
+	return fmt.Sprintf("session:baseline_participants:%s", sessionID)
+}
+
+// SetBaselineReady caches a participant's baseline, visual summary, and the
+// media_ref of the baseline frame it was derived from, and marks
+// baseline_status "ready", per plan/backend-local-docker-runbook.md Phase
+// 8. Gateway feedback logic (Phase 9+) reads baseline/visual_summary/status
+// to apply baseline-aware corrections once ready; the Realtime Worker
+// (Step 5) reads mediaRef (via ListReadyBaselineMediaRefs) to include
+// baseline_frames in its LLM evidence pack.
+func (c *Client) SetBaselineReady(ctx context.Context, sessionID, audienceID string, baseline, visualSummary []byte, mediaRef string) error {
 	pipe := c.rdb.Pipeline()
 	pipe.Set(ctx, baselineKey(sessionID, audienceID), baseline, keyTTL)
 	pipe.Set(ctx, visualSummaryKey(sessionID, audienceID), visualSummary, keyTTL)
 	pipe.Set(ctx, baselineStatusKey(sessionID, audienceID), "ready", keyTTL)
+	pipe.Set(ctx, baselineMediaRefKey(sessionID, audienceID), mediaRef, keyTTL)
+	pipe.SAdd(ctx, baselineParticipantsKey(sessionID), audienceID)
+	pipe.Expire(ctx, baselineParticipantsKey(sessionID), keyTTL)
 	_, err := pipe.Exec(ctx)
 	return err
+}
+
+// ListReadyBaselineMediaRefs returns the baseline frame media_ref of every
+// participant with a ready baseline in session_id, for the Realtime
+// Worker's evidence pack (Step 5). Order is unspecified (SMEMBERS order).
+func (c *Client) ListReadyBaselineMediaRefs(ctx context.Context, sessionID string) ([]string, error) {
+	audienceIDs, err := c.rdb.SMembers(ctx, baselineParticipantsKey(sessionID)).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(audienceIDs) == 0 {
+		return nil, nil
+	}
+
+	keys := make([]string, len(audienceIDs))
+	for i, audienceID := range audienceIDs {
+		keys[i] = baselineMediaRefKey(sessionID, audienceID)
+	}
+
+	vals, err := c.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	refs := make([]string, 0, len(vals))
+	for _, v := range vals {
+		if s, ok := v.(string); ok && s != "" {
+			refs = append(refs, s)
+		}
+	}
+	return refs, nil
 }
 
 // BaselineStatusReady and BaselineStatusWarmingUp mirror the

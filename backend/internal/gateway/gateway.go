@@ -14,6 +14,7 @@ import (
 
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
+	"github.com/k-kanke/reaction-engine/backend/internal/realtime"
 	gwredis "github.com/k-kanke/reaction-engine/backend/internal/redis"
 )
 
@@ -99,11 +100,11 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 // pseudocode: validate, assign event_id/server_received_at_ms, cache it in
 // Redis (mood_wave:recent + session:state), publish it for durable
 // processing, and — when the sample carries a trigger — cache that trigger
-// too. It intentionally does not decide or emit any feedback_event itself:
-// window summary, cooldown/LLM budget, evidence pack assembly, and the
-// LLM/rule decision all belong to the Realtime Worker
-// (plan/mood-wave-contract-migration.md Step 5), which reads the state this
-// handler writes.
+// and hand it to the Realtime Worker (internal/realtime, Step 5 of
+// plan/mood-wave-contract-migration.md) for cooldown/LLM-budget gating and
+// a feedback decision. Durable persistence of the resulting trigger_event/
+// feedback_event is Step 6 — for now HandleTrigger's feedback_event only
+// goes back to Chrome over this connection.
 func (h *Handler) handleMoodWaveSample(ctx context.Context, conn *websocket.Conn, raw json.RawMessage) {
 	var msg contract.MoodWaveSampleMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
@@ -129,10 +130,25 @@ func (h *Handler) handleMoodWaveSample(ctx context.Context, conn *websocket.Conn
 		log.Printf("gateway: enqueue local event failed: %v", err)
 	}
 
-	if msg.Trigger != nil {
-		if err := h.redis.StoreRecentTrigger(ctx, msg.SessionID, *msg.Trigger); err != nil {
-			log.Printf("gateway: store recent trigger failed: %v", err)
-		}
+	if msg.Trigger == nil {
+		return
+	}
+
+	if err := h.redis.StoreRecentTrigger(ctx, msg.SessionID, *msg.Trigger); err != nil {
+		log.Printf("gateway: store recent trigger failed: %v", err)
+	}
+
+	feedback, accepted, err := realtime.HandleTrigger(ctx, h.redis, msg, h.llmEnabled)
+	if err != nil {
+		log.Printf("gateway: realtime worker handle trigger failed: %v", err)
+		return
+	}
+	if !accepted {
+		return
+	}
+
+	if err := wsjson.Write(ctx, conn, feedback); err != nil {
+		log.Printf("gateway: write feedback_event failed: %v", err)
 	}
 }
 

@@ -12,7 +12,7 @@ import (
 // Cache is the Redis boundary the worker publishes baseline / visual
 // summary state to.
 type Cache interface {
-	SetBaselineReady(ctx context.Context, sessionID, audienceID string, baseline, visualSummary []byte) error
+	SetBaselineReady(ctx context.Context, sessionID, audienceID string, baseline, visualSummary []byte, mediaRef string) error
 }
 
 // visualSummaryConfidence is a fixed stub confidence for the fake visual
@@ -79,7 +79,7 @@ func (w *Worker) ProcessMediaUploaded(ctx context.Context, payload contract.Medi
 		return fmt.Errorf("insert visual summary: %w", err)
 	}
 
-	if err := w.Cache.SetBaselineReady(ctx, payload.SessionID, payload.AudienceID, baseline, visualSummary); err != nil {
+	if err := w.Cache.SetBaselineReady(ctx, payload.SessionID, payload.AudienceID, baseline, visualSummary, capture.MediaRef); err != nil {
 		return fmt.Errorf("cache baseline: %w", err)
 	}
 
