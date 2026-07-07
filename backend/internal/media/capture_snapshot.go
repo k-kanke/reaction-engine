@@ -25,6 +25,10 @@ type CaptureSnapshot struct {
 	MediaRef        string
 	UploadStatus    string
 	FeatureSnapshot json.RawMessage
+	// TriggerID links an evidence_frame capture to the trigger that caused
+	// it (architecture.md's mood_wave_sample.trigger.trigger_id). Empty
+	// (NULL) for baseline_frame captures, which are not trigger-driven.
+	TriggerID string
 }
 
 // MediaRef mirrors a row of the media_refs table.
@@ -35,6 +39,9 @@ type MediaRef struct {
 	Purpose      string
 	ContentType  string
 	UploadStatus string
+	// TriggerID mirrors CaptureSnapshot.TriggerID; empty (NULL) for
+	// baseline_frame media_refs.
+	TriggerID string
 }
 
 // CaptureRecord is the joined capture_snapshots + media_refs view returned
@@ -50,6 +57,7 @@ type CaptureRecord struct {
 	ContentType  string
 	Purpose      string
 	UploadStatus string
+	TriggerID    string // empty means NULL
 }
 
 // Store is the persistence boundary the media-api handlers depend on. It is
@@ -98,6 +106,10 @@ func (s *PGStore) InsertCaptureSnapshot(ctx context.Context, snapshot CaptureSna
 	if snapshot.TileID != "" {
 		tileID = &snapshot.TileID
 	}
+	var triggerID *string
+	if snapshot.TriggerID != "" {
+		triggerID = &snapshot.TriggerID
+	}
 
 	featureSnapshot := snapshot.FeatureSnapshot
 	if len(featureSnapshot) == 0 {
@@ -106,8 +118,8 @@ func (s *PGStore) InsertCaptureSnapshot(ctx context.Context, snapshot CaptureSna
 
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO capture_snapshots
-			(capture_id, session_id, audience_id, tile_id, t_ms, media_ref, upload_status, feature_snapshot)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+			(capture_id, session_id, audience_id, tile_id, t_ms, media_ref, upload_status, feature_snapshot, trigger_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
 	`,
 		snapshot.CaptureID,
 		snapshot.SessionID,
@@ -117,15 +129,21 @@ func (s *PGStore) InsertCaptureSnapshot(ctx context.Context, snapshot CaptureSna
 		snapshot.MediaRef,
 		snapshot.UploadStatus,
 		[]byte(featureSnapshot),
+		triggerID,
 	)
 	return err
 }
 
 func (s *PGStore) InsertMediaRef(ctx context.Context, ref MediaRef) error {
+	var triggerID *string
+	if ref.TriggerID != "" {
+		triggerID = &ref.TriggerID
+	}
+
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO media_refs
-			(session_id, capture_id, media_ref, purpose, content_type, upload_status)
-		VALUES ($1, $2, $3, $4, $5, $6)
+			(session_id, capture_id, media_ref, purpose, content_type, upload_status, trigger_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`,
 		ref.SessionID,
 		ref.CaptureID,
@@ -133,6 +151,7 @@ func (s *PGStore) InsertMediaRef(ctx context.Context, ref MediaRef) error {
 		ref.Purpose,
 		ref.ContentType,
 		ref.UploadStatus,
+		triggerID,
 	)
 	return err
 }
@@ -140,10 +159,11 @@ func (s *PGStore) InsertMediaRef(ctx context.Context, ref MediaRef) error {
 func (s *PGStore) GetCapture(ctx context.Context, sessionID, captureID string) (CaptureRecord, error) {
 	var rec CaptureRecord
 	var tileID *string
+	var triggerID *string
 
 	err := s.pool.QueryRow(ctx, `
 		SELECT cs.session_id, cs.capture_id, cs.audience_id, cs.tile_id, cs.t_ms,
-		       cs.media_ref, mr.content_type, mr.purpose, cs.upload_status
+		       cs.media_ref, mr.content_type, mr.purpose, cs.upload_status, cs.trigger_id
 		FROM capture_snapshots cs
 		JOIN media_refs mr ON mr.capture_id = cs.capture_id AND mr.session_id = cs.session_id
 		WHERE cs.session_id = $1 AND cs.capture_id = $2
@@ -157,6 +177,7 @@ func (s *PGStore) GetCapture(ctx context.Context, sessionID, captureID string) (
 		&rec.ContentType,
 		&rec.Purpose,
 		&rec.UploadStatus,
+		&triggerID,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CaptureRecord{}, ErrCaptureNotFound
@@ -166,6 +187,9 @@ func (s *PGStore) GetCapture(ctx context.Context, sessionID, captureID string) (
 	}
 	if tileID != nil {
 		rec.TileID = *tileID
+	}
+	if triggerID != nil {
+		rec.TriggerID = *triggerID
 	}
 	return rec, nil
 }

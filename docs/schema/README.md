@@ -7,8 +7,8 @@
 | [public.schema_migrations](public.schema_migrations.md) | 2 |  | BASE TABLE |
 | [public.sessions](public.sessions.md) | 8 |  | BASE TABLE |
 | [public.participants](public.participants.md) | 6 |  | BASE TABLE |
-| [public.capture_snapshots](public.capture_snapshots.md) | 10 |  | BASE TABLE |
-| [public.media_refs](public.media_refs.md) | 9 |  | BASE TABLE |
+| [public.capture_snapshots](public.capture_snapshots.md) | 11 |  | BASE TABLE |
+| [public.media_refs](public.media_refs.md) | 10 |  | BASE TABLE |
 | [public.participant_baselines](public.participant_baselines.md) | 7 |  | BASE TABLE |
 | [public.visual_summaries](public.visual_summaries.md) | 8 |  | BASE TABLE |
 | [public.signal_summaries](public.signal_summaries.md) | 7 |  | BASE TABLE |
@@ -16,6 +16,8 @@
 | [public.transcripts](public.transcripts.md) | 10 |  | BASE TABLE |
 | [public.feedback_events](public.feedback_events.md) | 15 |  | BASE TABLE |
 | [public.reports](public.reports.md) | 5 |  | BASE TABLE |
+| [public.local_events](public.local_events.md) | 7 |  | BASE TABLE |
+| [public.trigger_events](public.trigger_events.md) | 10 |  | BASE TABLE |
 
 ## Relations
 
@@ -34,6 +36,7 @@ erDiagram
 "public.transcripts" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
 "public.feedback_events" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
 "public.reports" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
+"public.trigger_events" }o--|| "public.sessions" : "FOREIGN KEY (session_id) REFERENCES sessions(session_id)"
 
 "public.schema_migrations" {
   bigint version
@@ -68,6 +71,7 @@ erDiagram
   jsonb feature_snapshot
   timestamp_with_time_zone created_at
   timestamp_with_time_zone uploaded_at
+  text trigger_id
 }
 "public.media_refs" {
   uuid id
@@ -79,6 +83,7 @@ erDiagram
   text upload_status
   timestamp_with_time_zone created_at
   timestamp_with_time_zone uploaded_at
+  text trigger_id
 }
 "public.participant_baselines" {
   uuid id
@@ -152,6 +157,27 @@ erDiagram
   text session_id FK
   jsonb report
   timestamp_with_time_zone generated_at
+  timestamp_with_time_zone created_at
+}
+"public.local_events" {
+  bigint id
+  text topic
+  text event_id
+  jsonb payload
+  timestamp_with_time_zone available_at
+  timestamp_with_time_zone created_at
+  timestamp_with_time_zone acked_at
+}
+"public.trigger_events" {
+  uuid id
+  text event_id
+  text session_id FK
+  text trigger_id
+  text type
+  text source
+  bigint t_ms
+  bigint peak_t_ms
+  double_precision delta
   timestamp_with_time_zone created_at
 }
 ```
