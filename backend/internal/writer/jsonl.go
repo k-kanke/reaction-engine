@@ -32,30 +32,11 @@ func appendJSONLine(payload any, baseDir string, parts ...string) error {
 	return err
 }
 
-// AppendCompactRawFeature appends payload as one JSON line to
-// {baseDir}/sessions/{sessionID}/features/compact-raw/part-0001.jsonl.
-// Each line carries its own event_id so duplicate lines (e.g. from an
-// unacked event reprocessed after a restart) can be deduped downstream
-// during post-session analysis, per architecture.md's storage policy for
-// Cloud Storage JSONL.
-func AppendCompactRawFeature(baseDir, sessionID string, payload any) error {
-	return appendJSONLine(payload, baseDir, "sessions", sessionID, "features", "compact-raw")
-}
-
 // AppendTranscriptChunk appends one finalized transcript_chunk as a JSON
 // line to {baseDir}/sessions/{sessionID}/transcript/part-0001.jsonl,
-// matching architecture.md's Cloud Storage layout
-// (.../transcript/part-0001.jsonl, separate from the features/ prefix).
+// matching architecture.md's Cloud Storage layout.
 func AppendTranscriptChunk(baseDir, sessionID string, chunk any) error {
 	return appendJSONLine(chunk, baseDir, "sessions", sessionID, "transcript")
-}
-
-// AppendDecisionLog appends one decision_log as a JSON line to
-// {baseDir}/sessions/{sessionID}/features/decision-log/part-0001.jsonl,
-// matching architecture.md's Cloud Storage layout (Phase 12 of
-// plan/backend-local-docker-runbook.md).
-func AppendDecisionLog(baseDir, sessionID string, log any) error {
-	return appendJSONLine(log, baseDir, "sessions", sessionID, "features", "decision-log")
 }
 
 // AppendMoodWaveSample appends one mood_wave_sample as a JSON line to

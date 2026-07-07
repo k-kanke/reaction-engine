@@ -49,20 +49,16 @@ func readJSONLLines[T any](baseDir string, parts ...string) ([]T, error) {
 	return items, nil
 }
 
-// ReadCompactRawFeatures reads every feature-events payload the writer has
-// appended for one session's compact-raw JSONL.
-func ReadCompactRawFeatures(baseDir, sessionID string) ([]contract.FeatureEventPayload, error) {
-	return readJSONLLines[contract.FeatureEventPayload](baseDir, "sessions", sessionID, "features", "compact-raw")
-}
-
 // ReadTranscriptChunks reads every transcript_chunk the writer has appended
 // for one session.
 func ReadTranscriptChunks(baseDir, sessionID string) ([]contract.TranscriptChunk, error) {
 	return readJSONLLines[contract.TranscriptChunk](baseDir, "sessions", sessionID, "transcript")
 }
 
-// ReadDecisionLogs reads every decision_log the writer has appended for one
-// session.
-func ReadDecisionLogs(baseDir, sessionID string) ([]contract.DecisionLog, error) {
-	return readJSONLLines[contract.DecisionLog](baseDir, "sessions", sessionID, "features", "decision-log")
+// ReadMoodWaveSamples reads every mood_wave_sample the writer has appended
+// for one session (Step 6/10 of plan/mood-wave-contract-migration.md) — the
+// mood-wave JSONL is mood_wave_sample's only durable copy, since Cloud SQL
+// never gets one row per sample.
+func ReadMoodWaveSamples(baseDir, sessionID string) ([]contract.MoodWaveSampleMessage, error) {
+	return readJSONLLines[contract.MoodWaveSampleMessage](baseDir, "sessions", sessionID, "mood-wave")
 }
