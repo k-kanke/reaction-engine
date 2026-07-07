@@ -92,8 +92,8 @@ const MOOD_TRIGGER_REARM_RATIO = 0.6; // 偏差がこの割合以下に戻った
 // 頷きは瞬間的なジェスチャーでEMA平滑化に埋もれるため、mood偏差とは独立の
 // 専用チャンネルで発火させる(将来の笑い声・声量急変も同パターンで追加する)
 const NOD_TRIGGER_RATIO = 0.34; // 可視の顔のうちこの割合以上が頷いていたら
-const NOD_TRIGGER_MIN_MS = 500; // この時間継続したら発火
-const NOD_TRIGGER_COOLDOWN_MS = 10000;
+const NOD_TRIGGER_MIN_MS = 750; // この時間継続したら発火
+const NOD_TRIGGER_COOLDOWN_MS = 15000;
 const MOOD_EMA_ALPHA = 0.35; // 表情検出フリッカー対策の平滑化係数(250ms毎)
 const MOOD_BASELINE_ALPHA = 0.02; // 波形の中心線となる移動ベースライン(時定数≒12秒)
 const MOOD_WAVE_GAIN = 0.15; // 波形の縦スケール: ベースライン偏差±この値で上下端に達する
@@ -114,6 +114,11 @@ let moodTriggerArmed = true;
 let nodActiveSince = null;
 let lastNodTriggerTs = 0;
 let activeExcursion = null; // {moment, startTs} 発火中(偏差が戻るまで)の盛り上がり区間
+// セッション全体の波形(1秒粒度)。全体フィードバック用に開始〜終了まで保持し、
+// 次のキャプチャ開始時にリセットする。1時間で約14KB×50B≒700KBと軽量。
+const MOOD_TIMELINE_INTERVAL_MS = 1000;
+let moodTimeline = []; // {t_ms, mood, baseline, dev, attention_dev}
+let lastTimelinePushTs = 0;
 let snapshotTimer = null;
 let snapshotCanvas = null;
 let snapshotBuffer = []; // {t_ms, blob}
@@ -1099,7 +1104,7 @@ function pruneTrackHistory(now) {
 const ENGAGEMENT_WARMUP_SAMPLES = 40; // 開始~30-60秒は基準を較正するだけ
 const ENGAGEMENT_EWMA_ALPHA = 0.03; // 較正後の緩やかなドリフト
 const ENGAGEMENT_WARMUP_ALPHA = 0.15; // 較正中は速く基準へ寄せる
-const NOD_SCORE_THRESHOLD = 0.5; // これを超えたら「頷いている」
+const NOD_SCORE_THRESHOLD = 0.7; // これを超えたら「頷いている」(振幅0.07以上=大きめの頷きのみ)
 const BROW_FLAG_MARGIN = 0.15; // 基準+マージン超で brow_flag（重みは仮値）
 
 const engagementBaseline = {
@@ -1713,7 +1718,15 @@ function sendFeatureEvent() {
     t_ms: Date.now(),
     meeting_provider: "google_meet",
     source: "chrome_side_panel",
-    features: latestFeatures
+    features: latestFeatures,
+    // リアルタイムフィードバック用の雰囲気波形の現在値。受け側はこの1Hz
+    // ストリームを窓で貯めれば任意の長さ(例: 直近30秒)の波形を再構成できる。
+    // 毎秒 IndexedDB にも保存されるため、エクスポートすると全セッション分が残る。
+    mood: moodEma == null ? null : {
+      value: round(moodEma),
+      baseline: round(moodBaseline),
+      dev: round(moodEma - moodBaseline)
+    }
   };
 
   if (ws?.readyState === WebSocket.OPEN) {
@@ -2198,6 +2211,8 @@ function startMoodMonitor() {
   nodActiveSince = null;
   lastNodTriggerTs = 0;
   activeExcursion = null;
+  moodTimeline = []; // 新しいセッションの全体波形を開始
+  lastTimelinePushTs = 0;
   if (snapshotTimer) window.clearInterval(snapshotTimer);
   snapshotTimer = window.setInterval(captureSnapshotFrame, SNAPSHOT_INTERVAL_MS);
   drawMoodWave();
@@ -2249,6 +2264,18 @@ function updateMoodMonitor(features) {
     attention: round(attentionEma - attentionBaseline)
   });
 
+  // 全体フィードバック用: セッション全体の波形を1秒粒度で保持
+  if (now - lastTimelinePushTs >= MOOD_TIMELINE_INTERVAL_MS) {
+    lastTimelinePushTs = now;
+    moodTimeline.push({
+      t_ms: now,
+      mood: round(moodEma),
+      baseline: round(moodBaseline),
+      dev: round(moodEma - moodBaseline),
+      attention_dev: round(attentionEma - attentionBaseline)
+    });
+  }
+
   const cutoff = now - MOOD_WAVE_WINDOW_MS;
   while (moodHistory.length && moodHistory[0].t_ms < cutoff) moodHistory.shift();
   moodTriggerMarks = moodTriggerMarks.filter((mark) => mark.t_ms >= cutoff);
@@ -2256,6 +2283,13 @@ function updateMoodMonitor(features) {
   detectMoodTrigger(now);
   detectNodTrigger(now, features);
   drawMoodWave();
+}
+
+// リアルタイムフィードバック用: 直近 windowMs ぶんの波形(250ms粒度・偏差ベース)。
+// moodHistory は直近60秒を保持しているので、30秒窓はここから切り出せる。
+function getRecentMoodWindow(windowMs = 30000) {
+  const cutoff = Date.now() - windowMs;
+  return moodHistory.filter((s) => s.t_ms >= cutoff);
 }
 
 function detectNodTrigger(now, features) {
@@ -2291,6 +2325,9 @@ function detectMoodTrigger(now) {
   if (moodHistory.length < MOOD_TRIGGER_MIN_SAMPLES) return;
   if (now - lastMoodTriggerTs < MOOD_TRIGGER_COOLDOWN_MS) return;
   if (Math.abs(dev) < MOOD_TRIGGER_DELTA) return;
+  // 頷き進行中/直後は mood 側を保留(頷き自体が mood を押し上げて
+  // NOD と rise の二連発になるため。ラベルが具体的な NOD を優先する)
+  if (nodActiveSince != null || now - lastNodTriggerTs < MOOD_TRIGGER_COOLDOWN_MS) return;
 
   const direction = dev > 0 ? "rise" : "drop";
   moodTriggerArmed = false;
