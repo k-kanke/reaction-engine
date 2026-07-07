@@ -160,6 +160,8 @@ erDiagram
   jsonb report
   timestamp_with_time_zone generated_at
   timestamp_with_time_zone created_at
+  text pdf_path
+  timestamp_with_time_zone pdf_generated_at
 }
 "public.trigger_events" {
   uuid id

@@ -1,4 +1,4 @@
-.PHONY: test build run-gateway run-media-api run-writer run-image-worker run-post-session-job migrate-up migrate-down docs-schema
+.PHONY: test build run-gateway run-media-api run-writer run-image-worker run-post-session-job run-pdf-renderer run-gmail-sender migrate-up migrate-down docs-schema
 
 test:
 	go test ./...
@@ -9,6 +9,8 @@ build:
 	go build -o bin/writer ./cmd/writer
 	go build -o bin/image-analysis-worker ./cmd/image-analysis-worker
 	go build -o bin/post-session-job ./cmd/post-session-job
+	go build -o bin/pdf-renderer ./cmd/pdf-renderer
+	go build -o bin/gmail-sender ./cmd/gmail-sender
 
 run-gateway:
 	go run ./cmd/gateway
@@ -24,6 +26,12 @@ run-image-worker:
 
 run-post-session-job:
 	go run ./cmd/post-session-job
+
+run-pdf-renderer:
+	go run ./cmd/pdf-renderer
+
+run-gmail-sender:
+	go run ./cmd/gmail-sender
 
 migrate-up:
 	cd $(CURDIR)/.. && docker compose run --rm migrate up
