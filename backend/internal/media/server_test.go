@@ -76,8 +76,12 @@ func (f *fakePublisher) Enqueue(ctx context.Context, topic, eventID string, payl
 }
 
 func newTestHandler(store Store, publisher EventPublisher, mediaDir string) *Handler {
-	h := NewHandler(store, publisher, mediaDir, "http://test-base", 900*time.Second)
-	h.Now = func() time.Time { return time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC) }
+	mediaStore := NewLocalMediaStore(mediaDir, "http://test-base", 900*time.Second)
+	fixedNow := func() time.Time { return time.Date(2026, 7, 4, 12, 0, 0, 0, time.UTC) }
+	mediaStore.Now = fixedNow
+
+	h := NewHandler(store, publisher, mediaStore, mediaDir)
+	h.Now = fixedNow
 	return h
 }
 
@@ -173,6 +177,79 @@ func TestHandleUploadURL_UnsupportedContentType(t *testing.T) {
 	mux := newTestMux(newTestHandler(store, &fakePublisher{}, t.TempDir()))
 
 	body := `{"purpose":"baseline_frame","content_type":"image/gif","capture_id":"cap_1","audience_id":"aud_1"}`
+	req := httptest.NewRequest(http.MethodPost, "/sessions/sess_1/media/upload-url", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandleUploadURL_EvidenceFrame covers Step 7 of
+// plan/mood-wave-contract-migration.md: evidence_frame requests have no
+// audience_id (a room-level tab screenshot, not a per-participant crop)
+// and require trigger_id instead.
+func TestHandleUploadURL_EvidenceFrame(t *testing.T) {
+	store := &fakeStore{}
+	mux := newTestMux(newTestHandler(store, &fakePublisher{}, t.TempDir()))
+
+	body := `{
+		"purpose": "evidence_frame",
+		"content_type": "image/jpeg",
+		"capture_id": "cap_ev_1",
+		"t_ms": 1783067120000,
+		"trigger_id": "trig_123"
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/sessions/sess_1/media/upload-url", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", rec.Code, rec.Body.String())
+	}
+
+	if len(store.snapshots) != 1 {
+		t.Fatalf("snapshots recorded = %d, want 1", len(store.snapshots))
+	}
+	snap := store.snapshots[0]
+	if snap.AudienceID != "" {
+		t.Errorf("AudienceID = %q, want empty for an evidence_frame capture", snap.AudienceID)
+	}
+	if snap.TriggerID != "trig_123" {
+		t.Errorf("TriggerID = %q, want trig_123", snap.TriggerID)
+	}
+
+	if len(store.refs) != 1 {
+		t.Fatalf("refs recorded = %d, want 1", len(store.refs))
+	}
+	if store.refs[0].TriggerID != "trig_123" {
+		t.Errorf("media_refs TriggerID = %q, want trig_123", store.refs[0].TriggerID)
+	}
+}
+
+func TestHandleUploadURL_EvidenceFrameMissingTriggerID(t *testing.T) {
+	store := &fakeStore{}
+	mux := newTestMux(newTestHandler(store, &fakePublisher{}, t.TempDir()))
+
+	body := `{"purpose":"evidence_frame","content_type":"image/jpeg","capture_id":"cap_ev_1","t_ms":1783067120000}`
+	req := httptest.NewRequest(http.MethodPost, "/sessions/sess_1/media/upload-url", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", rec.Code, rec.Body.String())
+	}
+	if len(store.snapshots) != 0 {
+		t.Errorf("expected no snapshot to be recorded, got %d", len(store.snapshots))
+	}
+}
+
+func TestHandleUploadURL_UnsupportedPurpose(t *testing.T) {
+	store := &fakeStore{}
+	mux := newTestMux(newTestHandler(store, &fakePublisher{}, t.TempDir()))
+
+	body := `{"purpose":"something_else","content_type":"image/jpeg","capture_id":"cap_1","t_ms":1}`
 	req := httptest.NewRequest(http.MethodPost, "/sessions/sess_1/media/upload-url", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -316,6 +393,7 @@ func TestHandleUploadComplete_FileNotUploaded(t *testing.T) {
 				SessionID:   "sess_1",
 				CaptureID:   "cap_1",
 				AudienceID:  "aud_1",
+				MediaRef:    "local://sessions/sess_1/baseline/frames/cap_1.webp",
 				ContentType: "image/webp",
 				Purpose:     "baseline_frame",
 			},

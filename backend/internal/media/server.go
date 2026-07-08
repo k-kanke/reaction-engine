@@ -3,6 +3,7 @@ package media
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -23,19 +24,17 @@ const (
 type Handler struct {
 	Store         Store
 	Events        EventPublisher
+	MediaStore    MediaStore
 	LocalMediaDir string
-	PublicBaseURL string
-	SignedURLTTL  time.Duration
 	Now           func() time.Time
 }
 
-func NewHandler(store Store, events EventPublisher, localMediaDir, publicBaseURL string, signedURLTTL time.Duration) *Handler {
+func NewHandler(store Store, events EventPublisher, mediaStore MediaStore, localMediaDir string) *Handler {
 	return &Handler{
 		Store:         store,
 		Events:        events,
+		MediaStore:    mediaStore,
 		LocalMediaDir: localMediaDir,
-		PublicBaseURL: publicBaseURL,
-		SignedURLTTL:  signedURLTTL,
 		Now:           time.Now,
 	}
 }
@@ -76,7 +75,12 @@ func (h *Handler) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ref := mediaRef(sessionID, req.CaptureID, ext)
+	uploadURL, ref, expiresAtStr, err := h.MediaStore.SignedUploadURL(ctx, sessionID, req.CaptureID, req.ContentType, ext)
+	if err != nil {
+		log.Printf("media-api: signed upload url failed: %v", err)
+		writeError(w, http.StatusInternalServerError, "failed to create upload url")
+		return
+	}
 
 	if err := h.Store.InsertCaptureSnapshot(ctx, CaptureSnapshot{
 		CaptureID:       req.CaptureID,
@@ -87,6 +91,7 @@ func (h *Handler) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 		MediaRef:        ref,
 		UploadStatus:    "pending",
 		FeatureSnapshot: req.FeatureSnapshot,
+		TriggerID:       req.TriggerID,
 	}); err != nil {
 		log.Printf("media-api: insert capture_snapshot failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to store capture snapshot")
@@ -100,6 +105,7 @@ func (h *Handler) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 		Purpose:      req.Purpose,
 		ContentType:  req.ContentType,
 		UploadStatus: "pending",
+		TriggerID:    req.TriggerID,
 	}); err != nil {
 		log.Printf("media-api: insert media_ref failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "failed to store media ref")
@@ -107,16 +113,21 @@ func (h *Handler) handleUploadURL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := contract.UploadURLResponse{
-		UploadURL: localUploadURL(h.PublicBaseURL, sessionID, req.CaptureID, ext),
+		UploadURL: uploadURL,
 		MediaRef:  ref,
 		CaptureID: req.CaptureID,
-		ExpiresAt: expiresAt(h.SignedURLTTL, h.Now()),
+		ExpiresAt: expiresAtStr,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
+// validateUploadURLRequest enforces the two shapes architecture.md's Upload
+// URL request examples show (画像フロー § Media API): baseline_frame is a
+// per-participant crop and requires audience_id; evidence_frame is a
+// room-level tab screenshot tied to the trigger that caused it and
+// requires trigger_id instead — it has no audience_id on the wire at all.
 func validateUploadURLRequest(sessionID string, req contract.UploadURLRequest) error {
 	if sessionID == "" {
 		return errors.New("session_id is required")
@@ -124,15 +135,25 @@ func validateUploadURLRequest(sessionID string, req contract.UploadURLRequest) e
 	if req.CaptureID == "" {
 		return errors.New("capture_id is required")
 	}
-	if req.AudienceID == "" {
-		return errors.New("audience_id is required")
-	}
-	if req.Purpose == "" {
-		return errors.New("purpose is required")
-	}
 	if req.ContentType == "" {
 		return errors.New("content_type is required")
 	}
+
+	switch req.Purpose {
+	case "baseline_frame":
+		if req.AudienceID == "" {
+			return errors.New("audience_id is required for purpose=baseline_frame")
+		}
+	case "evidence_frame":
+		if req.TriggerID == "" {
+			return errors.New("trigger_id is required for purpose=evidence_frame")
+		}
+	case "":
+		return errors.New("purpose is required")
+	default:
+		return fmt.Errorf("unsupported purpose: %s", req.Purpose)
+	}
+
 	return nil
 }
 
@@ -215,15 +236,13 @@ func (h *Handler) handleUploadComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ext, ok := extensionForContentType(capture.ContentType)
-	if !ok {
-		log.Printf("media-api: unknown content_type %q for capture %s/%s", capture.ContentType, sessionID, captureID)
-		writeError(w, http.StatusInternalServerError, "stored capture has unknown content_type")
+	exists, err := h.MediaStore.Exists(ctx, capture.MediaRef)
+	if err != nil {
+		log.Printf("media-api: check media exists failed for ref %s: %v", capture.MediaRef, err)
+		writeError(w, http.StatusInternalServerError, "failed to check uploaded file")
 		return
 	}
-
-	path := localFilePath(h.LocalMediaDir, sessionID, captureID, ext)
-	if _, err := os.Stat(path); err != nil {
+	if !exists {
 		writeError(w, http.StatusBadRequest, "uploaded file not found; PUT to the upload URL first")
 		return
 	}

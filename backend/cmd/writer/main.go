@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
@@ -40,6 +41,56 @@ func main() {
 	events := db.NewLocalEventStore(pool)
 	store := writer.NewStore(pool)
 
+	// JSONL_STORE_BACKEND mirrors MEDIA_STORE_BACKEND (internal/media):
+	// "local" writes to LOCAL_JSONL_DIR on this instance's own disk (fine
+	// for the single docker compose container that also runs
+	// post-session-job/pdf-renderer against the same volume); "gcs" is
+	// required once writer and post-session-job/pdf-renderer run as
+	// separate Cloud Run instances, since they don't share a filesystem
+	// (Step F of plan/gcp-deployment-runbook.md).
+	jsonlStoreBackend := os.Getenv("JSONL_STORE_BACKEND")
+	if jsonlStoreBackend == "" {
+		jsonlStoreBackend = "local"
+	}
+
+	var jsonlStore writer.JSONLStore
+	switch jsonlStoreBackend {
+	case "local":
+		jsonlStore = writer.NewLocalJSONLStore(jsonlDir)
+	case "gcs":
+		bucket := os.Getenv("GCS_JSONL_BUCKET")
+		if bucket == "" {
+			log.Fatal("writer: GCS_JSONL_BUCKET is required when JSONL_STORE_BACKEND=gcs")
+		}
+		gcsStore, err := writer.NewGCSJSONLStore(ctx, bucket, os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+		if err != nil {
+			log.Fatalf("writer: failed to create gcs jsonl store: %v", err)
+		}
+		jsonlStore = gcsStore
+	default:
+		log.Fatalf("writer: unknown JSONL_STORE_BACKEND %q (want local or gcs)", jsonlStoreBackend)
+	}
+
+	// Step G of plan/gcp-deployment-runbook.md: Cloud Run Services (unlike
+	// Jobs) require the container to listen on $PORT and respond, or the
+	// revision never becomes healthy. writer previously had no HTTP
+	// listener at all (a bare poll loop), unlike image-analysis-worker's
+	// /debug/healthz -- this was the last gap in
+	// backend-local-docker-runbook.md's Phase 15 "GET /healthz on every
+	// service" checklist item.
+	port := os.Getenv("WRITER_PORT")
+	if port == "" {
+		port = "8080"
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	go func() {
+		log.Printf("writer: healthz endpoint on :%s", port)
+		log.Fatal(http.ListenAndServe(":"+port, mux))
+	}()
+
 	log.Println("writer started")
 
 	ticker := time.NewTicker(pollInterval)
@@ -58,7 +109,7 @@ func main() {
 				continue
 			}
 
-			if ok := writeEvent(ctx, jsonlDir, store, e.ID, payload); !ok {
+			if ok := writeEvent(ctx, jsonlStore, store, e.ID, payload); !ok {
 				continue
 			}
 
@@ -72,17 +123,49 @@ func main() {
 	}
 }
 
-// writeEvent persists one feature-events payload: compact raw features (if
-// any) as JSONL, transcript_chunks (if any, Phase 11) as both JSONL and a
-// `transcripts` Postgres row, and decision_logs (if any, Phase 12) as both
-// JSONL and a `decision_logs` Postgres row. A payload from realtime_feature
-// carries Features + DecisionLogs; one from audio_chunk carries only
-// TranscriptChunks (see contract.FeatureEventPayload). Returns false if any
-// step failed, so the caller leaves the event unacked for retry.
-func writeEvent(ctx context.Context, jsonlDir string, store *writer.Store, eventID int64, payload contract.FeatureEventPayload) bool {
-	if len(payload.Features) > 0 {
-		if err := writer.AppendCompactRawFeature(jsonlDir, payload.SessionID, payload); err != nil {
-			log.Printf("writer: write compact raw feature failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+// writeEvent persists one feature-events payload: mood_wave_sample (if any,
+// Step 6 of plan/mood-wave-contract-migration.md) as JSONL only —
+// architecture.md's "Cloud SQL に mood_wave_sample 全件を insert しない"
+// policy means no Postgres row for it — trigger_events/feedback_events (if
+// any, from an accepted trigger) as both JSONL and their Postgres rows, and
+// transcript_chunks (if any, Phase 11) as both JSONL and a `transcripts`
+// Postgres row. Each event carries exactly one of these (see
+// contract.FeatureEventPayload). Returns false if any step failed, so the
+// caller leaves the event unacked for retry.
+func writeEvent(ctx context.Context, jsonlStore writer.JSONLStore, store *writer.Store, eventID int64, payload contract.FeatureEventPayload) bool {
+	if payload.MoodWaveSample != nil {
+		if err := writer.AppendMoodWaveSample(ctx, jsonlStore, payload.SessionID, payload.EventID, payload.MoodWaveSample); err != nil {
+			log.Printf("writer: write mood wave sample jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+	}
+
+	for _, trigger := range payload.TriggerEvents {
+		if err := store.EnsureSession(ctx, trigger.SessionID); err != nil {
+			log.Printf("writer: ensure session failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+		if err := store.InsertTriggerEvent(ctx, trigger); err != nil {
+			log.Printf("writer: insert trigger event failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+		if err := writer.AppendTriggerEvent(ctx, jsonlStore, trigger.SessionID, trigger.EventID, trigger); err != nil {
+			log.Printf("writer: write trigger event jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+	}
+
+	for _, feedback := range payload.FeedbackEvents {
+		if err := store.EnsureSession(ctx, feedback.SessionID); err != nil {
+			log.Printf("writer: ensure session failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+		if err := store.InsertFeedbackEvent(ctx, feedback); err != nil {
+			log.Printf("writer: insert feedback event failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			return false
+		}
+		if err := writer.AppendFeedbackEvent(ctx, jsonlStore, feedback.SessionID, feedback.EventID, feedback); err != nil {
+			log.Printf("writer: write feedback event jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
 			return false
 		}
 	}
@@ -96,23 +179,8 @@ func writeEvent(ctx context.Context, jsonlDir string, store *writer.Store, event
 			log.Printf("writer: insert transcript failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
 			return false
 		}
-		if err := writer.AppendTranscriptChunk(jsonlDir, chunk.SessionID, chunk); err != nil {
+		if err := writer.AppendTranscriptChunk(ctx, jsonlStore, chunk.SessionID, chunk.EventID, chunk); err != nil {
 			log.Printf("writer: write transcript jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
-			return false
-		}
-	}
-
-	for _, decision := range payload.DecisionLogs {
-		if err := store.EnsureSession(ctx, decision.SessionID); err != nil {
-			log.Printf("writer: ensure session failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
-			return false
-		}
-		if err := store.InsertDecisionLog(ctx, decision); err != nil {
-			log.Printf("writer: insert decision log failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
-			return false
-		}
-		if err := writer.AppendDecisionLog(jsonlDir, decision.SessionID, decision); err != nil {
-			log.Printf("writer: write decision log jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
 			return false
 		}
 	}

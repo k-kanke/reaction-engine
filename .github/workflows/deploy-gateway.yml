@@ -1,0 +1,100 @@
+name: Deploy gateway
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - backend/Dockerfile
+      - backend/go.mod
+      - backend/go.sum
+      - backend/cmd/gateway/**
+      - backend/internal/contract/**
+      - backend/internal/db/**
+      - backend/internal/gateway/**
+      - backend/internal/realtime/**
+      - backend/internal/redis/**
+      - infra/**
+      - .github/workflows/deploy-gateway.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: reaction-engine-501316
+  REGION: asia-northeast1
+  SERVICE: gateway
+  TF_VAR_project_id: reaction-engine-501316
+  TF_VAR_region: asia-northeast1
+  TF_VAR_media_bucket_name: ${{ vars.MEDIA_BUCKET_NAME }}
+  TF_VAR_terraform_state_bucket_name: ${{ vars.TERRAFORM_STATE_BUCKET_NAME }}
+  TF_VAR_media_api_invoker_members: ${{ vars.MEDIA_API_INVOKER_MEMBERS_JSON }}
+
+jobs:
+  deploy:
+    name: Build and deploy r-gateway
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Compute image tag
+        run: echo "TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Terraform init
+        working-directory: infra/environments/prod
+        run: terraform init -input=false
+
+      - name: Read current media-api image tag
+        id: media-api
+        working-directory: infra/environments/prod
+        run: |
+          tag="$(
+            terraform state show module.media_api_service.google_cloud_run_v2_service.this \
+              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/media-api:([^"]+)".*/\1/p' \
+              | head -n 1
+          )"
+          if [ -z "$tag" ]; then
+            echo "Failed to read current media-api image tag from Terraform state" >&2
+            exit 1
+          fi
+          echo "MEDIA_API_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Build and push gateway image
+        run: |
+          image="${REGION}-docker.pkg.dev/${PROJECT_ID}/reaction-engine-backend/${SERVICE}:${TAG}"
+          cat > /tmp/cloudbuild-gateway.yaml <<EOF
+          steps:
+            - name: 'gcr.io/cloud-builders/docker'
+              args: ['build', '--platform', 'linux/amd64', '--build-arg', 'SERVICE=${SERVICE}', '-t', '${image}', '-f', 'backend/Dockerfile', 'backend']
+          images: ['${image}']
+          EOF
+          gcloud builds submit \
+            --project="${PROJECT_ID}" \
+            --region="${REGION}" \
+            --config=/tmp/cloudbuild-gateway.yaml \
+            .
+
+      - name: Deploy gateway with Terraform
+        working-directory: infra/environments/prod
+        run: |
+          terraform apply -input=false -auto-approve -lock-timeout=5m \
+            -var="gateway_image_tag=${TAG}" \
+            -var="media_api_image_tag=${MEDIA_API_IMAGE_TAG}"

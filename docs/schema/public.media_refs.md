@@ -15,6 +15,7 @@
 | upload_status | text |  | false |  |  |  |
 | created_at | timestamp with time zone | now() | false |  |  |  |
 | uploaded_at | timestamp with time zone |  | true |  |  |  |
+| trigger_id | text |  | true |  |  |  |
 
 ## Constraints
 
@@ -51,6 +52,7 @@ erDiagram
   text upload_status
   timestamp_with_time_zone created_at
   timestamp_with_time_zone uploaded_at
+  text trigger_id
 }
 "public.sessions" {
   text session_id
@@ -73,6 +75,7 @@ erDiagram
   jsonb feature_snapshot
   timestamp_with_time_zone created_at
   timestamp_with_time_zone uploaded_at
+  text trigger_id
 }
 ```
 

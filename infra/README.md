@@ -37,3 +37,43 @@ infra/
 ```
 
 Each environment should own its `main.tf`, `variables.tf`, `outputs.tf`, and `terraform.tfvars.example`.
+
+Only `environments/prod` is actually implemented. There is a single real GCP
+project behind this app, so a separate `dev` Terraform environment would
+just be a second piece of state to keep in sync for no benefit;
+`environments/dev/` stays an empty placeholder until (if ever) a second
+project is needed.
+
+## Getting started (first time on this machine)
+
+1. Install the gcloud CLI (needed for auth even though we drive everything
+   through Terraform, not `gcloud` commands directly):
+   ```bash
+   brew install --cask google-cloud-sdk
+   ```
+2. Authenticate Application Default Credentials -- this is what the
+   `google` Terraform provider actually reads. It uses *your own* Google
+   account, not a service account key, as long as you already have
+   Owner/Editor on the GCP project:
+   ```bash
+   gcloud auth application-default login
+   ```
+   (opens a browser; log in with the account that has access to the project)
+3. Set up your local vars (never commit `terraform.tfvars`, only the
+   `.example` file):
+   ```bash
+   cd infra/environments/prod
+   cp terraform.tfvars.example terraform.tfvars
+   # edit terraform.tfvars: set project_id to your actual GCP project ID
+   ```
+4. Standard Terraform flow:
+   ```bash
+   terraform init
+   terraform plan
+   terraform apply
+   ```
+
+State lives in a `gcs` backend (see `environments/prod/versions.tf` and
+`environments/prod/README.md`), in a bucket that environment manages for
+itself via `module.terraform_state_bucket`. `terraform init` will pick this
+up automatically -- no separate setup needed here.
