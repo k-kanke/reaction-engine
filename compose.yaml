@@ -58,6 +58,10 @@ services:
         SERVICE: writer
     env_file:
       - ./backend/.env.local
+    environment:
+      WRITER_PORT: 8083
+    ports:
+      - "8083:8083"
     volumes:
       - ./tmp/jsonl:/var/reaction/jsonl
     depends_on:

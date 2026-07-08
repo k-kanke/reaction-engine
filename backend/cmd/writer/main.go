@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
@@ -69,6 +70,26 @@ func main() {
 	default:
 		log.Fatalf("writer: unknown JSONL_STORE_BACKEND %q (want local or gcs)", jsonlStoreBackend)
 	}
+
+	// Step G of plan/gcp-deployment-runbook.md: Cloud Run Services (unlike
+	// Jobs) require the container to listen on $PORT and respond, or the
+	// revision never becomes healthy. writer previously had no HTTP
+	// listener at all (a bare poll loop), unlike image-analysis-worker's
+	// /debug/healthz -- this was the last gap in
+	// backend-local-docker-runbook.md's Phase 15 "GET /healthz on every
+	// service" checklist item.
+	port := os.Getenv("WRITER_PORT")
+	if port == "" {
+		port = "8080"
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+	go func() {
+		log.Printf("writer: healthz endpoint on :%s", port)
+		log.Fatal(http.ListenAndServe(":"+port, mux))
+	}()
 
 	log.Println("writer started")
 
