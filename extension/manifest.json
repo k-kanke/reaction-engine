@@ -20,6 +20,7 @@
   ],
   "host_permissions": [
     "https://meet.google.com/*",
+    "https://r-media-api-ycqdhsf4ca-an.a.run.app/*",
     "http://localhost:8081/*"
   ],
   "content_scripts": [

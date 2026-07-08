@@ -31,6 +31,17 @@ variable "versioning_enabled" {
   description = "Keep old object versions on overwrite/delete. Turn on for buckets holding data you can't regenerate, e.g. Terraform state."
 }
 
+variable "cors" {
+  type = list(object({
+    origins          = list(string)
+    methods          = list(string)
+    response_headers = list(string)
+    max_age_seconds  = number
+  }))
+  default     = []
+  description = "Optional bucket CORS rules. Needed when browsers upload directly to signed URLs."
+}
+
 variable "iam_bindings" {
   type = list(object({
     role    = string

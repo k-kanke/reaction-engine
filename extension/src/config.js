@@ -4,6 +4,6 @@
 // easy to override per-environment (e.g. a build step swapping this file for
 // Cloud Run URLs) without touching sidebar.js.
 window.REACTION_ENGINE_CONFIG = window.REACTION_ENGINE_CONFIG || {
-  gatewayWsUrl: "ws://localhost:8080/ws",
-  mediaApiBaseUrl: "http://localhost:8081"
+  gatewayWsUrl: "wss://r-gateway-ycqdhsf4ca-an.a.run.app/ws",
+  mediaApiBaseUrl: "https://r-media-api-ycqdhsf4ca-an.a.run.app"
 };

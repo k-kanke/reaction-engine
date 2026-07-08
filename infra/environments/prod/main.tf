@@ -43,6 +43,15 @@ module "media_bucket" {
   name       = var.media_bucket_name
   location   = var.region
 
+  cors = [
+    {
+      origins          = ["*"]
+      methods          = ["GET", "HEAD", "PUT", "POST", "OPTIONS"]
+      response_headers = ["Content-Type", "x-goog-resumable"]
+      max_age_seconds  = 3600
+    }
+  ]
+
   iam_bindings = [
     {
       role    = "roles/storage.objectAdmin"
@@ -104,11 +113,13 @@ module "backend_images" {
   ]
 }
 
-# Step E (deploy plan): the media-api Cloud Run service itself. No
-# application-level auth exists yet (see backend/internal/media), so
-# roles/run.invoker is restricted to media_api_invoker_members rather than
-# allUsers -- widen that once real auth is built, since Chrome extension
-# clients can't hold GCP identity tokens anyway.
+# Step E (deploy plan): the media-api Cloud Run service itself. Originally
+# restricted to media_api_invoker_members since no application-level auth
+# existed yet -- but that also meant the Chrome extension itself (which
+# can't hold a GCP identity token) got rejected before reaching the
+# container, so upload-url/complete calls from real sessions silently never
+# happened and no baseline/evidence frame ever reached GCS. Now public, same
+# tradeoff module.gateway_service already accepts below.
 module "media_api_service" {
   source = "../../modules/cloud-run-service"
 
@@ -128,7 +139,8 @@ module "media_api_service" {
     DATABASE_URL        = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
   }
 
-  invoker_members = concat(var.media_api_invoker_members, [module.tester_service_account.member])
+  invoker_members       = concat(var.media_api_invoker_members, [module.tester_service_account.member])
+  allow_unauthenticated = true
 }
 
 # gcloud auth print-identity-token for a *user* account carries gcloud's
