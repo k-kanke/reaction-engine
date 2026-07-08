@@ -25,6 +25,12 @@ binding. Notable choices baked in:
   service; set `invoker_members` to specific principals, or
   `allow_unauthenticated = true` only if the service must be reachable
   without an identity token.
+- **VPC connector is opt-in.** Memorystore for Redis only has a
+  VPC-internal IP, unlike Cloud SQL's built-in connector above. Set
+  `vpc_connector` (from `modules/vpc`'s `connector_id` output) for any
+  service that needs to reach it (`r-gateway`, `r-image-worker`) — leave it
+  `null` for services that don't (`r-media-api`, `r-writer`). Step I of
+  `plan/gcp-deployment-runbook.md`.
 
 ## Usage
 

@@ -144,3 +144,77 @@ resource "google_service_account_iam_member" "tester_service_account_impersonato
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = each.value
 }
+
+# Step I (plan/gcp-deployment-runbook.md): dedicated VPC + Serverless VPC
+# Access connector so Cloud Run services can reach Memorystore for Redis
+# (VPC-internal IP only -- Cloud Run isn't in any VPC by default).
+module "vpc" {
+  source = "../../modules/vpc"
+
+  project_id            = var.project_id
+  region                = var.region
+  network_name          = "reaction-engine-vpc"
+  connector_subnet_cidr = "10.8.0.0/28"
+  connector_name        = "reaction-engine-connector"
+}
+
+# Step I: Memorystore for Redis, architecture.md's Realtime state store
+# (mood_wave/transcript recent windows, trigger/feedback cooldown --
+# internal/redis/client.go). BASIC tier (no replica) for MVP traffic; see
+# modules/memorystore/README.md for the tradeoffs of upgrading later.
+module "redis" {
+  source = "../../modules/memorystore"
+
+  project_id     = var.project_id
+  region         = var.region
+  instance_name  = "reaction-engine-redis"
+  network_id     = module.vpc.network_id
+  memory_size_gb = 1
+}
+
+# Step J (plan/gcp-deployment-runbook.md): the realtime WebSocket entry
+# point. Needs both Cloud SQL (local_events polling, participant baselines)
+# and Redis (mood wave / transcript recent windows, feedback cooldown) --
+# the latter via module.vpc's connector, unlike media-api which only needs
+# the Cloud SQL built-in volume.
+module "gateway_service_account" {
+  source = "../../modules/service-account"
+
+  project_id    = var.project_id
+  account_id    = "reaction-engine-gateway"
+  display_name  = "Reaction Engine Gateway"
+  project_roles = ["roles/cloudsql.client"]
+}
+
+module "gateway_service" {
+  source = "../../modules/cloud-run-service"
+
+  project_id = var.project_id
+  location   = var.region
+
+  service_name              = "r-gateway"
+  image                     = "${module.backend_images.repository_url}/gateway:${var.gateway_image_tag}"
+  service_account_email     = module.gateway_service_account.email
+  container_port            = 8080
+  cloudsql_connection_names = [module.db.connection_name]
+  vpc_connector             = module.vpc.connector_id
+  vpc_egress                = "PRIVATE_RANGES_ONLY"
+
+  env_vars = {
+    GATEWAY_PORT    = "8080"
+    REDIS_ADDR      = "${module.redis.host}:${module.redis.port}"
+    ENABLE_REAL_LLM = "false" # flips once Phase 14 Step 14-6 (Vertex AI) lands
+    DATABASE_URL    = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+  }
+
+  # Chrome extension clients connect directly and can't hold GCP identity
+  # tokens, so unlike media-api's invoker_members restriction this has to
+  # be public -- there's no application-level auth to fall back on yet
+  # (same known gap noted in plan/gcp-deployment-runbook.md Step O).
+  allow_unauthenticated = true
+
+  # Keep at least one warm instance so an established WebSocket connection
+  # doesn't get cut by a cold start, and cap low for MVP traffic.
+  min_instance_count = 1
+  max_instance_count = 3
+}

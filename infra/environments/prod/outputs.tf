@@ -52,3 +52,17 @@ output "tester_service_account_email" {
   value       = module.tester_service_account.email
   description = "Impersonate this (if you're in media_api_invoker_members) to mint a correctly-audienced identity token for testing IAM-protected Cloud Run services. See README."
 }
+
+output "redis_host" {
+  value       = module.redis.host
+  description = "VPC-internal IP, only reachable from resources on module.vpc (e.g. r-gateway, r-image-worker via the Serverless VPC Access connector). Combine with redis_port as REDIS_ADDR."
+}
+
+output "redis_port" {
+  value = module.redis.port
+}
+
+output "gateway_url" {
+  value       = module.gateway_service.uri
+  description = "r-gateway's Cloud Run URL (wss://<this-without-https>/ws for the WebSocket endpoint). Publicly reachable (allow_unauthenticated) since Chrome extension clients can't hold GCP identity tokens -- see plan/gcp-deployment-runbook.md Step J."
+}

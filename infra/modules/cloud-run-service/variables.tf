@@ -82,3 +82,15 @@ variable "deletion_protection" {
   default     = true
   description = "Block `terraform destroy` from deleting this service. Keep true outside of throwaway testing."
 }
+
+variable "vpc_connector" {
+  type        = string
+  default     = null
+  description = "Serverless VPC Access connector ID (modules/vpc's connector_id output). Set when the service needs to reach VPC-internal resources like Memorystore. Leave null for services that don't (e.g. media-api, which only talks to Cloud SQL over the built-in Cloud SQL volume -- no VPC connector needed for that)."
+}
+
+variable "vpc_egress" {
+  type        = string
+  default     = "PRIVATE_RANGES_ONLY"
+  description = "Only used when vpc_connector is set. PRIVATE_RANGES_ONLY (default) sends only RFC1918 traffic through the connector, so calls to public APIs (e.g. Vertex AI, Secret Manager) still go direct; ALL_TRAFFIC routes everything through it."
+}
