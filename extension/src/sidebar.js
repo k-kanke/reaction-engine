@@ -29,6 +29,8 @@ const elements = {
   stopButton: document.getElementById("stopButton"),
   micPermButton: document.getElementById("micPermButton"),
   eventLog: document.getElementById("eventLog"),
+  feedbackPanel: document.getElementById("feedbackPanel"),
+  feedbackEmpty: document.getElementById("feedbackEmpty"),
   exportButton: document.getElementById("exportButton"),
   geminiApiKey: document.getElementById("geminiApiKey"),
   saveApiKeyButton: document.getElementById("saveApiKeyButton"),
@@ -1827,7 +1829,11 @@ async function toggleWebSocket() {
       logEvent({ type: "websocket_open", url });
     });
     ws.addEventListener("message", (event) => {
-      logEvent({ type: "feedback_event", payload: safeParse(event.data) });
+      const payload = safeParse(event.data);
+      logEvent({ type: "feedback_event", payload });
+      if (payload?.type === "feedback_event") {
+        renderFeedback(payload);
+      }
     });
     ws.addEventListener("close", () => {
       ws = null;
@@ -1863,6 +1869,44 @@ function logEvent(event) {
 
   while (elements.eventLog.children.length > 30) {
     elements.eventLog.lastElementChild?.remove();
+  }
+}
+
+// Dev-only display for contract.FeedbackEvent (backend/internal/contract/feedback.go).
+// architecture.md lists sidebar rendering of feedback_event as in-scope but
+// not yet built (only mood wave / moment snapshot are); this is a minimal
+// stand-in until a real design exists.
+function renderFeedback(feedback) {
+  if (elements.feedbackEmpty) {
+    elements.feedbackEmpty.style.display = "none";
+  }
+
+  const item = document.createElement("li");
+  item.className = `feedback-card severity-${feedback.severity || "info"}`;
+
+  const meta = document.createElement("div");
+  meta.className = "feedback-meta";
+  meta.textContent = [feedback.feedback_type, feedback.severity, feedback.source]
+    .filter(Boolean)
+    .join(" / ");
+  item.appendChild(meta);
+
+  const message = document.createElement("p");
+  message.className = "feedback-message";
+  message.textContent = feedback.message || "(no message)";
+  item.appendChild(message);
+
+  if (feedback.evidence_quote) {
+    const quote = document.createElement("p");
+    quote.className = "feedback-quote";
+    quote.textContent = `"${feedback.evidence_quote}"`;
+    item.appendChild(quote);
+  }
+
+  elements.feedbackPanel.prepend(item);
+
+  while (elements.feedbackPanel.children.length > 5) {
+    elements.feedbackPanel.lastElementChild?.remove();
   }
 }
 
