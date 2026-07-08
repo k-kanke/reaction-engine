@@ -210,7 +210,7 @@ module "gateway_service" {
     ENABLE_REAL_LLM       = "true"
     VERTEX_PROJECT        = var.project_id
     VERTEX_LOCATION       = var.region
-    VERTEX_REALTIME_MODEL = "gemini-1.5-flash"
+    VERTEX_REALTIME_MODEL = "gemini-2.5-flash"
     ENABLE_REAL_STT       = "true"
     STT_LANGUAGE_CODE     = "ja-JP"
     DATABASE_URL          = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"

@@ -44,7 +44,7 @@ func main() {
 	if os.Getenv("ENABLE_REAL_LLM") == "true" {
 		projectID := firstNonEmpty(os.Getenv("VERTEX_PROJECT"), os.Getenv("GOOGLE_CLOUD_PROJECT"))
 		location := firstNonEmpty(os.Getenv("VERTEX_LOCATION"), os.Getenv("GCP_REGION"), "asia-northeast1")
-		model := firstNonEmpty(os.Getenv("VERTEX_REALTIME_MODEL"), "gemini-1.5-flash")
+		model := firstNonEmpty(os.Getenv("VERTEX_REALTIME_MODEL"), "gemini-2.5-flash")
 		vertexGenerator, err := realtime.NewVertexFeedbackGenerator(context.Background(), projectID, location, model)
 		if err != nil {
 			log.Fatalf("gateway: initialize realtime vertex generator: %v", err)
