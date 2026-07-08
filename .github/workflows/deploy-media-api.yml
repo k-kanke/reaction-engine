@@ -27,6 +27,7 @@ env:
   TF_VAR_project_id: reaction-engine-501316
   TF_VAR_region: asia-northeast1
   TF_VAR_media_bucket_name: ${{ vars.MEDIA_BUCKET_NAME }}
+  TF_VAR_jsonl_bucket_name: ${{ vars.JSONL_BUCKET_NAME }}
   TF_VAR_terraform_state_bucket_name: ${{ vars.TERRAFORM_STATE_BUCKET_NAME }}
   TF_VAR_media_api_invoker_members: ${{ vars.MEDIA_API_INVOKER_MEMBERS_JSON }}
 
@@ -74,6 +75,81 @@ jobs:
             exit 1
           fi
           echo "GATEWAY_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Read current writer image tag
+        id: writer
+        working-directory: infra/environments/prod
+        run: |
+          tag="$(
+            terraform state show module.writer_service.google_cloud_run_v2_service.this \
+              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/writer:([^"]+)".*/\1/p' \
+              | head -n 1
+          )"
+          if [ -z "$tag" ]; then
+            echo "Failed to read current writer image tag from Terraform state" >&2
+            exit 1
+          fi
+          echo "WRITER_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Read current image-analysis-worker image tag
+        id: image-analysis-worker
+        working-directory: infra/environments/prod
+        run: |
+          tag="$(
+            terraform state show module.image_analysis_worker_service.google_cloud_run_v2_service.this \
+              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/image-analysis-worker:([^"]+)".*/\1/p' \
+              | head -n 1
+          )"
+          if [ -z "$tag" ]; then
+            echo "Failed to read current image-analysis-worker image tag from Terraform state" >&2
+            exit 1
+          fi
+          echo "IMAGE_ANALYSIS_WORKER_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Read current post-session-job image tag
+        id: post-session-job
+        working-directory: infra/environments/prod
+        run: |
+          tag="$(
+            terraform state show module.post_session_job.google_cloud_run_v2_job.this \
+              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/post-session-job:([^"]+)".*/\1/p' \
+              | head -n 1
+          )"
+          if [ -z "$tag" ]; then
+            echo "Failed to read current post-session-job image tag from Terraform state" >&2
+            exit 1
+          fi
+          echo "POST_SESSION_JOB_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Read current pdf-renderer image tag
+        id: pdf-renderer
+        working-directory: infra/environments/prod
+        run: |
+          tag="$(
+            terraform state show module.pdf_renderer_job.google_cloud_run_v2_job.this \
+              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/pdf-renderer:([^"]+)".*/\1/p' \
+              | head -n 1
+          )"
+          if [ -z "$tag" ]; then
+            echo "Failed to read current pdf-renderer image tag from Terraform state" >&2
+            exit 1
+          fi
+          echo "PDF_RENDERER_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Read current gmail-sender image tag
+        id: gmail-sender
+        working-directory: infra/environments/prod
+        run: |
+          tag="$(
+            terraform state show module.gmail_sender_job.google_cloud_run_v2_job.this \
+              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/gmail-sender:([^"]+)".*/\1/p' \
+              | head -n 1
+          )"
+          if [ -z "$tag" ]; then
+            echo "Failed to read current gmail-sender image tag from Terraform state" >&2
+            exit 1
+          fi
+          echo "GMAIL_SENDER_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
 
       - name: Build and push media-api image
         run: |
@@ -128,4 +204,9 @@ jobs:
         run: |
           terraform apply -input=false -auto-approve -lock-timeout=5m \
             -var="media_api_image_tag=${TAG}" \
-            -var="gateway_image_tag=${GATEWAY_IMAGE_TAG}"
+            -var="gateway_image_tag=${GATEWAY_IMAGE_TAG}" \
+            -var="writer_image_tag=${WRITER_IMAGE_TAG}" \
+            -var="image_analysis_worker_image_tag=${IMAGE_ANALYSIS_WORKER_IMAGE_TAG}" \
+            -var="post_session_job_image_tag=${POST_SESSION_JOB_IMAGE_TAG}" \
+            -var="pdf_renderer_image_tag=${PDF_RENDERER_IMAGE_TAG}" \
+            -var="gmail_sender_image_tag=${GMAIL_SENDER_IMAGE_TAG}"

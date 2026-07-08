@@ -8,6 +8,7 @@ import (
 
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	"github.com/k-kanke/reaction-engine/backend/internal/gateway"
+	"github.com/k-kanke/reaction-engine/backend/internal/postsessiontrigger"
 	"github.com/k-kanke/reaction-engine/backend/internal/realtime"
 	"github.com/k-kanke/reaction-engine/backend/internal/redis"
 	"github.com/k-kanke/reaction-engine/backend/internal/speech"
@@ -64,7 +65,18 @@ func main() {
 		recognizer = googleRecognizer
 	}
 
-	handler := gateway.NewHandlerWithSTT(redisClient, events, generator, recognizer, sttLanguageCode)
+	var postSessionTrigger postsessiontrigger.Trigger
+	if os.Getenv("ENABLE_POST_SESSION_JOBS") == "true" {
+		projectID := firstNonEmpty(os.Getenv("GCP_PROJECT"), os.Getenv("GOOGLE_CLOUD_PROJECT"))
+		region := firstNonEmpty(os.Getenv("GCP_REGION"), "asia-northeast1")
+		cloudRunTrigger, err := postsessiontrigger.NewCloudRunTrigger(context.Background(), projectID, region)
+		if err != nil {
+			log.Fatalf("gateway: initialize post-session trigger: %v", err)
+		}
+		postSessionTrigger = cloudRunTrigger
+	}
+
+	handler := gateway.NewHandlerWithPostSessionTrigger(redisClient, events, generator, recognizer, sttLanguageCode, postSessionTrigger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

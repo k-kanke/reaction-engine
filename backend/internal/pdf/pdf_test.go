@@ -4,65 +4,36 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"github.com/signintech/gopdf"
 )
 
-func TestSanitizeLine(t *testing.T) {
-	cases := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{"plain ascii", "session_id=sess_1", "session_id=sess_1"},
-		{"all japanese", "直近秒で反応が下がっています", "(non-ASCII content omitted)"},
-		{"mixed with ascii digits surviving", "severity=low 直近30秒", "severity=low 30 (non-ASCII content omitted)"},
-		{"empty", "", ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := sanitizeLine(tc.input); got != tc.want {
-				t.Errorf("sanitizeLine(%q) = %q, want %q", tc.input, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestEscapeText(t *testing.T) {
-	cases := []struct{ input, want string }{
-		{"plain", "plain"},
-		{"a(b)c", `a\(b\)c`},
-		{`back\slash`, `back\\slash`},
-	}
-	for _, tc := range cases {
-		if got := escapeText(tc.input); got != tc.want {
-			t.Errorf("escapeText(%q) = %q, want %q", tc.input, got, tc.want)
-		}
-	}
-}
-
-func TestRender_SinglePage(t *testing.T) {
+func TestRender_ValidPDFHeader(t *testing.T) {
 	out, err := Render("Test Report", []string{"line one", "line two"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !bytes.HasPrefix(out, []byte("%PDF-1.4")) {
-		t.Errorf("output doesn't start with %%PDF-1.4 header")
+	if !bytes.HasPrefix(out, []byte("%PDF-")) {
+		t.Errorf("output doesn't start with a %%PDF- header")
 	}
-	if !bytes.HasSuffix(out, []byte("%%EOF")) {
-		t.Errorf("output doesn't end with %%%%EOF trailer")
+}
+
+func TestRender_JapaneseContentDoesNotError(t *testing.T) {
+	out, err := Render("レポート", []string{
+		"直近30秒で反応が下がっています",
+		"severity=low source=rule",
+		"重要なウィンドウ: 発言内容を踏まえた要約がここに入ります。",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error rendering Japanese content: %v", err)
 	}
-	if got := bytes.Count(out, []byte("/Type /Page ")); got != 1 {
-		t.Errorf("page count = %d, want 1 (2 lines + title well under linesPerPage)", got)
-	}
-	if !bytes.Contains(out, []byte("(Test Report)")) {
-		t.Errorf("output doesn't contain the title text")
-	}
-	if !bytes.Contains(out, []byte("(line one)")) {
-		t.Errorf("output doesn't contain 'line one'")
+	if len(out) == 0 {
+		t.Errorf("expected non-empty output")
 	}
 }
 
 func TestRender_MultiPage(t *testing.T) {
-	lines := make([]string, linesPerPage*2+5) // forces 3 pages (title+blank pushes past 2*linesPerPage)
+	lines := make([]string, 80)
 	for i := range lines {
 		lines[i] = "line"
 	}
@@ -71,36 +42,66 @@ func TestRender_MultiPage(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	pageCount := strings.Count(string(out), "/Type /Page ")
-	if pageCount != 3 {
-		t.Errorf("page count = %d, want 3 (title+blank+%d lines at %d/page)", pageCount, len(lines), linesPerPage)
-	}
-
-	// /Count in the Pages object should match.
-	if !strings.Contains(string(out), "/Count 3") {
-		t.Errorf("output missing /Count 3 in the Pages object")
+	// "/Type /Page\n" (note the trailing newline) matches only leaf Page
+	// objects, not the "/Type /Pages" container object.
+	pageCount := strings.Count(string(out), "/Type /Page\n")
+	if pageCount < 2 {
+		t.Errorf("page count = %d, want at least 2 for %d lines", pageCount, len(lines))
 	}
 }
 
-func TestRender_NonASCIIContentOmittedNotCorrupted(t *testing.T) {
-	out, err := Render("Report", []string{"直近30秒で反応が下がっています"})
+func TestWrapLine_StaysWithinWidth(t *testing.T) {
+	pdf := &gopdf.GoPdf{}
+	pdf.Start(gopdf.Config{PageSize: *gopdf.PageSizeA4})
+	if err := pdf.AddTTFFontData(fontFamily, notoSansJPFont); err != nil {
+		t.Fatalf("load font: %v", err)
+	}
+	if err := pdf.SetFont(fontFamily, "", fontSize); err != nil {
+		t.Fatalf("set font: %v", err)
+	}
+
+	const maxWidth = 100.0
+	input := "直近30秒で反応が下がっています。これは十分に長い一文で複数行に折り返されるはずです。"
+
+	wrapped, err := wrapLine(pdf, input, maxWidth)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("wrapLine: %v", err)
 	}
-	if bytes.Contains(out, []byte("直近")) {
-		t.Errorf("raw non-ASCII bytes leaked into the PDF content stream")
+	if len(wrapped) < 2 {
+		t.Fatalf("expected wrapping to produce multiple lines, got %d", len(wrapped))
 	}
-	if !bytes.Contains(out, []byte("non-ASCII content omitted")) {
-		t.Errorf("expected the omission marker in the output")
+
+	var rejoined strings.Builder
+	for _, w := range wrapped {
+		width, err := pdf.MeasureTextWidth(w)
+		if err != nil {
+			t.Fatalf("measure wrapped line: %v", err)
+		}
+		if width > maxWidth {
+			t.Errorf("wrapped line %q has width %.1f, want <= %.1f", w, width, maxWidth)
+		}
+		rejoined.WriteString(w)
+	}
+	if rejoined.String() != input {
+		t.Errorf("wrapped lines rejoined = %q, want %q (no characters lost)", rejoined.String(), input)
 	}
 }
 
-func TestRender_ParenthesesEscaped(t *testing.T) {
-	out, err := Render("Report", []string{"severity=low (rule)"})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+func TestWrapLine_Empty(t *testing.T) {
+	pdf := &gopdf.GoPdf{}
+	pdf.Start(gopdf.Config{PageSize: *gopdf.PageSizeA4})
+	if err := pdf.AddTTFFontData(fontFamily, notoSansJPFont); err != nil {
+		t.Fatalf("load font: %v", err)
 	}
-	if !bytes.Contains(out, []byte(`severity=low \(rule\)`)) {
-		t.Errorf("parentheses in report content were not escaped in the content stream")
+	if err := pdf.SetFont(fontFamily, "", fontSize); err != nil {
+		t.Fatalf("set font: %v", err)
+	}
+
+	got, err := wrapLine(pdf, "", 100.0)
+	if err != nil {
+		t.Fatalf("wrapLine: %v", err)
+	}
+	if len(got) != 1 || got[0] != "" {
+		t.Errorf("wrapLine(\"\") = %v, want a single empty line", got)
 	}
 }
