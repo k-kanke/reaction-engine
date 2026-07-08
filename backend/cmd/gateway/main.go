@@ -52,6 +52,8 @@ func main() {
 		generator = vertexGenerator
 	}
 
+	realtime.DebugLogEvidencePack = os.Getenv("REALTIME_DEBUG_LOG") == "true"
+
 	var recognizer speech.Recognizer
 	sttLanguageCode := firstNonEmpty(os.Getenv("STT_LANGUAGE_CODE"), "ja-JP")
 	if os.Getenv("ENABLE_REAL_STT") == "true" {
