@@ -41,7 +41,33 @@ func main() {
 
 	store := postsession.NewPGStore(pool)
 
-	moodWaveSamples, err := writer.ReadMoodWaveSamples(jsonlDir, *sessionID)
+	// JSONL_STORE_BACKEND mirrors cmd/writer's flag (Step F of
+	// plan/gcp-deployment-runbook.md): must point at the same backend
+	// writer used to persist mood_wave_sample, or this reads back empty.
+	jsonlStoreBackend := os.Getenv("JSONL_STORE_BACKEND")
+	if jsonlStoreBackend == "" {
+		jsonlStoreBackend = "local"
+	}
+
+	var jsonlStore writer.JSONLStore
+	switch jsonlStoreBackend {
+	case "local":
+		jsonlStore = writer.NewLocalJSONLStore(jsonlDir)
+	case "gcs":
+		bucket := os.Getenv("GCS_JSONL_BUCKET")
+		if bucket == "" {
+			log.Fatal("post-session-job: GCS_JSONL_BUCKET is required when JSONL_STORE_BACKEND=gcs")
+		}
+		gcsStore, err := writer.NewGCSJSONLStore(ctx, bucket, os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+		if err != nil {
+			log.Fatalf("post-session-job: failed to create gcs jsonl store: %v", err)
+		}
+		jsonlStore = gcsStore
+	default:
+		log.Fatalf("post-session-job: unknown JSONL_STORE_BACKEND %q (want local or gcs)", jsonlStoreBackend)
+	}
+
+	moodWaveSamples, err := writer.ReadMoodWaveSamples(ctx, jsonlStore, *sessionID)
 	if err != nil {
 		log.Fatalf("post-session-job: read mood wave samples failed: %v", err)
 	}

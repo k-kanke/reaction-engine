@@ -3,7 +3,9 @@ package media
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -45,6 +47,20 @@ func (s *LocalMediaStore) Exists(ctx context.Context, mediaRef string) (bool, er
 
 func (s *LocalMediaStore) Read(ctx context.Context, mediaRef string) ([]byte, error) {
 	return os.ReadFile(s.path(mediaRef))
+}
+
+func (s *LocalMediaStore) Write(ctx context.Context, sessionID string, parts []string, data []byte, contentType string) (string, error) {
+	relPath := path.Join(append([]string{"sessions", sessionID}, parts...)...)
+	dest := filepath.Join(s.Dir, filepath.FromSlash(relPath))
+
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return "", fmt.Errorf("media: prepare storage dir for %q: %w", relPath, err)
+	}
+	if err := os.WriteFile(dest, data, 0o644); err != nil {
+		return "", fmt.Errorf("media: write %q: %w", relPath, err)
+	}
+
+	return "local://" + relPath, nil
 }
 
 // path resolves a local:// media_ref (e.g.

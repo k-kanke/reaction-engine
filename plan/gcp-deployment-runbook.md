@@ -33,56 +33,56 @@
 | --- | --- | --- | --- | --- |
 | gateway | Cloud Run **Service** | 常駐(WebSocket) | Cloud SQL, Redis | 未デプロイ |
 | media-api | Cloud Run **Service** | 常駐(HTTP) | Cloud SQL, Cloud Storage | **デプロイ済み**(`r-media-api`) |
-| writer | Cloud Run **Service** | 常駐(2秒ポーリング) | Cloud SQL, (JSONL 出力先) | 未デプロイ、要コード修正(後述 Step F/G) |
+| writer | Cloud Run **Service** | 常駐(2秒ポーリング) | Cloud SQL, Cloud Storage(JSONL、Step F対応済み) | 未デプロイ、コード修正は完了。残るは Step G(`/healthz`) |
 | image-analysis-worker | Cloud Run **Service** | 常駐(2秒ポーリング、debug HTTP あり) | Cloud SQL, Redis, Cloud Storage | 未デプロイ |
-| post-session-job | Cloud Run **Job** | バッチ(`--session-id` 必須) | Cloud SQL, (JSONL 読み込み元) | 未デプロイ、要コード修正(Step F) |
-| pdf-renderer | Cloud Run **Job** | バッチ(`--session-id` 必須) | Cloud SQL, (PDF 出力先) | 未デプロイ、要コード修正(Step F) |
+| post-session-job | Cloud Run **Job** | バッチ(`--session-id` 必須) | Cloud SQL, Cloud Storage(JSONL、Step F対応済み) | 未デプロイ、コード修正は完了 |
+| pdf-renderer | Cloud Run **Job** | バッチ(`--session-id` 必須) | Cloud SQL, Cloud Storage(PDF、Step F対応済み) | 未デプロイ、コード修正は完了 |
 | gmail-sender | Cloud Run **Job** | バッチ(`--session-id --to` 必須) | Cloud SQL | 未デプロイ(コード変更不要) |
 
 `architecture.md` の対応表通り、post-session-job/pdf-renderer は Cloud Run Jobs、gateway/media-api/writer/image-analysis-worker は Cloud Run service として扱う。
 
-## ブロッカー: JSONL永続化がローカルディスク前提になっている(Step F)
+## ブロッカー: JSONL永続化がローカルディスク前提になっている(Step F、実装済み)
 
-**これが一番重要な発見であり、writer・post-session-job・pdf-renderer をそのまま Cloud Run にデプロイすると壊れる。**
+**Step F は実装・実 GCS バケットでの検証まで完了した**(`feat/gcp-deploy-step-f-jsonl-gcs-store` ブランチ)。この節は元は「これから直す」という前提で書いていたが、実際に手を動かした結果に合わせて書き直してある。
 
-`backend/internal/writer/jsonl.go` の `appendJSONLine`(`AppendMoodWaveSample`/`AppendTranscriptChunk`/`AppendTriggerEvent`/`AppendFeedbackEvent` が呼ぶ)は `os.MkdirAll` + `os.OpenFile` で **常にローカルファイルシステム**に書く。Phase 14 Step 14-1 で `MediaStore`(`internal/media`)が `Local`/`GCS` を切り替えられるようになったのと違い、JSONL 書き込み層には local/GCS を切り替える interface が一切無い。`backend/internal/writer/jsonl_read.go` の `ReadMoodWaveSamples`/`ReadTranscriptChunks` も同様にローカル読み込み専用。
+発見した問題: `backend/internal/writer/jsonl.go` の `appendJSONLine` は `os.MkdirAll` + `os.OpenFile` で **常にローカルファイルシステム**に書いていた。Phase 14 Step 14-1 で `MediaStore`(`internal/media`)が `Local`/`GCS` を切り替えられるようになったのと違い、JSONL 書き込み層には local/GCS を切り替える interface が一切無かった。Cloud Run のコンテナインスタンスはインスタンス間でファイルシステムを共有しないため、`writer` が書いた JSONL を別インスタンスの `post-session-job`/`pdf-renderer` が読めず、`important_windows` が常に空になる ── というサイレントな壊れ方をする状態だった。`cmd/pdf-renderer/main.go` も同様に、GCS 対応済みの `internal/media.MediaStore` を使わず `os.WriteFile` で直接ローカルディスクに PDF を書いていた(Step 11 実装時の見落とし)。
 
-Cloud Run のコンテナインスタンスはインスタンス間でファイルシステムを共有しない。`writer` が書いた JSONL を、別のインスタンスとして起動する `post-session-job`/`pdf-renderer` の Job 実行が読めるとは限らない(むしろ通常は読めない)。デプロイした場合、`post-session-job` は毎回 `mood_wave_sample_count: 0` の空レポートを生成し、`important_windows` も常に空になる ── サイレントに壊れる。エラーにはならないので気づきにくい。
+### Step F-1: `internal/writer.JSONLStore` interface(実装済み)
 
-また `backend/cmd/pdf-renderer/main.go` は、既に GCS 対応済みの `internal/media.MediaStore`(`LocalMediaStore`/`GCSMediaStore`)を使わず、`os.WriteFile` で直接ローカルディスクに PDF を書いている(Step 11 実装時の見落とし)。これも同じ問題を持つ。
-
-### Step F-1: `internal/writer` に `MediaStore` と同型の Store interface を追加する
-
-`internal/media.MediaStore`(`SignedUploadURL`/`Exists`/`Read`)のパターンを踏襲し、JSONL 書き込み・読み込みを interface 化する。
+`internal/media.MediaStore` のパターンを踏襲し、`internal/writer/store.go` に interface を追加した(名前は当初案の `Store` ではなく `JSONLStore` ── `internal/writer` には既に Postgres 永続化用の `Store` 構造体があり衝突するため):
 
 ```go
-// internal/writer/store.go (新規)
-type Store interface {
-    Append(ctx context.Context, sessionID string, parts []string, payload any) error
-    ReadLines(ctx context.Context, sessionID string, parts []string) ([][]byte, error)
+// internal/writer/store.go
+type JSONLStore interface {
+    Append(ctx context.Context, sessionID, eventID string, payload any, parts ...string) error
+    ReadAll(ctx context.Context, sessionID string, parts ...string) ([][]byte, error)
 }
 ```
 
-- `LocalJSONLStore`(既存の `appendJSONLine`/`readJSONLLines` のロジックをそのまま移植。ローカル docker compose では現状維持)
-- `GCSJSONLStore`(`cloud.google.com/go/storage` で `sessions/{session_id}/{parts...}/part-0001.jsonl` に相当するオブジェクトへ **1行ずつ追記**。GCS オブジェクトは本来イミュータブルなので、素朴な `Writer.Write` の使い回しはできない。実装方針は次の2択:
-  1. **バッファ後に upsert**: 呼び出しごとに対象オブジェクトを `Read` → 末尾に1行追記 → `Write` で上書き(read-modify-write)。実装は簡単だが、書き込み頻度が上がるとコストと競合(同時書き込み時に片方が消える)が問題になる。`writer`/`post-session-job` はセッションあたりの書き込み頻度が低い(1Hzのmood_wave_sampleと、trigger発生時のみのtriggers/feedback)ため、MVP としてはこれで十分。
-  2. **オブジェクトを分割**: `part-{event_id}.jsonl` のように1書き込み=1オブジェクトにして、読み込み側(`ReadLines`)がそのプレフィックス配下を全部列挙して結合する。追記の競合が原理的に起きない。Cloud Storage のオブジェクト数が増える点だけ注意。
-  
-  **推奨は 2 (オブジェクト分割)**。`writer` は将来 `max_instance_count` を1より大きくする可能性があり(後述 Step H の注記)、read-modify-write は複数インスタンス下で書き込みロスを起こす。オブジェクト分割なら instance 数に依存しない。
-- 環境変数は既存の `MEDIA_STORE_BACKEND=local|gcs` に倣い、新たに `JSONL_STORE_BACKEND=local|gcs`(+`GCS_JSONL_BUCKET`、`media_bucket` を流用してよい)を追加する。
+`GCSJSONLStore`(`internal/writer/gcs_store.go`)の実装方針は、当初案の2択(read-modify-write / 1行1オブジェクト)のどちらでもなく、**Cloud Storage の Compose API** を使った第3の方式にした:
 
-`cmd/writer/main.go`・`cmd/post-session-job/main.go` を新 interface 経由に置き換える(`writer.AppendXxx(jsonlDir, ...)` という関数呼び出しを `store.Append(ctx, sessionID, []string{"mood-wave"}, sample)` のような形へ)。
+1. 新しい1行を短命な「ステージングオブジェクト」(`part-0001.jsonl.append-{event_id}`)としてアップロードする。
+2. 対象の `part-0001.jsonl` が既に存在すれば `ComposerFrom(target, staging)` で「今の内容 + 新しい1行」を1回の Compose 呼び出しで合成し、`part-0001.jsonl` を上書きする。まだ存在しなければ(セッションの最初の1行)ステージングオブジェクトをそのままコピーするだけ。
+3. ステージングオブジェクトは(ベストエフォートで)削除する。
 
-### Step F-2: `pdf-renderer` の PDF 書き込みを `internal/media.MediaStore` 経由にする
+これにより、architecture.md が明記している `sessions/{session_id}/mood-wave/part-0001.jsonl` という**単一ファイルのパス**をそのまま維持しつつ(1行1オブジェクトの方式だとこの命名と食い違う)、既存内容全体を読み直す必要もない(Compose の入力は常に2つ ── 今の `part-0001.jsonl` 自身 + 新しい1行 ── なので、行数が増えてもコストが線形に増えない)。
 
-`cmd/pdf-renderer/main.go` の `os.WriteFile(pdfPath, pdfBytes, 0o644)` を、`media-api` と同じ `internal/media.MediaUploader`(または新規に `MediaWriter` 相当のシンプルな `Write(ctx, mediaRef string, data []byte) error` を `MediaStore` に追加)経由に置き換える。`internal/media` は既に `Local`/`GCS` 両対応なので、こちらは新規 interface 設計不要 ── 既存コードの再利用だけで直る。
+並行性については、generation precondition によるリトライは実装していない。`writer` を `max_instance_count=1` で運用する前提(後述 Step H)でこれを安全としている。
 
-### Step F の完了条件
+`LocalJSONLStore`(`internal/writer/local_store.go`)は既存の `appendJSONLine`/`readJSONLLines` のロジックをそのまま移植したもので、ローカル docker compose での挙動は変えていない。
 
-- `go test ./...` が通る(Local 実装は残すこと。既存の `internal/media` の慣習に倣い、GCP 認証情報が無くてもテストが通る状態を維持する)。
-- ローカル docker compose で `JSONL_STORE_BACKEND=local`(デフォルト)のまま今まで通り動くことを確認する。
-- 実 GCS バケットに対して `JSONL_STORE_BACKEND=gcs` で `writer` を起動し、`gsutil ls gs://<bucket>/sessions/<id>/mood-wave/` にオブジェクトが増えることを確認する。
-- `post-session-job` を同じセッションに対して実行し、`important_windows` が空でないことを確認する(Step 10 のローカル検証と同じ内容を GCS 越しに再現する)。
+環境変数は `MEDIA_STORE_BACKEND=local|gcs` に倣い `JSONL_STORE_BACKEND=local|gcs` + `GCS_JSONL_BUCKET` を追加した(`.env.example` 参照)。`cmd/writer/main.go`・`cmd/post-session-job/main.go` は新 interface 経由に書き換えた。
+
+### Step F-2: `pdf-renderer` の PDF 書き込み(実装済み)
+
+`internal/media.MediaStore` に新しい `MediaWriter` interface(`Write(ctx, sessionID string, parts []string, data []byte, contentType string) (mediaRef string, err error)`)を追加し、`LocalMediaStore`/`GCSMediaStore` 両方に実装した。`cmd/pdf-renderer/main.go` の `os.WriteFile` 直書きをこれに置き換えた。`MEDIA_STORE_BACKEND` は media-api/image-analysis-worker と共通の環境変数をそのまま使う(新しい環境変数は増やしていない)。
+
+### Step F の完了条件(確認済み)
+
+- `go build ./... && go vet ./... && go test ./...` が通ることを確認した(新規ユニットテスト: `internal/writer/local_store_test.go`、`internal/media/local_store_test.go`)。
+- 実 GCS バケット(`reaction-engine-501316-sessions`、Terraform で作成済みのもの)に対して、ローカルの ADC(`gcloud auth application-default login`)から `GCSJSONLStore.Append`/`ReadAll` を実行し、3行 append → 3行読み出し(順序保持)を確認した。同じセッションに対して**プロセスを分けて**再実行し、前回の3行 + 今回の3行 = 6行になることを確認 ── Compose による追記が本当に永続化されていることの確認になる。
+- `media.GCSMediaStore.Write` で PDF を書き込み、`Exists`/`Read` で読み戻せることを確認した(`GCSMediaStore` は署名用に実在のサービスアカウント身元を要求するため、ローカル検証時は `.secrets/reaction-engine-media-api-key.json` を `GOOGLE_APPLICATION_CREDENTIALS` 相当として使った。Cloud Run 上ではアタッチされたランタイム SA が自動的に使われるため、これは不要)。
+- 検証で作成したオブジェクト(`sessions/sess_step_f_gcs_verify/...`)は `gsutil rm -r` で削除済み。ステージングオブジェクトが残っていないことも確認した(Compose 後の delete が正しく効いている)。
 
 ## Step G: `writer` に `/healthz` を追加する
 
@@ -558,7 +558,7 @@ resource "google_secret_manager_secret_iam_member" "accessors" {
 
 依存関係に基づく推奨順序。並行できるものは並行してよい。
 
-1. **Step F**(JSONL/PDF の GCS 化、コード変更) ── 他の全 Step の前提
+1. **Step F**(JSONL/PDF の GCS 化、コード変更) ── 他の全 Step の前提。**実装・実GCS検証済み**(`feat/gcp-deploy-step-f-jsonl-gcs-store`)
 2. **Step G**(writer に `/healthz`、コード変更) ── Step H の前提
 3. **Step H**(writer デプロイ) ── Step F, G 完了後。Step I とは独立に進められる
 4. **Step I**(Memorystore + VPC) ── Step J, K の前提

@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
+	"github.com/k-kanke/reaction-engine/backend/internal/media"
 	"github.com/k-kanke/reaction-engine/backend/internal/pdf"
 	"github.com/k-kanke/reaction-engine/backend/internal/postsession"
 )
@@ -43,6 +43,35 @@ func main() {
 
 	store := postsession.NewPGStore(pool)
 
+	// MEDIA_STORE_BACKEND mirrors media-api/image-analysis-worker's flag
+	// (Step F of plan/gcp-deployment-runbook.md): report.pdf now goes
+	// through internal/media's existing Local/GCS split instead of the
+	// os.WriteFile this used before, which always wrote to local disk even
+	// when deployed as a separate Cloud Run instance from whatever reads
+	// report.pdf back.
+	mediaStoreBackend := os.Getenv("MEDIA_STORE_BACKEND")
+	if mediaStoreBackend == "" {
+		mediaStoreBackend = "local"
+	}
+
+	var mediaWriter media.MediaWriter
+	switch mediaStoreBackend {
+	case "local":
+		mediaWriter = media.NewLocalMediaStore(localMediaDir, "", 0)
+	case "gcs":
+		bucket := os.Getenv("GCS_MEDIA_BUCKET")
+		if bucket == "" {
+			log.Fatal("pdf-renderer: GCS_MEDIA_BUCKET is required when MEDIA_STORE_BACKEND=gcs")
+		}
+		gcsStore, err := media.NewGCSMediaStore(ctx, bucket, os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"), 0)
+		if err != nil {
+			log.Fatalf("pdf-renderer: failed to create gcs media store: %v", err)
+		}
+		mediaWriter = gcsStore
+	default:
+		log.Fatalf("pdf-renderer: unknown MEDIA_STORE_BACKEND %q (want local or gcs)", mediaStoreBackend)
+	}
+
 	reportID, reportJSON, err := store.GetLatestReport(ctx, *sessionID)
 	if err != nil {
 		log.Fatalf("pdf-renderer: get latest report failed: %v", err)
@@ -59,19 +88,11 @@ func main() {
 		log.Fatalf("pdf-renderer: render pdf failed: %v", err)
 	}
 
-	dir := filepath.Join(localMediaDir, "sessions", *sessionID, "reports")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		log.Fatalf("pdf-renderer: prepare storage dir failed: %v", err)
-	}
-	pdfPath := filepath.Join(dir, "report.pdf")
-	if err := os.WriteFile(pdfPath, pdfBytes, 0o644); err != nil {
+	mediaRef, err := mediaWriter.Write(ctx, *sessionID, []string{"reports", "report.pdf"}, pdfBytes, "application/pdf")
+	if err != nil {
 		log.Fatalf("pdf-renderer: write pdf failed: %v", err)
 	}
 
-	// local:// scheme mirrors internal/media's media_ref convention; in
-	// Cloud Run this becomes a gs:// object path instead (see
-	// plan/gcp-adapter-migration-phase14.md).
-	mediaRef := fmt.Sprintf("local://sessions/%s/reports/report.pdf", *sessionID)
 	generatedAt := time.Now()
 	if err := store.UpdateReportPDF(ctx, reportID, mediaRef, generatedAt); err != nil {
 		log.Fatalf("pdf-renderer: update report pdf path failed: %v", err)
