@@ -155,7 +155,7 @@ func (g *VertexFeedbackGenerator) buildGenerateContentRequest(pack EvidencePack)
 
 	parts := []map[string]any{
 		{
-			"text": "You are Reaction Engine's realtime presentation feedback model. Return only compact JSON with keys feedback_type, severity, message, reason_codes, evidence_quote, confidence. Do not overstate causality; phrase reactions as possibilities. Use Japanese for message.",
+			"text": "You are Reaction Engine's realtime presentation feedback model. Return only compact JSON with keys feedback_type, severity, message, reason_codes, evidence_quote, confidence. Do not overstate causality; phrase reactions as possibilities. Ground the message in transcript_window when it is non-empty: name the specific topic/phrase being discussed around the reaction change, and suggest one concrete next action (e.g. revisit that point, ask a question, slow down). If transcript_window is empty, describe only the mood trend generically. Use Japanese for message, written as natural spoken advice to the presenter (2 sentences max).",
 		},
 		{
 			"text": "Realtime evidence pack:\n" + string(packJSON),
@@ -184,8 +184,19 @@ func (g *VertexFeedbackGenerator) buildGenerateContentRequest(pack EvidencePack)
 		},
 		"generationConfig": map[string]any{
 			"temperature":      0.2,
-			"maxOutputTokens":  256,
+			"maxOutputTokens":  512,
 			"responseMimeType": "application/json",
+			// gemini-2.5-flash defaults to spending its output budget on
+			// internal "thinking" tokens first -- with the old
+			// maxOutputTokens=256 that consumed the whole budget (measured
+			// thoughtsTokenCount=253/256) and left zero tokens for the
+			// actual JSON answer, so every real call hit finishReason
+			// MAX_TOKENS with no text (extractVertexText's "response
+			// contained no text" error, always falling back to
+			// ruleFallback). This path has a 1.5s budget
+			// (realtimeLLMTimeout) anyway, so thinking adds latency risk
+			// for no benefit here.
+			"thinkingConfig": map[string]any{"thinkingBudget": 0},
 		},
 	}, nil
 }
