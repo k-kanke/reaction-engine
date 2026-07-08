@@ -71,6 +71,11 @@ let latestTileSnapshot = null;
 const VAD_INTERVAL_MS = 100; // VADサンプリング間隔
 const VAD_RMS_THRESHOLD = 0.02; // 発話判定のRMS閾値（仮値・後で実データ調整）
 const SPEECH_WINDOW_MS = 5000; // speech_ratio を出す移動窓
+// --- audio_chunk 送信 (plan/realtime-llm-context-next-steps.md Step 3):
+// VAD analyser の time-domain バッファをそのままPCMとしてGatewayへ送る。
+// まずはtranscript windowにデータが入ることの確認が目的なので低頻度でよい。
+const AUDIO_CHUNK_INTERVAL_MS = 2000;
+let audioChunkTimer = null;
 // --- 代表フレーム取得 (§2.2 LLM定期パス用): 最初5分・30秒ごと ---
 const FRAME_CAPTURE_INTERVAL_MS = 30000; // 30秒ごと
 const FRAME_CAPTURE_DURATION_MS = 5 * 60 * 1000; // 最初の5分だけ
@@ -341,6 +346,7 @@ async function startCapture() {
     analysisTimer = window.setInterval(runAnalysisFrame, ANALYSIS_INTERVAL_MS);
     eventTimer = window.setInterval(sendMoodWaveSample, EVENT_INTERVAL_MS);
     vadTimer = window.setInterval(sampleVad, VAD_INTERVAL_MS);
+    audioChunkTimer = window.setInterval(sendAudioChunks, AUDIO_CHUNK_INTERVAL_MS);
     captureStartTs = Date.now();
     captureFrame(); // 開始直後に1枚
     frameTimer = window.setInterval(captureFrame, FRAME_CAPTURE_INTERVAL_MS);
@@ -358,12 +364,14 @@ function stopCapture() {
   if (analysisTimer) window.clearInterval(analysisTimer);
   if (eventTimer) window.clearInterval(eventTimer);
   if (vadTimer) window.clearInterval(vadTimer);
+  if (audioChunkTimer) window.clearInterval(audioChunkTimer);
   if (frameTimer) window.clearInterval(frameTimer);
   if (baselineTimer) window.clearInterval(baselineTimer);
   baselineTimer = null;
   analysisTimer = null;
   eventTimer = null;
   vadTimer = null;
+  audioChunkTimer = null;
   frameTimer = null;
   stopMoodMonitor();
   teardownAudioAnalysis();
@@ -1469,6 +1477,52 @@ function sampleVad() {
     s.history.push({ t: now, speaking });
     while (s.history.length && s.history[0].t < cutoff) s.history.shift();
   }
+}
+
+// sendAudioChunks sends one audio_chunk per active VAD source (self/other)
+// straight from that analyser's time-domain buffer (architecture.md's Audio
+// Chunk contract, plan/realtime-llm-context-next-steps.md Step 3). Backend
+// only tracks arrival timestamps for the stub STT flush today (Step 4 will
+// wire a real decoder), so a short low-frequency snapshot is enough to
+// verify the transcript_window pipeline end to end.
+function sendAudioChunks() {
+  if (ws?.readyState !== WebSocket.OPEN) return;
+
+  const sampleRate = audioContext?.sampleRate ?? 48000;
+  const tMs = Date.now();
+
+  for (const speaker of ["self", "other"]) {
+    const s = vad[speaker];
+    if (!s.analyser) continue;
+
+    const buf = new Float32Array(s.analyser.fftSize);
+    s.analyser.getFloatTimeDomainData(buf);
+
+    const event = {
+      type: "audio_chunk",
+      session_id: sessionId,
+      speaker,
+      t_ms: tMs,
+      sample_rate: sampleRate,
+      pcm: encodePCM16Base64(buf)
+    };
+    ws.send(JSON.stringify(event));
+  }
+}
+
+// encodePCM16Base64 converts a Float32 time-domain buffer ([-1, 1]) to
+// little-endian 16-bit PCM and base64-encodes it, matching architecture.md's
+// audio_chunk.pcm shape.
+function encodePCM16Base64(floatBuf) {
+  const int16 = new Int16Array(floatBuf.length);
+  for (let i = 0; i < floatBuf.length; i++) {
+    const clamped = Math.max(-1, Math.min(1, floatBuf[i]));
+    int16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+  }
+  const bytes = new Uint8Array(int16.buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
 
 function buildSpeechFeatures() {
