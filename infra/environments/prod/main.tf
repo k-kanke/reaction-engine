@@ -183,7 +183,7 @@ module "gateway_service_account" {
   project_id    = var.project_id
   account_id    = "reaction-engine-gateway"
   display_name  = "Reaction Engine Gateway"
-  project_roles = ["roles/cloudsql.client"]
+  project_roles = ["roles/cloudsql.client", "roles/aiplatform.user"]
 }
 
 module "gateway_service" {
@@ -201,10 +201,13 @@ module "gateway_service" {
   vpc_egress                = "PRIVATE_RANGES_ONLY"
 
   env_vars = {
-    GATEWAY_PORT    = "8080"
-    REDIS_ADDR      = "${module.redis.host}:${module.redis.port}"
-    ENABLE_REAL_LLM = "false" # flips once Phase 14 Step 14-6 (Vertex AI) lands
-    DATABASE_URL    = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+    GATEWAY_PORT          = "8080"
+    REDIS_ADDR            = "${module.redis.host}:${module.redis.port}"
+    ENABLE_REAL_LLM       = "true"
+    VERTEX_PROJECT        = var.project_id
+    VERTEX_LOCATION       = var.region
+    VERTEX_REALTIME_MODEL = "gemini-1.5-flash"
+    DATABASE_URL          = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
   }
 
   # Chrome extension clients connect directly and can't hold GCP identity

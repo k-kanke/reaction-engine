@@ -42,14 +42,19 @@ type audioAccumulator struct {
 type Handler struct {
 	redis  *gwredis.Client
 	events *db.LocalEventStore
-	// llmEnabled is read by the Realtime Worker's trigger-acceptance path
-	// (plan/mood-wave-contract-migration.md Step 5), not by this file
-	// directly — handleMoodWaveSample only ingests and stores.
-	llmEnabled bool
+	llm    realtime.FeedbackGenerator
 }
 
 func NewHandler(redis *gwredis.Client, events *db.LocalEventStore, llmEnabled bool) *Handler {
-	return &Handler{redis: redis, events: events, llmEnabled: llmEnabled}
+	var generator realtime.FeedbackGenerator
+	if llmEnabled {
+		generator = realtime.StubFeedbackGenerator{}
+	}
+	return NewHandlerWithFeedbackGenerator(redis, events, generator)
+}
+
+func NewHandlerWithFeedbackGenerator(redis *gwredis.Client, events *db.LocalEventStore, generator realtime.FeedbackGenerator) *Handler {
+	return &Handler{redis: redis, events: events, llm: generator}
 }
 
 // ServeWS handles GET /ws: it accepts the WebSocket connection, dispatches
@@ -176,7 +181,7 @@ func (h *Handler) handleMoodWaveSample(ctx context.Context, conn *websocket.Conn
 		log.Printf("gateway: store recent trigger failed: %v", err)
 	}
 
-	feedback, accepted, err := realtime.HandleTrigger(ctx, h.redis, msg, h.llmEnabled)
+	feedback, accepted, err := realtime.HandleTriggerWithGenerator(ctx, h.redis, msg, h.llm)
 	if err != nil {
 		log.Printf("gateway: realtime worker handle trigger failed: %v", err)
 		return

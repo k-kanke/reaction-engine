@@ -8,6 +8,7 @@ import (
 
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	"github.com/k-kanke/reaction-engine/backend/internal/gateway"
+	"github.com/k-kanke/reaction-engine/backend/internal/realtime"
 	"github.com/k-kanke/reaction-engine/backend/internal/redis"
 )
 
@@ -27,8 +28,6 @@ func main() {
 		databaseURL = "postgres://reaction:reaction@localhost:5432/reaction?sslmode=disable"
 	}
 
-	llmEnabled := os.Getenv("ENABLE_REAL_LLM") == "true"
-
 	redisClient := redis.NewClient(redisAddr)
 	defer redisClient.Close()
 
@@ -39,7 +38,20 @@ func main() {
 	defer pool.Close()
 
 	events := db.NewLocalEventStore(pool)
-	handler := gateway.NewHandler(redisClient, events, llmEnabled)
+
+	var generator realtime.FeedbackGenerator
+	if os.Getenv("ENABLE_REAL_LLM") == "true" {
+		projectID := firstNonEmpty(os.Getenv("VERTEX_PROJECT"), os.Getenv("GOOGLE_CLOUD_PROJECT"))
+		location := firstNonEmpty(os.Getenv("VERTEX_LOCATION"), os.Getenv("GCP_REGION"), "asia-northeast1")
+		model := firstNonEmpty(os.Getenv("VERTEX_REALTIME_MODEL"), "gemini-1.5-flash")
+		vertexGenerator, err := realtime.NewVertexFeedbackGenerator(context.Background(), projectID, location, model)
+		if err != nil {
+			log.Fatalf("gateway: initialize realtime vertex generator: %v", err)
+		}
+		generator = vertexGenerator
+	}
+
+	handler := gateway.NewHandlerWithFeedbackGenerator(redisClient, events, generator)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -51,4 +63,13 @@ func main() {
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }

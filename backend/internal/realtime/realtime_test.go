@@ -276,3 +276,30 @@ func TestHandleTrigger(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildEvidencePackIncludesUploadingEvidenceFrameRef(t *testing.T) {
+	store := &fakeWaveStore{
+		samples: []contract.MoodWaveSampleMessage{
+			sample(10000, 0.1, 0),
+			sample(30000, -0.2, 0),
+		},
+	}
+	trigger := contract.TriggerInfo{TriggerID: "trig_1", Type: "wave_drop", PeakTMs: 30000}
+	msg := triggerMsg(&trigger)
+	msg.EvidenceFrame = &contract.EvidenceFrameRef{
+		MediaRef:     "gs://bucket/evidence/trig_1.jpg",
+		UploadStatus: "uploading",
+		SnapshotTMs:  29900,
+	}
+
+	pack, err := buildEvidencePack(context.Background(), store, "sess_1", msg, trigger)
+	if err != nil {
+		t.Fatalf("buildEvidencePack returned error: %v", err)
+	}
+	if len(pack.EvidenceFrames) != 1 {
+		t.Fatalf("EvidenceFrames len = %d, want 1", len(pack.EvidenceFrames))
+	}
+	if pack.EvidenceFrames[0].MediaRef != "gs://bucket/evidence/trig_1.jpg" {
+		t.Errorf("EvidenceFrames[0].MediaRef = %q", pack.EvidenceFrames[0].MediaRef)
+	}
+}

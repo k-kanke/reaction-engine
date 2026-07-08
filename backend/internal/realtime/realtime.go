@@ -73,6 +73,14 @@ type EvidencePack struct {
 	EvidenceFrames   []EvidenceFrameRefOut      `json:"evidence_frames"`
 }
 
+// FeedbackGenerator is the optional realtime LLM boundary. Implementations
+// receive the fully assembled evidence pack and either return an LLM-backed
+// feedback_event candidate or an error, in which case HandleTrigger keeps
+// the deterministic rule fallback.
+type FeedbackGenerator interface {
+	GenerateFeedback(ctx context.Context, sessionID string, tMs int64, trigger contract.TriggerInfo, pack EvidencePack) (contract.FeedbackEvent, error)
+}
+
 // HandleTrigger implements architecture.md's steps 9-14 of リアルタイムFB
 // フロー for one trigger-carrying mood_wave_sample: check cooldown, build
 // the evidence pack, decide feedback (LLM stub when llmEnabled, rule
@@ -83,6 +91,18 @@ type EvidencePack struct {
 // failed; the caller should log it and, likewise, not emit feedback for
 // this trigger rather than emit one built from partial data.
 func HandleTrigger(ctx context.Context, store WaveStore, msg contract.MoodWaveSampleMessage, llmEnabled bool) (feedback contract.FeedbackEvent, accepted bool, err error) {
+	var generator FeedbackGenerator
+	if llmEnabled {
+		generator = StubFeedbackGenerator{}
+	}
+	return HandleTriggerWithGenerator(ctx, store, msg, generator)
+}
+
+// HandleTriggerWithGenerator is HandleTrigger with an injected LLM
+// generator. It is used by Cloud Run wiring to pass a real Vertex AI Gemini
+// adapter while tests and local runs can continue using HandleTrigger's
+// boolean stub switch.
+func HandleTriggerWithGenerator(ctx context.Context, store WaveStore, msg contract.MoodWaveSampleMessage, generator FeedbackGenerator) (feedback contract.FeedbackEvent, accepted bool, err error) {
 	if msg.Trigger == nil {
 		return contract.FeedbackEvent{}, false, fmt.Errorf("realtime: HandleTrigger called without a trigger")
 	}
@@ -104,9 +124,9 @@ func HandleTrigger(ctx context.Context, store WaveStore, msg contract.MoodWaveSa
 
 	feedback = ruleFallback(sessionID, msg.TMs, trigger, pack.MoodWave)
 
-	if llmEnabled {
+	if generator != nil {
 		llmCtx, cancel := context.WithTimeout(ctx, realtimeLLMTimeout)
-		candidate, llmErr := generateLLMStubCandidate(llmCtx, sessionID, msg.TMs, trigger, pack)
+		candidate, llmErr := generator.GenerateFeedback(llmCtx, sessionID, msg.TMs, trigger, pack)
 		cancel()
 		if llmErr == nil {
 			feedback = candidate
@@ -124,9 +144,10 @@ func HandleTrigger(ctx context.Context, store WaveStore, msg contract.MoodWaveSa
 // mood_wave_window (re-sliced from whatever GetRecentMoodWaveSamples
 // returns), the same-window transcript from both speakers merged and
 // sorted, and every participant's baseline frame media_ref. evidence_frames
-// only ever contains msg's own evidence_frame (if present and uploaded) —
-// Realtime Worker never queries Cloud Storage/media_refs for other frames,
-// per architecture.md's "画像フロー" section.
+// only ever contains msg's own evidence_frame media_ref when present.
+// Chrome does not wait for the image PUT to complete before sending the
+// trigger sample, so a still-uploading object may make the real LLM adapter
+// fail and fall back to the rule result.
 func buildEvidencePack(ctx context.Context, store WaveStore, sessionID string, msg contract.MoodWaveSampleMessage, trigger contract.TriggerInfo) (EvidencePack, error) {
 	windowStartTMs := msg.TMs - int64(WindowDurationSec)*1000
 
@@ -159,7 +180,7 @@ func buildEvidencePack(ctx context.Context, store WaveStore, sessionID string, m
 	}
 
 	var evidenceFrames []EvidenceFrameRefOut
-	if msg.EvidenceFrame != nil && msg.EvidenceFrame.UploadStatus == "uploaded" {
+	if msg.EvidenceFrame != nil && msg.EvidenceFrame.MediaRef != "" {
 		evidenceFrames = []EvidenceFrameRefOut{{
 			MediaRef: msg.EvidenceFrame.MediaRef,
 			TMs:      msg.EvidenceFrame.SnapshotTMs,
@@ -224,6 +245,12 @@ func ruleFallback(sessionID string, tMs int64, trigger contract.TriggerInfo, moo
 // an actual adapter in. The only difference from ruleFallback's message
 // selection is that this quotes the most recent transcript chunk in the
 // window as evidence, when one exists.
+type StubFeedbackGenerator struct{}
+
+func (StubFeedbackGenerator) GenerateFeedback(ctx context.Context, sessionID string, tMs int64, trigger contract.TriggerInfo, pack EvidencePack) (contract.FeedbackEvent, error) {
+	return generateLLMStubCandidate(ctx, sessionID, tMs, trigger, pack)
+}
+
 func generateLLMStubCandidate(ctx context.Context, sessionID string, tMs int64, trigger contract.TriggerInfo, pack EvidencePack) (contract.FeedbackEvent, error) {
 	select {
 	case <-ctx.Done():

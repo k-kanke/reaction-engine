@@ -15,6 +15,17 @@ terraform plan
 terraform apply
 ```
 
+`gateway_image_tag` / `media_api_image_tag` are intentionally required
+Terraform variables so service revisions always point at explicit image
+tags. For routine local plan/apply where you do not want Terraform to
+prompt for them, use the wrapper from the repository root. It reads the
+currently deployed Cloud Run image tags and passes them as `-var` values:
+
+```bash
+scripts/terraform-prod plan
+scripts/terraform-prod apply
+```
+
 State lives in the `gcs` backend configured in `versions.tf`
 (`gs://reaction-engine-501316-tfstate/terraform/state/prod`), a bucket
 managed by `module.terraform_state_bucket` below. It was bootstrapped with

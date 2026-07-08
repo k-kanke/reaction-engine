@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cmd="${1:-plan}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+
+project_id="${PROJECT_ID:-${TF_VAR_project_id:-reaction-engine-501316}}"
+region="${REGION:-${TF_VAR_region:-asia-northeast1}}"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tf_dir="${repo_root}/infra/environments/prod"
+
+current_tag() {
+  local service="$1"
+  local image
+  image="$(
+    gcloud run services describe "${service}" \
+      --project="${project_id}" \
+      --region="${region}" \
+      --format='value(spec.template.spec.containers[0].image)'
+  )"
+  if [[ -z "${image}" || "${image}" != *:* ]]; then
+    echo "failed to read current image tag for ${service}: ${image}" >&2
+    exit 1
+  fi
+  echo "${image##*:}"
+}
+
+gateway_tag="$(current_tag r-gateway)"
+media_api_tag="$(current_tag r-media-api)"
+
+cd "${tf_dir}"
+terraform "${cmd}" \
+  -var="gateway_image_tag=${gateway_tag}" \
+  -var="media_api_image_tag=${media_api_tag}" \
+  "$@"
