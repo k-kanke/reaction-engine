@@ -86,12 +86,44 @@ jobs:
               args: ['build', '--platform', 'linux/amd64', '--build-arg', 'SERVICE=${SERVICE}', '-t', '${image}', '-f', 'backend/Dockerfile', 'backend']
           images: ['${image}']
           EOF
-          gcloud builds submit \
+          submit_output="$(
+            gcloud builds submit \
             --project="${PROJECT_ID}" \
             --region="${REGION}" \
-            --suppress-logs \
+            --async \
             --config=/tmp/cloudbuild-gateway.yaml \
-            .
+            . 2>&1
+          )"
+          echo "$submit_output"
+
+          build_id="$(
+            printf '%s\n' "$submit_output" \
+              | sed -nE 's|.*builds/([0-9a-f-]+).*|\1|p' \
+              | tail -n 1
+          )"
+          if [ -z "$build_id" ]; then
+            echo "Failed to parse Cloud Build ID" >&2
+            exit 1
+          fi
+
+          while true; do
+            status="$(
+              gcloud builds describe "$build_id" \
+                --project="${PROJECT_ID}" \
+                --region="${REGION}" \
+                --format='value(status)'
+            )"
+            echo "Cloud Build ${build_id}: ${status}"
+            case "$status" in
+              SUCCESS)
+                break
+                ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
 
       - name: Deploy gateway with Terraform
         working-directory: infra/environments/prod
