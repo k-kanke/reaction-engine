@@ -84,9 +84,11 @@ type JSONLStore interface {
 - `media.GCSMediaStore.Write` で PDF を書き込み、`Exists`/`Read` で読み戻せることを確認した(`GCSMediaStore` は署名用に実在のサービスアカウント身元を要求するため、ローカル検証時は `.secrets/reaction-engine-media-api-key.json` を `GOOGLE_APPLICATION_CREDENTIALS` 相当として使った。Cloud Run 上ではアタッチされたランタイム SA が自動的に使われるため、これは不要)。
 - 検証で作成したオブジェクト(`sessions/sess_step_f_gcs_verify/...`)は `gsutil rm -r` で削除済み。ステージングオブジェクトが残っていないことも確認した(Compose 後の delete が正しく効いている)。
 
-## Step G: `writer` に `/healthz` を追加する
+## Step G: `writer` に `/healthz` を追加する(実装済み)
 
-`backend-local-docker-runbook.md` Phase 15 のチェックリスト(「全サービスで `GET /healthz` を実装する」)がまだ `writer` に対して未達。`cmd/writer/main.go` は現状 HTTP リスナーを一切持たない(`image-analysis-worker` は `/debug/healthz` を既に持っている ── `cmd/image-analysis-worker/main.go` を参考にする)。
+**実装・ローカル動作確認まで完了した**(`feat/gcp-deploy-step-g-writer-healthz` ブランチ)。ほぼこの節に書いた通りのコードで実装し、`WRITER_PORT`(デフォルト8080、`compose.yaml`/`.env.example` では他サービスと衝突しないよう8083)を追加、`curl /healthz` で200 okを確認済み。
+
+`backend-local-docker-runbook.md` Phase 15 のチェックリスト(「全サービスで `GET /healthz` を実装する」)がまだ `writer` に対して未達だった。`cmd/writer/main.go` は現状 HTTP リスナーを一切持たない(`image-analysis-worker` は `/debug/healthz` を既に持っている ── `cmd/image-analysis-worker/main.go` を参考にする)。
 
 Cloud Run **Service**(`google_cloud_run_v2_service`)はコンテナが `$PORT` で listen して応答することを健全性の条件にしている。`writer` を Cloud Run Job ではなく Service としてデプロイする(常駐ポーリングという設計上そうすべき、`architecture.md` の対応表とも一致)以上、これは必須。
 
@@ -559,7 +561,7 @@ resource "google_secret_manager_secret_iam_member" "accessors" {
 依存関係に基づく推奨順序。並行できるものは並行してよい。
 
 1. **Step F**(JSONL/PDF の GCS 化、コード変更) ── 他の全 Step の前提。**実装・実GCS検証済み**(`feat/gcp-deploy-step-f-jsonl-gcs-store`)
-2. **Step G**(writer に `/healthz`、コード変更) ── Step H の前提
+2. **Step G**(writer に `/healthz`、コード変更) ── Step H の前提。**実装・動作確認済み**(`feat/gcp-deploy-step-g-writer-healthz`)
 3. **Step H**(writer デプロイ) ── Step F, G 完了後。Step I とは独立に進められる
 4. **Step I**(Memorystore + VPC) ── Step J, K の前提
 5. **Step J**(gateway デプロイ) ── Step I 完了後
