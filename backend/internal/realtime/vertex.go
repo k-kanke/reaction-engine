@@ -33,7 +33,7 @@ func NewVertexFeedbackGenerator(ctx context.Context, projectID, location, model 
 		location = "asia-northeast1"
 	}
 	if model == "" {
-		model = "gemini-1.5-flash"
+		model = "gemini-2.5-flash"
 	}
 
 	client, err := google.DefaultClient(ctx, "https://www.googleapis.com/auth/cloud-platform")

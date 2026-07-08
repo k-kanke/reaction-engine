@@ -6,9 +6,9 @@ import (
 )
 
 func TestVertexEndpoint(t *testing.T) {
-	g := &VertexFeedbackGenerator{ProjectID: "proj_1", Location: "asia-northeast1", Model: "gemini-1.5-flash"}
+	g := &VertexFeedbackGenerator{ProjectID: "proj_1", Location: "asia-northeast1", Model: "gemini-2.5-flash"}
 	got := g.endpoint()
-	want := "https://asia-northeast1-aiplatform.googleapis.com/v1/projects/proj_1/locations/asia-northeast1/publishers/google/models/gemini-1.5-flash:generateContent"
+	want := "https://asia-northeast1-aiplatform.googleapis.com/v1/projects/proj_1/locations/asia-northeast1/publishers/google/models/gemini-2.5-flash:generateContent"
 	if got != want {
 		t.Errorf("endpoint = %q, want %q", got, want)
 	}
