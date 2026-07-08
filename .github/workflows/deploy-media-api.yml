@@ -1,0 +1,131 @@
+name: Deploy media-api
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - backend/Dockerfile
+      - backend/go.mod
+      - backend/go.sum
+      - backend/cmd/media-api/**
+      - backend/internal/contract/**
+      - backend/internal/db/**
+      - backend/internal/media/**
+      - infra/**
+      - .github/workflows/deploy-media-api.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: reaction-engine-501316
+  REGION: asia-northeast1
+  SERVICE: media-api
+  TF_VAR_project_id: reaction-engine-501316
+  TF_VAR_region: asia-northeast1
+  TF_VAR_media_bucket_name: ${{ vars.MEDIA_BUCKET_NAME }}
+  TF_VAR_terraform_state_bucket_name: ${{ vars.TERRAFORM_STATE_BUCKET_NAME }}
+  TF_VAR_media_api_invoker_members: ${{ vars.MEDIA_API_INVOKER_MEMBERS_JSON }}
+
+jobs:
+  deploy:
+    name: Build and deploy r-media-api
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Compute image tag
+        run: echo "TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Terraform init
+        working-directory: infra/environments/prod
+        run: terraform init -input=false
+
+      - name: Read current gateway image tag
+        id: gateway
+        working-directory: infra/environments/prod
+        run: |
+          tag="$(
+            terraform state show module.gateway_service.google_cloud_run_v2_service.this \
+              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/gateway:([^"]+)".*/\1/p' \
+              | head -n 1
+          )"
+          if [ -z "$tag" ]; then
+            echo "Failed to read current gateway image tag from Terraform state" >&2
+            exit 1
+          fi
+          echo "GATEWAY_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Build and push media-api image
+        run: |
+          image="${REGION}-docker.pkg.dev/${PROJECT_ID}/reaction-engine-backend/${SERVICE}:${TAG}"
+          cat > /tmp/cloudbuild-media-api.yaml <<EOF
+          steps:
+            - name: 'gcr.io/cloud-builders/docker'
+              args: ['build', '--platform', 'linux/amd64', '--build-arg', 'SERVICE=${SERVICE}', '-t', '${image}', '-f', 'backend/Dockerfile', 'backend']
+          images: ['${image}']
+          EOF
+          submit_output="$(
+            gcloud builds submit \
+            --project="${PROJECT_ID}" \
+            --region="${REGION}" \
+            --async \
+            --config=/tmp/cloudbuild-media-api.yaml \
+            . 2>&1
+          )"
+          echo "$submit_output"
+
+          build_id="$(
+            printf '%s\n' "$submit_output" \
+              | sed -nE 's|.*builds/([0-9a-f-]+).*|\1|p' \
+              | tail -n 1
+          )"
+          if [ -z "$build_id" ]; then
+            echo "Failed to parse Cloud Build ID" >&2
+            exit 1
+          fi
+
+          while true; do
+            status="$(
+              gcloud builds describe "$build_id" \
+                --project="${PROJECT_ID}" \
+                --region="${REGION}" \
+                --format='value(status)'
+            )"
+            echo "Cloud Build ${build_id}: ${status}"
+            case "$status" in
+              SUCCESS)
+                break
+                ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+
+      - name: Deploy media-api with Terraform
+        working-directory: infra/environments/prod
+        run: |
+          terraform apply -input=false -auto-approve -lock-timeout=5m \
+            -var="media_api_image_tag=${TAG}" \
+            -var="gateway_image_tag=${GATEWAY_IMAGE_TAG}"
