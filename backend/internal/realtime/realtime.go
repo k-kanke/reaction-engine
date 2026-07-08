@@ -13,12 +13,21 @@ package realtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"time"
 
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
 )
+
+// DebugLogEvidencePack, when true, additionally logs the full EvidencePack
+// as JSON (potentially large: mood_wave points + transcript text) alongside
+// the always-on summary line every trigger already gets. Off by default;
+// cmd/gateway wires it from REALTIME_DEBUG_LOG=true for one-off
+// investigation (Step 5 of plan/realtime-llm-context-next-steps.md).
+var DebugLogEvidencePack = false
 
 // feedbackCooldownMs matches architecture.md's feedback_event.cooldown_ms
 // example (30000) and is reported back to Chrome as-is, so the value the
@@ -121,6 +130,7 @@ func HandleTriggerWithGenerator(ctx context.Context, store WaveStore, msg contra
 	if err != nil {
 		return contract.FeedbackEvent{}, false, err
 	}
+	logEvidencePackSummary(sessionID, trigger, pack)
 
 	feedback = ruleFallback(sessionID, msg.TMs, trigger, pack.MoodWave)
 
@@ -130,7 +140,14 @@ func HandleTriggerWithGenerator(ctx context.Context, store WaveStore, msg contra
 		cancel()
 		if llmErr == nil {
 			feedback = candidate
+			log.Printf("realtime: llm feedback used session=%s trigger_id=%s source=%s model_version=%s",
+				sessionID, trigger.TriggerID, feedback.Source, feedback.ModelVersion)
+		} else {
+			log.Printf("realtime: llm feedback failed, using rule fallback session=%s trigger_id=%s reason=%v",
+				sessionID, trigger.TriggerID, llmErr)
 		}
+	} else {
+		log.Printf("realtime: llm disabled, using rule fallback session=%s trigger_id=%s", sessionID, trigger.TriggerID)
 	}
 
 	if cooldownErr := store.SetFeedbackCooldown(ctx, sessionID, feedback.CooldownMs); cooldownErr != nil {
@@ -196,6 +213,31 @@ func buildEvidencePack(ctx context.Context, store WaveStore, sessionID string, m
 		BaselineFrames:   baselineFrames,
 		EvidenceFrames:   evidenceFrames,
 	}, nil
+}
+
+// logEvidencePackSummary is the Step 5 always-on log line: counts only
+// (never full mood_wave points or transcript text, which can be large), so
+// Cloud Run logs show what went into the LLM call for every trigger without
+// needing DebugLogEvidencePack. It logs the evidence_frame media_ref
+// specifically (not just its count) since that's the one field worth
+// eyeballing to confirm Chrome's upload actually reached the pack in time.
+func logEvidencePackSummary(sessionID string, trigger contract.TriggerInfo, pack EvidencePack) {
+	log.Printf("realtime: evidence pack session=%s trigger_id=%s trigger_type=%s mood_wave_points=%d transcript_chunks=%d baseline_frames=%d evidence_frames=%d",
+		sessionID, trigger.TriggerID, trigger.Type,
+		len(pack.MoodWave.Points), len(pack.TranscriptWindow), len(pack.BaselineFrames), len(pack.EvidenceFrames))
+
+	if len(pack.EvidenceFrames) > 0 {
+		log.Printf("realtime: evidence pack session=%s trigger_id=%s evidence_frame_media_ref=%s",
+			sessionID, trigger.TriggerID, pack.EvidenceFrames[0].MediaRef)
+	}
+
+	if DebugLogEvidencePack {
+		if raw, err := json.Marshal(pack); err == nil {
+			log.Printf("realtime: evidence pack json session=%s trigger_id=%s payload=%s", sessionID, trigger.TriggerID, raw)
+		} else {
+			log.Printf("realtime: evidence pack json marshal failed session=%s trigger_id=%s err=%v", sessionID, trigger.TriggerID, err)
+		}
+	}
 }
 
 // ruleFallback is the deterministic, LLM-free feedback decision: it reads

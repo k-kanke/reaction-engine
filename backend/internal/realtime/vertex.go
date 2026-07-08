@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -89,6 +90,9 @@ func (g *VertexFeedbackGenerator) GenerateFeedback(ctx context.Context, sessionI
 	text, err := extractVertexText(respBody)
 	if err != nil {
 		return contract.FeedbackEvent{}, err
+	}
+	if DebugLogEvidencePack {
+		log.Printf("realtime: vertex raw response session=%s trigger_id=%s text=%q", sessionID, trigger.TriggerID, text)
 	}
 
 	var generated struct {

@@ -71,6 +71,15 @@ let latestTileSnapshot = null;
 const VAD_INTERVAL_MS = 100; // VADサンプリング間隔
 const VAD_RMS_THRESHOLD = 0.02; // 発話判定のRMS閾値（仮値・後で実データ調整）
 const SPEECH_WINDOW_MS = 5000; // speech_ratio を出す移動窓
+// --- audio_chunk 送信 (plan/realtime-llm-context-next-steps.md Step 4):
+// self(マイク)/other(タブ音声) それぞれの source node から
+// ScriptProcessorNode で連続PCMを取り、そのままGatewayへ送る。Step 3の
+// AnalyserNodeスナップショット方式(2秒おきに約85msだけ送る)は本物の
+// Speech-to-Text streamingには音声が欠けすぎるため、この連続キャプチャに
+// 置き換えた。
+const AUDIO_CHUNK_BUFFER_SIZE = 4096; // 48kHzで約85ms/chunk
+let audioChunkGainNode = null; // 無音でdestinationに繋ぐための共有GainNode
+const audioChunkProcessors = { self: null, other: null };
 // --- 代表フレーム取得 (§2.2 LLM定期パス用): 最初5分・30秒ごと ---
 const FRAME_CAPTURE_INTERVAL_MS = 30000; // 30秒ごと
 const FRAME_CAPTURE_DURATION_MS = 5 * 60 * 1000; // 最初の5分だけ
@@ -1341,12 +1350,19 @@ async function setupAudioAnalysis(displayStream) {
     return;
   }
 
+  // ScriptProcessorNode は destination への経路が無いと onaudioprocess が
+  // 発火しない実装があるため、gain=0の共有ノードで無音のまま繋ぐ。
+  audioChunkGainNode = audioContext.createGain();
+  audioChunkGainNode.gain.value = 0;
+  audioChunkGainNode.connect(audioContext.destination);
+
   // 相手 = タブ音声（getDisplayMedia の audio トラックを流用。スピーカー前のデジタル音声）
   const audioTracks = displayStream.getAudioTracks();
   if (audioTracks[0]) {
     try {
       const src = audioContext.createMediaStreamSource(new MediaStream([audioTracks[0]]));
       vad.other.analyser = makeAnalyser(src);
+      audioChunkProcessors.other = setupAudioChunkCapture(src, "other");
       sendDiagnostic("audio_status", "other(tab) VAD enabled");
     } catch (error) {
       sendDiagnostic("audio_init_error", `other(tab) failed: ${error.name} ${error.message}`);
@@ -1367,6 +1383,7 @@ async function setupAudioAnalysis(displayStream) {
     try {
       const micSrc = audioContext.createMediaStreamSource(micStream);
       vad.self.analyser = makeAnalyser(micSrc);
+      audioChunkProcessors.self = setupAudioChunkCapture(micSrc, "self");
       sendDiagnostic("audio_status", "self(mic) VAD enabled");
     } catch (error) {
       sendDiagnostic("audio_init_error", `self(mic) connect failed: ${error.name} ${error.message}`);
@@ -1386,11 +1403,47 @@ function makeAnalyser(sourceNode) {
   return analyser;
 }
 
+// setupAudioChunkCapture fans out sourceNode into a ScriptProcessorNode that
+// sends every buffer as a continuous audio_chunk (plan/
+// realtime-llm-context-next-steps.md Step 4), independent of the VAD
+// analyser also fed from the same source.
+function setupAudioChunkCapture(sourceNode, speaker) {
+  const processor = audioContext.createScriptProcessor(AUDIO_CHUNK_BUFFER_SIZE, 1, 1);
+  processor.onaudioprocess = (event) => {
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    const input = event.inputBuffer.getChannelData(0);
+    ws.send(
+      JSON.stringify({
+        type: "audio_chunk",
+        session_id: sessionId,
+        speaker,
+        t_ms: Date.now(),
+        sample_rate: audioContext.sampleRate,
+        pcm: encodePCM16Base64(input)
+      })
+    );
+  };
+  sourceNode.connect(processor);
+  processor.connect(audioChunkGainNode);
+  return processor;
+}
+
 function teardownAudioAnalysis() {
   if (micStream) {
     for (const t of micStream.getTracks()) t.stop();
   }
   micStream = null;
+  for (const key of ["self", "other"]) {
+    if (audioChunkProcessors[key]) {
+      audioChunkProcessors[key].onaudioprocess = null;
+      audioChunkProcessors[key].disconnect();
+      audioChunkProcessors[key] = null;
+    }
+  }
+  if (audioChunkGainNode) {
+    audioChunkGainNode.disconnect();
+    audioChunkGainNode = null;
+  }
   if (audioContext) audioContext.close().catch(() => {});
   audioContext = null;
   vad.self = createVadState();
@@ -1469,6 +1522,21 @@ function sampleVad() {
     s.history.push({ t: now, speaking });
     while (s.history.length && s.history[0].t < cutoff) s.history.shift();
   }
+}
+
+// encodePCM16Base64 converts a Float32 time-domain buffer ([-1, 1]) to
+// little-endian 16-bit PCM and base64-encodes it, matching architecture.md's
+// audio_chunk.pcm shape.
+function encodePCM16Base64(floatBuf) {
+  const int16 = new Int16Array(floatBuf.length);
+  for (let i = 0; i < floatBuf.length; i++) {
+    const clamped = Math.max(-1, Math.min(1, floatBuf[i]));
+    int16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+  }
+  const bytes = new Uint8Array(int16.buffer);
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
 }
 
 function buildSpeechFeatures() {
@@ -1772,13 +1840,16 @@ function sendMoodWaveSample() {
     }
   };
 
-  // ローカルtriggerがこのtickまでに発火していれば同梱する(evidence_frame
-  // のMedia API連携はplan/mood-wave-contract-migration.mdのStep 7/8待ち。
-  // 先に繋ぐとImage Analysis Workerがpurposeを見ずbaselineを壊しうるため、
-  // 現状はtrigger情報のみ送りevidence_frameは送らない)。
+  // ローカルtriggerがこのtickまでに発火していれば同梱する。evidence_frame
+  // はmood_wave_sample契約上trigger本体とは別のトップレベルフィールドなので
+  // ここで分離する(backend/internal/contract/mood_wave.go)。
   const trigger = consumePendingTrigger();
   if (trigger) {
-    event.trigger = trigger;
+    const { evidence_frame: evidenceFrame, ...triggerInfo } = trigger;
+    event.trigger = triggerInfo;
+    if (evidenceFrame) {
+      event.evidence_frame = evidenceFrame;
+    }
   }
 
   if (ws?.readyState === WebSocket.OPEN) {
@@ -2509,10 +2580,8 @@ function captureMoment(trigger) {
 
   // architecture.md の trigger は WebSocket 上の独立メッセージではなく、
   // 次に送る mood_wave_sample に同梱する(sendMoodWaveSample 側で消費)。
-  // 画像(evidence_frame)は Media API 連携が繋がるまで送らない
-  // (plan/mood-wave-contract-migration.md Step 7/8 待ち)。
   const triggerType = trigger.direction === "nod" ? "nod" : trigger.direction === "rise" ? "wave_rise" : "wave_drop";
-  pendingTrigger = {
+  const baseTrigger = {
     trigger_id: `trig_${crypto.randomUUID()}`,
     type: triggerType,
     source: "chrome",
@@ -2523,7 +2592,7 @@ function captureMoment(trigger) {
     type: "local_moment_trigger",
     session_id: sessionId,
     t_ms: trigger.t_ms,
-    ...pendingTrigger,
+    ...baseTrigger,
     snapshot_t_ms: moment.snapshot_t_ms,
     snapshot_lag_ms: moment.snapshot_t_ms == null ? null : trigger.peak_t_ms - moment.snapshot_t_ms,
     has_snapshot: moment.blob != null,
@@ -2534,6 +2603,85 @@ function captureMoment(trigger) {
   if (trigger.direction !== "nod") {
     activeExcursion = { moment, startTs: trigger.t_ms };
   }
+
+  // pendingTrigger はここで即座にtrigger-onlyでセットせず、evidence frame の
+  // upload-url 取得(または失敗)を待ってから確定させる(plan/
+  // realtime-llm-context-next-steps.md Step 1: 同じtriggerのmood_wave_sample
+  // にevidence_frameを同梱するため)。次のsendMoodWaveSampleまでにfetchが
+  // 終わらなければ、そのtickはtriggerなしで送られ、次のtickで拾われる。
+  attachEvidenceFrame(baseTrigger, moment);
+}
+
+// attachEvidenceFrame requests a Media API upload URL for this trigger's
+// snapshot (moment.blob, the tab-wide JPEG captureSnapshotFrame already
+// buffered) and sets pendingTrigger once media_ref is known — or with
+// trigger-only if there's no snapshot or the request fails, so a trigger is
+// never dropped for evidence-frame reasons. The image PUT itself runs
+// concurrently, unawaited (plan/realtime-llm-context-next-steps.md Step 1).
+async function attachEvidenceFrame(baseTrigger, moment) {
+  const mediaApiBaseUrl = window.REACTION_ENGINE_CONFIG?.mediaApiBaseUrl;
+  if (!mediaApiBaseUrl || !moment.blob) {
+    pendingTrigger = baseTrigger;
+    return;
+  }
+
+  const snapshotTMs = moment.snapshot_t_ms ?? baseTrigger.peak_t_ms;
+  const captureId = `cap_${snapshotTMs}_${baseTrigger.trigger_id}`;
+
+  try {
+    const uploadURLRes = await fetch(`${mediaApiBaseUrl}/sessions/${sessionId}/media/upload-url`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        purpose: "evidence_frame",
+        content_type: "image/jpeg",
+        capture_id: captureId,
+        t_ms: snapshotTMs,
+        trigger_id: baseTrigger.trigger_id
+      })
+    });
+    if (!uploadURLRes.ok) throw new Error(`upload-url failed: ${uploadURLRes.status}`);
+    const { upload_url: uploadUrl, media_ref: mediaRef } = await uploadURLRes.json();
+
+    pendingTrigger = {
+      ...baseTrigger,
+      evidence_frame: {
+        capture_id: captureId,
+        media_ref: mediaRef,
+        upload_status: "uploading",
+        snapshot_t_ms: snapshotTMs,
+        snapshot_lag_ms: baseTrigger.peak_t_ms - snapshotTMs,
+        content_type: "image/jpeg"
+      }
+    };
+
+    putEvidenceFrame(mediaApiBaseUrl, uploadUrl, captureId, moment.blob).catch((error) => {
+      logEvent({ type: "evidence_upload_error", trigger_id: baseTrigger.trigger_id, capture_id: captureId, message: error.message });
+    });
+  } catch (error) {
+    logEvent({ type: "evidence_upload_url_error", trigger_id: baseTrigger.trigger_id, message: error.message });
+    pendingTrigger = baseTrigger;
+  }
+}
+
+// putEvidenceFrame PUTs the evidence frame blob to the signed/local upload
+// URL and then calls Media API's complete endpoint, mirroring
+// uploadBaselineFrame's PUT+complete pair. Runs unawaited from
+// attachEvidenceFrame so it never delays the trigger's mood_wave_sample.
+async function putEvidenceFrame(mediaApiBaseUrl, uploadUrl, captureId, blob) {
+  const putRes = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "image/jpeg" },
+    body: blob
+  });
+  if (!putRes.ok) throw new Error(`local-upload failed: ${putRes.status}`);
+
+  const completeRes = await fetch(`${mediaApiBaseUrl}/sessions/${sessionId}/media/${captureId}/complete`, {
+    method: "POST"
+  });
+  if (!completeRes.ok) throw new Error(`complete failed: ${completeRes.status}`);
+
+  logEvent({ type: "evidence_frame_uploaded", capture_id: captureId });
 }
 
 // 偏差がベースライン付近へ戻った時点で盛り上がり区間を閉じ、継続時間を確定する
