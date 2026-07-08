@@ -170,7 +170,14 @@ module "writer_service" {
 
 デプロイ確認は media-api の時と同じ手順(`gcloud builds submit` で Artifact Registry に push → `terraform apply -var="writer_image_tag=$(git rev-parse --short HEAD)"`)。
 
-## Step I: Memorystore for Redis + Serverless VPC Access
+## Step I: Memorystore for Redis + Serverless VPC Access(実装済み・develop に直接コミット)
+
+**Step I・J はともに実装し、`terraform fmt`/`validate`/`plan`(実リモート state 相手)まで確認済み。`apply` はユーザー自身が実行する。** develop の他の作業と無関係な `infra/` 配下のみの変更のため、PR を介さず `develop` へ直接コミット・push した(コミット `85ae346`)。
+
+実装時に以下、下書きから変更した点:
+- `subnet_cidr` 変数は `connector_subnet_cidr` に改名(コネクタ専用サブネットであることを明示)。
+- Memorystore の `connect_mode` は `PRIVATE_SERVICE_ACCESS` ではなく `DIRECT_PEERING` を採用。`PRIVATE_SERVICE_ACCESS` は追加で `google_service_networking_connection` + `google_compute_global_address` が要るため、モジュールを自己完結させるために `DIRECT_PEERING` にした(`infra/modules/memorystore/README.md` に理由を明記)。
+- `cloud-run-service` モジュールの `vpc_access` は `dynamic` ブロックとして実装(`var.vpc_connector != null` のときのみ生成)、下書き通り。
 
 gateway と image-analysis-worker は Redis(`REDIS_ADDR`)に依存する。Memorystore for Redis は VPC 内部 IP しか持たないため、Cloud Run から到達するには Serverless VPC Access コネクタが要る(`infra/modules/vpc/README.md` に明記済み)。`infra/modules/vpc/`・`infra/modules/memorystore/` は現状 README のみのプレースホルダーなので、ここで実装する。
 
@@ -259,7 +266,7 @@ variable "vpc_egress" {
 
 `main.tf` の `google_cloud_run_v2_service` リソースに `vpc_access` ブロックを条件付きで追加する(`dynamic "vpc_access"` ブロック、`var.vpc_connector != null` の時だけ生成)。
 
-## Step J: gateway を Cloud Run Service としてデプロイする
+## Step J: gateway を Cloud Run Service としてデプロイする(実装済み・develop に直接コミット)
 
 Step I 完了後。gateway は WebSocket サーバーであり、Cloud Run の WebSocket サポート(HTTP/1.1 アップグレード)は最大 60 分のリクエストタイムアウト内でのみ有効 ── `architecture.md` の「Cloud Run WebSocket は timeout / reconnect を前提にする」という設計上の注意通り、これは Chrome 拡張側の再接続ロジックで吸収する前提とする(拡張側の対応状況はこの文書のスコープ外)。
 
