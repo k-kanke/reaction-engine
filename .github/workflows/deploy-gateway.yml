@@ -89,6 +89,7 @@ jobs:
           gcloud builds submit \
             --project="${PROJECT_ID}" \
             --region="${REGION}" \
+            --suppress-logs \
             --config=/tmp/cloudbuild-gateway.yaml \
             .
 
