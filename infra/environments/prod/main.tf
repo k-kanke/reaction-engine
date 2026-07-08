@@ -6,6 +6,10 @@
 # (a secret) is intentionally not created here; see
 # modules/service-account/README.md.
 
+data "google_project" "current" {
+  project_id = var.project_id
+}
+
 module "media_service_account" {
   source = "../../modules/service-account"
 
@@ -43,6 +47,12 @@ module "media_bucket" {
     {
       role    = "roles/storage.objectAdmin"
       members = [module.media_service_account.member]
+    },
+    {
+      role = "roles/storage.objectViewer"
+      members = [
+        "serviceAccount:service-${data.google_project.current.number}@gcp-sa-aiplatform.iam.gserviceaccount.com",
+      ]
     }
   ]
 }
