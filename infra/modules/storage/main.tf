@@ -8,6 +8,16 @@ resource "google_storage_bucket" "this" {
   versioning {
     enabled = var.versioning_enabled
   }
+
+  dynamic "cors" {
+    for_each = var.cors
+    content {
+      origin          = cors.value.origins
+      method          = cors.value.methods
+      response_header = cors.value.response_headers
+      max_age_seconds = cors.value.max_age_seconds
+    }
+  }
 }
 
 # Flattened so each (role, member) pair gets its own resource instance --
