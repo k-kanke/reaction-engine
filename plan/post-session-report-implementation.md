@@ -113,11 +113,10 @@ report_deliveries 保存
 
 作業:
 
-- writer 用の service account を作る(`roles/cloudsql.client` + JSONL バケットへの
+- JSONL 専用の新規バケット(例: `reaction-engine-501316-jsonl`)を
+  `module.storage` で作る(media バケットとは分離。IAMも独立させる)。
+- writer 用の service account を作る(`roles/cloudsql.client` + このバケットへの
   `roles/storage.objectAdmin`)。
-- JSONL の保存先バケットを決める(後述「未決定事項」参照。まずは既存の
-  `module.media_bucket` を再利用し、`sessions/{id}/mood-wave/...` 等のプレフィックスで
-  同居させるのが最短)。
 - `module.writer_service`(`cloud-run-service` モジュール流用)を追加。
   `env_vars` に `JSONL_STORE_BACKEND=gcs`, `GCS_JSONL_BUCKET`, `DATABASE_URL` を渡す。
   gateway と同様 Cloud SQL 接続が要るので `cloudsql_connection_names` を設定。
@@ -193,7 +192,7 @@ report_deliveries 保存
 - `terraform plan` で3つの Cloud Run Job(`r-post-session-job` / `r-pdf-renderer` /
   `r-gmail-sender`)が作成される。
 
-### Step 5: セッション終了検知 と Job 起動の仕組みを作る
+### Step 5: セッション終了検知 と Job 起動の仕組みを作る(gatewayから直接起動)
 
 対象:
 
@@ -204,7 +203,7 @@ report_deliveries 保存
 作業:
 
 - `stopCapture()` から WebSocket 経由で明示的な `session_end` メッセージを送る
-  (「未決定事項」参照。タブが閉じられる/画面共有が切れるケースも `stream.getVideoTracks()[0]
+  (タブが閉じられる/画面共有が切れるケースも `stream.getVideoTracks()[0]
   'ended'` で `stopCapture` に来るので拾える)。
 - gateway が `session_end` を受け取ったら、Cloud Run Admin API
   (`run.googleapis.com/v2/.../jobs/r-post-session-job:run`)を叩いて
@@ -268,24 +267,41 @@ report_deliveries 保存
 - 実際にフィードバックメッセージ・transcript 抜粋を含む report.pdf を開いて、日本語が
   正しく表示される。
 
-### Step 8: Gmail Sender の実装
+### Step 8: Gmail Sender の実装(専用Gmailアカウント + OAuth)
 
 対象:
 
 - `backend/cmd/gmail-sender/main.go`
-- 送信先メールアドレスの取得経路(extension 側 UI か、session metadata)
+- 新規 `backend/internal/gmail/`(Gmail API 送信処理)
+- Secret Manager(リフレッシュトークン保管)
+- extension 側 UI(送信先メールアドレス入力)
 
 作業:
 
-- 認証方式を決める(「未決定事項」参照)。
-- 決めた方式で実際に PDF を添付して Gmail API 経由送信する処理に置き換える。
+- このアプリ専用の Gmail アカウント(例: `reaction-engine-notifications@gmail.com`)
+  を作成する。
+- Google Cloud Console で OAuth 同意画面を設定し、`gmail.send` スコープでその専用
+  アカウント自身に対して一度だけ認可フローを回し、リフレッシュトークンを取得する。
+  取得したリフレッシュトークンは Secret Manager に保存する
+  (`infra/modules/secret-manager` を利用)。
+- **OAuth同意画面を「テスト中」のままにしない。** テスト中はリフレッシュトークンが
+  7日で失効し自動送信が止まるため、`gmail.send`(センシティブスコープ)の Google
+  審査を通して「本番公開」ステータスに上げる。審査には多少時間がかかるので早めに
+  着手する。
+- `backend/internal/gmail` で、保存済みリフレッシュトークンからアクセストークンを
+  都度更新し、Gmail API `users.messages.send` で PDF 添付メールを送る処理を書く。
+- 送信先メールアドレスは、拡張機能側でセッション開始時に入力させる形にする
+  (Step: extension の session 開始UIに入力欄を追加し、`sessions` テーブルか
+  post-session-job 起動時の引数として渡す)。
 - 送信失敗時は `report_deliveries` に失敗ステータスを記録し、architecture.md の
   「PDF送信に失敗してもreport自体は保存済みとして扱う」方針を守る(リトライは
   別管理)。
 
 完了条件:
 
-- 実際に自分のGmail宛にレポートPDFが届く。
+- 実際に指定したGmail宛に、専用アカウントからレポートPDFが届く。
+- リフレッシュトークンが「本番公開」ステータスのアプリで発行されており、7日を
+  超えても自動送信が継続する。
 
 ### Step 9: 各サービス/JobのCI/CDワークフローを整理する
 
@@ -318,22 +334,17 @@ report_deliveries 保存
   レポート生成 → pdf-renderer → gmail-sender の一連が人手を介さず完走することを
   確認する。
 
-## 未決定事項(先に決めたいこと)
+## 決定事項
 
-1. **JSONLの保存先バケット**: 既存の `module.media_bucket`
-   (`reaction-engine-501316-sessions`)を使い回すか、新しいバケットを切るか。
-   architecture.md の例は同一バケット配下に `mood-wave/` `transcript/` `triggers/`
-   `feedback/` `reports/` を並べているので、既存流用が最短。
-2. **post-session Job の起動方式**: gateway から Cloud Run Admin API を直接叩く
-   (Step 5 案)か、Pub/Sub + Eventarc を挟むか。前者はシンプルだが gateway に
-   インフラ操作の責務が増える。後者は architecture.md の Pub/Sub 中心設計に忠実だが
-   実装量が増える。MVPとしてはまず前者で通す想定。
-3. **Gmail送信の認証方式**: (a) Workspaceドメイン全体委任のサービスアカウント、
-   (b) セッション開始時にGoogleサインインしたユーザー自身の `gmail.send` スコープ
-   トークンを使う、のどちらか。(b) は以前話した「アクセス制御用のGoogle認証と
-   兼用できる」という利点があるが、センシティブスコープの審査が要る点に留意。
-4. **送信先メールアドレスの入力経路**: 拡張機能側でセッション開始時に入力させるか、
-   Google Sign-Inのメールアドレスをそのまま使うか。
+1. **JSONLの保存先バケット**: `module.media_bucket` とは別の新規バケットを作る。
+2. **post-session Job の起動方式**: gateway から Cloud Run Admin API を直接叩いて
+   起動する(Pub/Sub + Eventarc は使わない)。
+3. **Gmail送信の認証方式**: このアプリ専用のGmailアカウントを作成し、そのアカウント
+   自身に対して `gmail.send` スコープでOAuth認可を行い、リフレッシュトークンを
+   Secret Managerに保存して使い回す。センシティブスコープのGoogle審査を通し、
+   OAuth同意画面を「本番公開」ステータスにする(テスト中のままだとリフレッシュ
+   トークンが7日で失効するため)。
+4. **送信先メールアドレスの入力経路**: 拡張機能側でセッション開始時に入力させる。
 
 ## 優先順位
 
