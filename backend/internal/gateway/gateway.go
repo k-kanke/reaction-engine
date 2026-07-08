@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
@@ -55,7 +56,18 @@ func NewHandler(redis *gwredis.Client, events *db.LocalEventStore, llmEnabled bo
 // each incoming message by its "type" field, and keeps reading until the
 // client disconnects.
 func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Accept(w, r, nil)
+	if !isAllowedWebSocketOrigin(r) {
+		log.Printf("gateway: websocket origin rejected: origin=%q host=%q", r.Header.Get("Origin"), r.Host)
+		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
+		return
+	}
+
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		// Browser extensions use chrome-extension://<extension-id> origins,
+		// which nhooyr's same-origin default rejects. We perform the narrower
+		// extension-origin check above, then skip the library's duplicate check.
+		InsecureSkipVerify: true,
+	})
 	if err != nil {
 		log.Printf("gateway: websocket accept failed: %v", err)
 		return
@@ -94,6 +106,31 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 			h.writeError(ctx, conn, "unsupported type: "+envelope.Type)
 		}
 	}
+}
+
+func isAllowedWebSocketOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if u.Host == "" {
+		return false
+	}
+	if u.Host == r.Host {
+		return true
+	}
+
+	switch u.Scheme {
+	case "chrome-extension", "moz-extension":
+		return true
+	}
+
+	return false
 }
 
 // handleMoodWaveSample implements architecture.md's "on mood_wave_sample"
