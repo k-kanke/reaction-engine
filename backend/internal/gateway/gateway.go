@@ -16,6 +16,7 @@ import (
 
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
+	"github.com/k-kanke/reaction-engine/backend/internal/postsessiontrigger"
 	"github.com/k-kanke/reaction-engine/backend/internal/realtime"
 	gwredis "github.com/k-kanke/reaction-engine/backend/internal/redis"
 	"github.com/k-kanke/reaction-engine/backend/internal/speech"
@@ -58,11 +59,12 @@ type sttSession struct {
 }
 
 type Handler struct {
-	redis           *gwredis.Client
-	events          *db.LocalEventStore
-	llm             realtime.FeedbackGenerator
-	stt             speech.Recognizer
-	sttLanguageCode string
+	redis              *gwredis.Client
+	events             *db.LocalEventStore
+	llm                realtime.FeedbackGenerator
+	stt                speech.Recognizer
+	sttLanguageCode    string
+	postSessionTrigger postsessiontrigger.Trigger
 }
 
 func NewHandler(redis *gwredis.Client, events *db.LocalEventStore, llmEnabled bool) *Handler {
@@ -84,7 +86,16 @@ func NewHandlerWithFeedbackGenerator(redis *gwredis.Client, events *db.LocalEven
 // real Speech-to-Text Recognizer. recognizer nil keeps the stub transcript
 // path (used by tests and local runs without GCP credentials).
 func NewHandlerWithSTT(redis *gwredis.Client, events *db.LocalEventStore, generator realtime.FeedbackGenerator, recognizer speech.Recognizer, sttLanguageCode string) *Handler {
-	return &Handler{redis: redis, events: events, llm: generator, stt: recognizer, sttLanguageCode: sttLanguageCode}
+	return NewHandlerWithPostSessionTrigger(redis, events, generator, recognizer, sttLanguageCode, nil)
+}
+
+// NewHandlerWithPostSessionTrigger is NewHandlerWithSTT with an injected
+// post-session pipeline Trigger (Step 5 of
+// plan/post-session-report-implementation.md). trigger nil makes
+// session_end a no-op besides logging -- used by tests and local runs
+// without a deployed r-post-session-job/r-pdf-renderer to call.
+func NewHandlerWithPostSessionTrigger(redis *gwredis.Client, events *db.LocalEventStore, generator realtime.FeedbackGenerator, recognizer speech.Recognizer, sttLanguageCode string, trigger postsessiontrigger.Trigger) *Handler {
+	return &Handler{redis: redis, events: events, llm: generator, stt: recognizer, sttLanguageCode: sttLanguageCode, postSessionTrigger: trigger}
 }
 
 // ServeWS handles GET /ws: it accepts the WebSocket connection, dispatches
@@ -144,6 +155,8 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 			h.handleMoodWaveSample(ctx, conn, raw)
 		case "audio_chunk":
 			h.handleAudioChunk(ctx, raw, audioAccumulators, sttSessions)
+		case "session_end":
+			h.handleSessionEnd(raw)
 		default:
 			h.writeError(ctx, conn, "unsupported type: "+envelope.Type)
 		}
@@ -232,6 +245,32 @@ func (h *Handler) handleMoodWaveSample(ctx context.Context, conn *websocket.Conn
 	}
 
 	h.enqueueTriggerAndFeedback(ctx, msg, feedback)
+}
+
+// handleSessionEnd starts the post-session report pipeline (Step 5 of
+// plan/post-session-report-implementation.md) for the session that just
+// ended. It runs in its own goroutine with a fresh background context --
+// not r.Context() from ServeWS, which cancels the moment this WebSocket
+// connection closes, which typically happens right after the extension
+// sends session_end. The pipeline (post-session-job then pdf-renderer) can
+// take longer than that and must survive the disconnect.
+func (h *Handler) handleSessionEnd(raw json.RawMessage) {
+	if h.postSessionTrigger == nil {
+		return
+	}
+
+	var msg contract.SessionEndMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		log.Printf("gateway: invalid session_end payload: %v", err)
+		return
+	}
+	if msg.SessionID == "" {
+		log.Printf("gateway: session_end missing session_id")
+		return
+	}
+
+	log.Printf("gateway: session_end received session_id=%s, starting post-session pipeline", msg.SessionID)
+	go h.postSessionTrigger.TriggerSessionEnd(context.Background(), msg.SessionID)
 }
 
 // enqueueTriggerAndFeedback publishes the trigger_event/feedback_event for

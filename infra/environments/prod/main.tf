@@ -62,6 +62,21 @@ module "media_bucket" {
       members = [
         "serviceAccount:service-${data.google_project.current.number}@gcp-sa-aiplatform.iam.gserviceaccount.com",
       ]
+    },
+    {
+      # Step 2 (plan/post-session-report-implementation.md): lets
+      # image-analysis-worker read baseline frames it didn't upload itself
+      # (media-api wrote them under media_service_account) to populate
+      # participant_baselines / visual_summaries.
+      role    = "roles/storage.objectViewer"
+      members = [module.image_analysis_worker_service_account.member]
+    },
+    {
+      # Step 4: pdf-renderer writes sessions/{id}/reports/report.pdf here
+      # (internal/media.MediaWriter.Write), separate from the baseline/
+      # evidence frames media-api/image-analysis-worker deal with.
+      role    = "roles/storage.objectAdmin"
+      members = [module.pdf_renderer_service_account.member]
     }
   ]
 }
@@ -107,8 +122,16 @@ module "backend_images" {
 
   iam_bindings = [
     {
-      role    = "roles/artifactregistry.reader"
-      members = [module.media_service_account.member, module.gateway_service_account.member]
+      role = "roles/artifactregistry.reader"
+      members = [
+        module.media_service_account.member,
+        module.gateway_service_account.member,
+        module.writer_service_account.member,
+        module.image_analysis_worker_service_account.member,
+        module.post_session_job_service_account.member,
+        module.pdf_renderer_service_account.member,
+        module.gmail_sender_service_account.member,
+      ]
     }
   ]
 }
@@ -236,6 +259,12 @@ module "gateway_service" {
     ENABLE_REAL_STT       = "true"
     STT_LANGUAGE_CODE     = "ja-JP"
     DATABASE_URL          = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+    # Step 5 (plan/post-session-report-implementation.md): on session_end,
+    # gateway calls the Cloud Run Admin API to run r-post-session-job then
+    # r-pdf-renderer for that session (internal/postsessiontrigger).
+    ENABLE_POST_SESSION_JOBS = "true"
+    GCP_PROJECT              = var.project_id
+    GCP_REGION               = var.region
   }
 
   # Chrome extension clients connect directly and can't hold GCP identity
@@ -248,4 +277,215 @@ module "gateway_service" {
   # doesn't get cut by a cold start, and cap low for MVP traffic.
   min_instance_count = 1
   max_instance_count = 3
+}
+
+# Step 1 (plan/post-session-report-implementation.md): dedicated bucket for
+# mood_wave_sample/trigger/feedback/transcript JSONL that writer produces
+# and post-session-job later reads back. Kept separate from module.media_bucket
+# (baseline/evidence frames) so each bucket's IAM stays scoped to the one
+# service account that actually needs it.
+module "jsonl_bucket" {
+  source = "../../modules/storage"
+
+  project_id = var.project_id
+  name       = var.jsonl_bucket_name
+  location   = var.region
+
+  iam_bindings = [
+    {
+      role    = "roles/storage.objectAdmin"
+      members = [module.writer_service_account.member]
+    },
+    {
+      # Step 4: post-session-job reads mood_wave_sample JSONL back to
+      # build the report -- read-only, it never writes here.
+      role    = "roles/storage.objectViewer"
+      members = [module.post_session_job_service_account.member]
+    }
+  ]
+}
+
+# writer polls local_events (feature-events stand-in) and persists
+# mood_wave_sample to JSONL plus trigger_events/feedback_events/transcripts
+# to both JSONL and Postgres -- needs Cloud SQL like gateway/media-api, but
+# no VPC connector (it never talks to Redis).
+module "writer_service_account" {
+  source = "../../modules/service-account"
+
+  project_id    = var.project_id
+  account_id    = "reaction-engine-writer"
+  display_name  = "Reaction Engine Writer"
+  project_roles = ["roles/cloudsql.client"]
+}
+
+module "writer_service" {
+  source = "../../modules/cloud-run-service"
+
+  project_id = var.project_id
+  location   = var.region
+
+  service_name              = "r-writer"
+  image                     = "${module.backend_images.repository_url}/writer:${var.writer_image_tag}"
+  service_account_email     = module.writer_service_account.email
+  container_port            = 8080
+  cloudsql_connection_names = [module.db.connection_name]
+
+  env_vars = {
+    JSONL_STORE_BACKEND = "gcs"
+    GCS_JSONL_BUCKET    = module.jsonl_bucket.name
+    WRITER_PORT         = "8080"
+    DATABASE_URL        = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+  }
+
+  # writer is a poll-loop worker, not something callers hit -- no invoker
+  # members needed. Cloud Run's own health checks reach the container over
+  # the container port directly and aren't gated by roles/run.invoker.
+  allow_unauthenticated = false
+
+  # A poll-loop worker has no incoming HTTP traffic to keep it warm, so
+  # min_instance_count=0 (the module default) would let Cloud Run scale it
+  # to zero and the poll loop would stop running. Keep exactly one instance
+  # alive at all times; this is a singleton consumer of local_events, so
+  # max_instance_count stays at 1 too (more instances would double-process
+  # the same unacked rows).
+  min_instance_count = 1
+  max_instance_count = 1
+}
+
+# Step 2 (plan/post-session-report-implementation.md): image-analysis-worker
+# polls media-analysis-events (local_events stand-in) for media_uploaded
+# payloads and calls SetBaselineReady, populating participant_baselines /
+# visual_summaries that post-session-job's baseline_context depends on.
+# Needs Cloud SQL (like writer) plus Redis over the VPC connector (like
+# gateway) plus read access to media_bucket's baseline frames -- it never
+# writes to that bucket itself (media-api owns uploads).
+module "image_analysis_worker_service_account" {
+  source = "../../modules/service-account"
+
+  project_id    = var.project_id
+  account_id    = "reaction-engine-image-worker"
+  display_name  = "Reaction Engine Image Analysis Worker"
+  project_roles = ["roles/cloudsql.client"]
+}
+
+module "image_analysis_worker_service" {
+  source = "../../modules/cloud-run-service"
+
+  project_id = var.project_id
+  location   = var.region
+
+  service_name              = "r-image-analysis-worker"
+  image                     = "${module.backend_images.repository_url}/image-analysis-worker:${var.image_analysis_worker_image_tag}"
+  service_account_email     = module.image_analysis_worker_service_account.email
+  container_port            = 8082
+  cloudsql_connection_names = [module.db.connection_name]
+  vpc_connector             = module.vpc.connector_id
+  vpc_egress                = "PRIVATE_RANGES_ONLY"
+
+  env_vars = {
+    MEDIA_STORE_BACKEND              = "gcs"
+    GCS_MEDIA_BUCKET                 = module.media_bucket.name
+    IMAGE_ANALYSIS_WORKER_DEBUG_PORT = "8082"
+    REDIS_ADDR                       = "${module.redis.host}:${module.redis.port}"
+    DATABASE_URL                     = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+  }
+
+  # Poll-loop worker like writer -- no invoker members, and needs to stay
+  # warm continuously or it stops draining media-analysis-events.
+  allow_unauthenticated = false
+  min_instance_count    = 1
+  max_instance_count    = 1
+}
+
+# Step 4 (plan/post-session-report-implementation.md): the three Cloud Run
+# Jobs that turn a finished session's raw data into a delivered report.
+# Each is a `--session-id`-driven CLI (gmail-sender also takes `--to`) with
+# no scheduler of its own -- Step 5 wires gateway to call jobs.run with the
+# real session ID as an execution-time args override once session_end
+# detection exists. Until then they can be triggered manually with
+# `gcloud run jobs execute <job> --args=--session-id=<id> --region=...`.
+
+module "post_session_job_service_account" {
+  source = "../../modules/service-account"
+
+  project_id    = var.project_id
+  account_id    = "reaction-engine-post-session"
+  display_name  = "Reaction Engine Post-Session Job"
+  project_roles = ["roles/cloudsql.client"]
+}
+
+module "post_session_job" {
+  source = "../../modules/cloud-run-job"
+
+  project_id = var.project_id
+  location   = var.region
+
+  job_name                  = "r-post-session-job"
+  image                     = "${module.backend_images.repository_url}/post-session-job:${var.post_session_job_image_tag}"
+  service_account_email     = module.post_session_job_service_account.email
+  cloudsql_connection_names = [module.db.connection_name]
+
+  env_vars = {
+    JSONL_STORE_BACKEND = "gcs"
+    GCS_JSONL_BUCKET    = module.jsonl_bucket.name
+    DATABASE_URL        = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+  }
+
+  invoker_members = [module.gateway_service_account.member]
+}
+
+module "pdf_renderer_service_account" {
+  source = "../../modules/service-account"
+
+  project_id    = var.project_id
+  account_id    = "reaction-engine-pdf-renderer"
+  display_name  = "Reaction Engine PDF Renderer"
+  project_roles = ["roles/cloudsql.client"]
+}
+
+module "pdf_renderer_job" {
+  source = "../../modules/cloud-run-job"
+
+  project_id = var.project_id
+  location   = var.region
+
+  job_name                  = "r-pdf-renderer"
+  image                     = "${module.backend_images.repository_url}/pdf-renderer:${var.pdf_renderer_image_tag}"
+  service_account_email     = module.pdf_renderer_service_account.email
+  cloudsql_connection_names = [module.db.connection_name]
+
+  env_vars = {
+    MEDIA_STORE_BACKEND = "gcs"
+    GCS_MEDIA_BUCKET    = module.media_bucket.name
+    DATABASE_URL        = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+  }
+
+  invoker_members = [module.gateway_service_account.member]
+}
+
+module "gmail_sender_service_account" {
+  source = "../../modules/service-account"
+
+  project_id    = var.project_id
+  account_id    = "reaction-engine-gmail-sender"
+  display_name  = "Reaction Engine Gmail Sender"
+  project_roles = ["roles/cloudsql.client"]
+}
+
+module "gmail_sender_job" {
+  source = "../../modules/cloud-run-job"
+
+  project_id = var.project_id
+  location   = var.region
+
+  job_name                  = "r-gmail-sender"
+  image                     = "${module.backend_images.repository_url}/gmail-sender:${var.gmail_sender_image_tag}"
+  service_account_email     = module.gmail_sender_service_account.email
+  cloudsql_connection_names = [module.db.connection_name]
+
+  env_vars = {
+    DATABASE_URL = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+  }
+
+  invoker_members = [module.gateway_service_account.member]
 }

@@ -364,6 +364,15 @@ async function startCapture() {
 }
 
 function stopCapture() {
+  // architecture.md の Post-session Job 起動トリガー(plan/
+  // post-session-report-implementation.md Step 5)。タブが閉じられる/画面
+  // 共有が切れるケースも stream.getVideoTracks()[0] の "ended" 経由で
+  // ここに来るため、Stop ボタン以外の終了経路もまとめて拾える。stream が
+  // null(まだキャプチャ開始前)なら実セッションではないので送らない。
+  if (stream && ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "session_end", session_id: sessionId }));
+  }
+
   if (analysisTimer) window.clearInterval(analysisTimer);
   if (eventTimer) window.clearInterval(eventTimer);
   if (vadTimer) window.clearInterval(vadTimer);

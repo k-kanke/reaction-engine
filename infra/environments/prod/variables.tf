@@ -45,3 +45,33 @@ variable "gateway_image_tag" {
   type        = string
   description = "Short git commit hash of the gateway image to deploy, e.g. output of `git rev-parse --short HEAD`. No default -- pass explicitly on every apply (-var or TF_VAR_gateway_image_tag) so a deploy always traces back to one commit."
 }
+
+variable "jsonl_bucket_name" {
+  type        = string
+  description = "Globally unique Cloud Storage bucket name for mood_wave_sample/trigger/feedback/transcript JSONL (plan/post-session-report-implementation.md Step 1). Separate from media_bucket_name so IAM stays scoped independently -- set it in terraform.tfvars, e.g. \"<project_id>-reaction-engine-jsonl\"."
+}
+
+variable "writer_image_tag" {
+  type        = string
+  description = "Short git commit hash of the writer image to deploy, e.g. output of `git rev-parse --short HEAD`. No default -- pass explicitly on every apply (-var or TF_VAR_writer_image_tag) so a deploy always traces back to one commit."
+}
+
+variable "image_analysis_worker_image_tag" {
+  type        = string
+  description = "Short git commit hash of the image-analysis-worker image to deploy, e.g. output of `git rev-parse --short HEAD`. No default -- pass explicitly on every apply (-var or TF_VAR_image_analysis_worker_image_tag) so a deploy always traces back to one commit."
+}
+
+variable "post_session_job_image_tag" {
+  type        = string
+  description = "Short git commit hash of the post-session-job image to deploy, e.g. output of `git rev-parse --short HEAD`. No default -- pass explicitly on every apply (-var or TF_VAR_post_session_job_image_tag) so a deploy always traces back to one commit."
+}
+
+variable "pdf_renderer_image_tag" {
+  type        = string
+  description = "Short git commit hash of the pdf-renderer image to deploy, e.g. output of `git rev-parse --short HEAD`. No default -- pass explicitly on every apply (-var or TF_VAR_pdf_renderer_image_tag) so a deploy always traces back to one commit."
+}
+
+variable "gmail_sender_image_tag" {
+  type        = string
+  description = "Short git commit hash of the gmail-sender image to deploy, e.g. output of `git rev-parse --short HEAD`. No default -- pass explicitly on every apply (-var or TF_VAR_gmail_sender_image_tag) so a deploy always traces back to one commit."
+}

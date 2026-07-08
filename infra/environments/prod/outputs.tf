@@ -66,3 +66,40 @@ output "gateway_url" {
   value       = module.gateway_service.uri
   description = "r-gateway's Cloud Run URL (wss://<this-without-https>/ws for the WebSocket endpoint). Publicly reachable (allow_unauthenticated) since Chrome extension clients can't hold GCP identity tokens -- see plan/gcp-deployment-runbook.md Step J."
 }
+
+output "jsonl_bucket_name" {
+  value = module.jsonl_bucket.name
+}
+
+output "writer_service_account_email" {
+  value = module.writer_service_account.email
+}
+
+output "writer_url" {
+  value       = module.writer_service.uri
+  description = "r-writer's Cloud Run URL. Not meant to be called -- it's a poll-loop worker with only a /healthz endpoint -- but Cloud Run always assigns one."
+}
+
+output "image_analysis_worker_service_account_email" {
+  value = module.image_analysis_worker_service_account.email
+}
+
+output "image_analysis_worker_url" {
+  value       = module.image_analysis_worker_service.uri
+  description = "r-image-analysis-worker's Cloud Run URL. Not meant to be called -- it's a poll-loop worker with only a /debug/healthz endpoint -- but Cloud Run always assigns one."
+}
+
+output "post_session_job_name" {
+  value       = module.post_session_job.name
+  description = "Trigger with `gcloud run jobs execute r-post-session-job --region=<region> --args=--session-id=<id>`."
+}
+
+output "pdf_renderer_job_name" {
+  value       = module.pdf_renderer_job.name
+  description = "Trigger with `gcloud run jobs execute r-pdf-renderer --region=<region> --args=--session-id=<id>`."
+}
+
+output "gmail_sender_job_name" {
+  value       = module.gmail_sender_job.name
+  description = "Trigger with `gcloud run jobs execute r-gmail-sender --region=<region> --args=--session-id=<id>,--to=<email>`."
+}

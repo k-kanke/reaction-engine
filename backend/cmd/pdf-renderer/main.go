@@ -103,9 +103,9 @@ func main() {
 
 // reportToLines flattens a postsession.Report into the plain-text lines
 // internal/pdf.Render expects. Free-text fields (transcript_summary,
-// feedback message) may contain Japanese; pdf.Render's sanitizeLine keeps
-// the ASCII structure and flags what it dropped rather than corrupting the
-// PDF — see internal/pdf's doc comment.
+// feedback message) routinely contain Japanese; pdf.Render embeds a CJK
+// font and word-wraps each line, so these render as-is — see internal/pdf's
+// doc comment.
 func reportToLines(r postsession.Report) []string {
 	var lines []string
 

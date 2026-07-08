@@ -1,4 +1,4 @@
-name: Deploy gateway
+name: Deploy writer
 
 on:
   push:
@@ -8,14 +8,12 @@ on:
       - backend/Dockerfile
       - backend/go.mod
       - backend/go.sum
-      - backend/cmd/gateway/**
+      - backend/cmd/writer/**
       - backend/internal/contract/**
       - backend/internal/db/**
-      - backend/internal/gateway/**
-      - backend/internal/realtime/**
-      - backend/internal/redis/**
+      - backend/internal/writer/**
       - infra/**
-      - .github/workflows/deploy-gateway.yml
+      - .github/workflows/deploy-writer.yml
   workflow_dispatch:
 
 permissions:
@@ -25,7 +23,7 @@ permissions:
 env:
   PROJECT_ID: reaction-engine-501316
   REGION: asia-northeast1
-  SERVICE: gateway
+  SERVICE: writer
   TF_VAR_project_id: reaction-engine-501316
   TF_VAR_region: asia-northeast1
   TF_VAR_media_bucket_name: ${{ vars.MEDIA_BUCKET_NAME }}
@@ -35,7 +33,7 @@ env:
 
 jobs:
   deploy:
-    name: Build and deploy r-gateway
+    name: Build and deploy r-writer
     runs-on: ubuntu-latest
 
     steps:
@@ -78,20 +76,20 @@ jobs:
           fi
           echo "MEDIA_API_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
 
-      - name: Read current writer image tag
-        id: writer
+      - name: Read current gateway image tag
+        id: gateway
         working-directory: infra/environments/prod
         run: |
           tag="$(
-            terraform state show module.writer_service.google_cloud_run_v2_service.this \
-              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/writer:([^"]+)".*/\1/p' \
+            terraform state show module.gateway_service.google_cloud_run_v2_service.this \
+              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/gateway:([^"]+)".*/\1/p' \
               | head -n 1
           )"
           if [ -z "$tag" ]; then
-            echo "Failed to read current writer image tag from Terraform state" >&2
+            echo "Failed to read current gateway image tag from Terraform state" >&2
             exit 1
           fi
-          echo "WRITER_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "GATEWAY_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
 
       - name: Read current image-analysis-worker image tag
         id: image-analysis-worker
@@ -153,10 +151,10 @@ jobs:
           fi
           echo "GMAIL_SENDER_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
 
-      - name: Build and push gateway image
+      - name: Build and push writer image
         run: |
           image="${REGION}-docker.pkg.dev/${PROJECT_ID}/reaction-engine-backend/${SERVICE}:${TAG}"
-          cat > /tmp/cloudbuild-gateway.yaml <<EOF
+          cat > /tmp/cloudbuild-writer.yaml <<EOF
           steps:
             - name: 'gcr.io/cloud-builders/docker'
               args: ['build', '--platform', 'linux/amd64', '--build-arg', 'SERVICE=${SERVICE}', '-t', '${image}', '-f', 'backend/Dockerfile', 'backend']
@@ -167,7 +165,7 @@ jobs:
             --project="${PROJECT_ID}" \
             --region="${REGION}" \
             --async \
-            --config=/tmp/cloudbuild-gateway.yaml \
+            --config=/tmp/cloudbuild-writer.yaml \
             . 2>&1
           )"
           echo "$submit_output"
@@ -201,13 +199,13 @@ jobs:
             sleep 5
           done
 
-      - name: Deploy gateway with Terraform
+      - name: Deploy writer with Terraform
         working-directory: infra/environments/prod
         run: |
           terraform apply -input=false -auto-approve -lock-timeout=5m \
-            -var="gateway_image_tag=${TAG}" \
+            -var="writer_image_tag=${TAG}" \
             -var="media_api_image_tag=${MEDIA_API_IMAGE_TAG}" \
-            -var="writer_image_tag=${WRITER_IMAGE_TAG}" \
+            -var="gateway_image_tag=${GATEWAY_IMAGE_TAG}" \
             -var="image_analysis_worker_image_tag=${IMAGE_ANALYSIS_WORKER_IMAGE_TAG}" \
             -var="post_session_job_image_tag=${POST_SESSION_JOB_IMAGE_TAG}" \
             -var="pdf_renderer_image_tag=${PDF_RENDERER_IMAGE_TAG}" \
