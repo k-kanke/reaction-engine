@@ -180,10 +180,14 @@ module "redis" {
 module "gateway_service_account" {
   source = "../../modules/service-account"
 
-  project_id    = var.project_id
-  account_id    = "reaction-engine-gateway"
-  display_name  = "Reaction Engine Gateway"
-  project_roles = ["roles/cloudsql.client", "roles/aiplatform.user"]
+  project_id   = var.project_id
+  account_id   = "reaction-engine-gateway"
+  display_name = "Reaction Engine Gateway"
+  # roles/speech.client: Step 4 of plan/realtime-llm-context-next-steps.md
+  # (real Speech-to-Text streaming). Requires speech.googleapis.com to be
+  # enabled on the project first -- not managed by this Terraform config,
+  # same as aiplatform/storage/sql (see internal/speech/recognizer.go).
+  project_roles = ["roles/cloudsql.client", "roles/aiplatform.user", "roles/speech.client"]
 }
 
 module "gateway_service" {
@@ -207,6 +211,8 @@ module "gateway_service" {
     VERTEX_PROJECT        = var.project_id
     VERTEX_LOCATION       = var.region
     VERTEX_REALTIME_MODEL = "gemini-1.5-flash"
+    ENABLE_REAL_STT       = "true"
+    STT_LANGUAGE_CODE     = "ja-JP"
     DATABASE_URL          = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
   }
 

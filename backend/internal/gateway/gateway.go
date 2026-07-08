@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,32 +18,51 @@ import (
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	"github.com/k-kanke/reaction-engine/backend/internal/realtime"
 	gwredis "github.com/k-kanke/reaction-engine/backend/internal/redis"
+	"github.com/k-kanke/reaction-engine/backend/internal/speech"
 )
 
 const featureEventsTopic = "feature-events"
 
 // transcriptFlushIntervalMs is how much audio_chunk t_ms range accumulates
 // per speaker before the stub STT flushes a fake transcript_chunk.
-// fakeTranscriptConfidence is a fixed stub confidence; there is no real STT
-// model behind it yet (Phase 11 of plan/backend-local-docker-runbook.md).
+// fakeTranscriptConfidence is a fixed stub confidence. This path only runs
+// when no real Recognizer is configured (h.stt == nil).
 const (
 	transcriptFlushIntervalMs = 5000
 	fakeTranscriptConfidence  = 0.6
 )
 
+// maxSTTStreamDuration bounds one real Speech-to-Text stream's lifetime,
+// safely under Google's ~305s per-stream cap. architecture.md: "1ストリーム
+// の継続時間上限があるため、Gatewayが会議中に定期的にストリームを再接続する"
+// — the gateway (not internal/speech) owns this reconnect schedule because
+// it's tied to per-connection state.
+const maxSTTStreamDuration = 240 * time.Second
+
 // audioAccumulator tracks one speaker's audio_chunk arrivals within a
 // single WebSocket connection so the gateway knows when to flush a stub
 // transcript_chunk. It only ever sees t_ms/count — raw PCM is read off the
-// wire and discarded, never stored here or anywhere else.
+// wire and discarded, never stored here or anywhere else. Only used when
+// real STT is disabled.
 type audioAccumulator struct {
 	firstTMs int64
 	lastTMs  int64
 }
 
+// sttSession is one speaker's live real-STT stream within a connection,
+// tracked so handleAudioChunk knows when to reconnect (maxSTTStreamDuration)
+// or lazily create one.
+type sttSession struct {
+	stream    *speech.Stream
+	startedAt time.Time
+}
+
 type Handler struct {
-	redis  *gwredis.Client
-	events *db.LocalEventStore
-	llm    realtime.FeedbackGenerator
+	redis           *gwredis.Client
+	events          *db.LocalEventStore
+	llm             realtime.FeedbackGenerator
+	stt             speech.Recognizer
+	sttLanguageCode string
 }
 
 func NewHandler(redis *gwredis.Client, events *db.LocalEventStore, llmEnabled bool) *Handler {
@@ -53,8 +73,18 @@ func NewHandler(redis *gwredis.Client, events *db.LocalEventStore, llmEnabled bo
 	return NewHandlerWithFeedbackGenerator(redis, events, generator)
 }
 
+// NewHandlerWithFeedbackGenerator builds a Handler with no real STT
+// (ENABLE_REAL_STT=false path): audio_chunk falls back to the stub
+// transcript builder below, unchanged from before Step 4.
 func NewHandlerWithFeedbackGenerator(redis *gwredis.Client, events *db.LocalEventStore, generator realtime.FeedbackGenerator) *Handler {
-	return &Handler{redis: redis, events: events, llm: generator}
+	return NewHandlerWithSTT(redis, events, generator, nil, "")
+}
+
+// NewHandlerWithSTT is NewHandlerWithFeedbackGenerator with an injected
+// real Speech-to-Text Recognizer. recognizer nil keeps the stub transcript
+// path (used by tests and local runs without GCP credentials).
+func NewHandlerWithSTT(redis *gwredis.Client, events *db.LocalEventStore, generator realtime.FeedbackGenerator, recognizer speech.Recognizer, sttLanguageCode string) *Handler {
+	return &Handler{redis: redis, events: events, llm: generator, stt: recognizer, sttLanguageCode: sttLanguageCode}
 }
 
 // ServeWS handles GET /ws: it accepts the WebSocket connection, dispatches
@@ -82,8 +112,15 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	// One session per connection (architecture.md: "Gateway が session_id
 	// ごとに self/other 各1本の Speech-to-Text streaming セッションを維持"),
-	// so per-speaker audio accumulators live for the connection's lifetime.
+	// so per-speaker audio accumulators/STT sessions live for the
+	// connection's lifetime.
 	audioAccumulators := make(map[string]*audioAccumulator)
+	sttSessions := make(map[string]*sttSession)
+	defer func() {
+		for _, sess := range sttSessions {
+			sess.stream.Close()
+		}
+	}()
 
 	for {
 		var raw json.RawMessage
@@ -106,7 +143,7 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		case "mood_wave_sample":
 			h.handleMoodWaveSample(ctx, conn, raw)
 		case "audio_chunk":
-			h.handleAudioChunk(ctx, raw, audioAccumulators)
+			h.handleAudioChunk(ctx, raw, audioAccumulators, sttSessions)
 		default:
 			h.writeError(ctx, conn, "unsupported type: "+envelope.Type)
 		}
@@ -232,14 +269,13 @@ func (h *Handler) enqueueTriggerAndFeedback(ctx context.Context, msg contract.Mo
 	}
 }
 
-// handleAudioChunk implements the Phase 11 STT stub: it never calls a real
-// Speech-to-Text service and never persists msg.PCM anywhere. It only
-// tracks how much audio_chunk t_ms range has accumulated per speaker, and
-// once that reaches transcriptFlushIntervalMs it fabricates one
-// deterministic "final" transcript_chunk covering that range, caches it in
-// the Redis transcript window, and enqueues it to the same feature-events
-// local bus mood_wave_sample uses so Durable Writer persists it too.
-func (h *Handler) handleAudioChunk(ctx context.Context, raw json.RawMessage, accumulators map[string]*audioAccumulator) {
+// handleAudioChunk routes each audio_chunk to real Speech-to-Text
+// (h.stt != nil, Step 4) or, when no Recognizer is configured, the Phase 11
+// stub: it fabricates one deterministic "final" transcript_chunk once
+// transcriptFlushIntervalMs of audio_chunk t_ms range has accumulated per
+// speaker. Either way the resulting transcript_chunk goes through
+// persistTranscriptChunk (Redis + durable enqueue) the same way.
+func (h *Handler) handleAudioChunk(ctx context.Context, raw json.RawMessage, accumulators map[string]*audioAccumulator, sttSessions map[string]*sttSession) {
 	var msg contract.AudioChunkMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		log.Printf("gateway: invalid audio_chunk payload: %v", err)
@@ -247,6 +283,11 @@ func (h *Handler) handleAudioChunk(ctx context.Context, raw json.RawMessage, acc
 	}
 	if msg.Speaker == "" {
 		log.Printf("gateway: audio_chunk missing speaker")
+		return
+	}
+
+	if h.stt != nil {
+		h.forwardToSTT(ctx, msg, sttSessions)
 		return
 	}
 
@@ -264,6 +305,102 @@ func (h *Handler) handleAudioChunk(ctx context.Context, raw json.RawMessage, acc
 	chunk := buildFakeTranscriptChunk(msg.SessionID, msg.Speaker, acc.firstTMs, acc.lastTMs)
 	acc.firstTMs = msg.TMs
 
+	h.persistTranscriptChunk(ctx, chunk)
+}
+
+// forwardToSTT is the Step 4 real-STT path: lazily creates (or reconnects,
+// past maxSTTStreamDuration) a Speech-to-Text stream for msg.Speaker and
+// forwards its decoded PCM. Any failure here is logged and the session is
+// dropped so the next audio_chunk retries fresh — it never blocks or breaks
+// the mood_wave/evidence-frame feedback flow, which doesn't depend on
+// transcripts existing (architecture.md rule fallback already covers an
+// empty transcript_window).
+func (h *Handler) forwardToSTT(ctx context.Context, msg contract.AudioChunkMessage, sttSessions map[string]*sttSession) {
+	sess, err := h.getOrCreateSTTStream(ctx, sttSessions, msg)
+	if err != nil {
+		log.Printf("gateway: create stt stream failed for speaker=%s: %v", msg.Speaker, err)
+		return
+	}
+
+	pcm, err := base64.StdEncoding.DecodeString(msg.PCM)
+	if err != nil {
+		log.Printf("gateway: decode audio_chunk pcm failed for speaker=%s: %v", msg.Speaker, err)
+		return
+	}
+
+	if err := sess.stream.Send(pcm); err != nil {
+		log.Printf("gateway: stt send failed for speaker=%s: %v", msg.Speaker, err)
+		sess.stream.Close()
+		delete(sttSessions, msg.Speaker)
+	}
+}
+
+// getOrCreateSTTStream returns msg.Speaker's live stream, transparently
+// reconnecting once it's older than maxSTTStreamDuration (architecture.md's
+// periodic-reconnect requirement — see the const's doc comment) or creating
+// one on first use. A fresh stream gets its own result-consuming goroutine
+// (consumeSTTResults) for its whole lifetime.
+func (h *Handler) getOrCreateSTTStream(ctx context.Context, sttSessions map[string]*sttSession, msg contract.AudioChunkMessage) (*sttSession, error) {
+	if sess, ok := sttSessions[msg.Speaker]; ok {
+		if time.Since(sess.startedAt) < maxSTTStreamDuration {
+			return sess, nil
+		}
+		sess.stream.Close()
+		delete(sttSessions, msg.Speaker)
+	}
+
+	stream, err := h.stt.NewStream(ctx, int32(msg.SampleRate), h.sttLanguageCode)
+	if err != nil {
+		return nil, fmt.Errorf("new stt stream: %w", err)
+	}
+
+	sess := &sttSession{stream: stream, startedAt: time.Now()}
+	sttSessions[msg.Speaker] = sess
+	go h.consumeSTTResults(ctx, msg.SessionID, msg.Speaker, sess)
+	return sess, nil
+}
+
+// consumeSTTResults reads final results off one stream for its whole
+// lifetime, turning each into a transcript_chunk. TStartMs/TEndMs are wall
+// clock (time since the previous result, or stream start) rather than
+// Google's audio-relative offsets, matching the stub path's granularity —
+// downstream only needs these for the recent-window sort/filter, not exact
+// audio timing.
+func (h *Handler) consumeSTTResults(ctx context.Context, sessionID, speaker string, sess *sttSession) {
+	sinceMs := sess.startedAt.UnixMilli()
+	for result := range sess.stream.Results() {
+		nowMs := time.Now().UnixMilli()
+		chunk := contract.TranscriptChunk{
+			EventID:       "evt_" + uuid.NewString(),
+			Type:          "transcript_chunk",
+			SchemaVersion: 1,
+			SessionID:     sessionID,
+			Speaker:       speaker,
+			TStartMs:      sinceMs,
+			TEndMs:        nowMs,
+			Text:          result.Text,
+			Confidence:    result.Confidence,
+			IsFinal:       true,
+		}
+		h.persistTranscriptChunk(ctx, chunk)
+		sinceMs = nowMs
+	}
+
+	// Results() closing doesn't necessarily mean anything went wrong (it
+	// also closes on a deliberate Close() from reconnect/teardown), so only
+	// log when the stream actually ended abnormally -- e.g. missing
+	// roles/speech.client, quota, or a network error. Either way this
+	// speaker's transcripts simply stop; mood_wave/evidence-frame feedback
+	// keeps flowing independently.
+	if err := sess.stream.Err(); err != nil {
+		log.Printf("gateway: stt stream ended for speaker=%s: %v", speaker, err)
+	}
+}
+
+// persistTranscriptChunk is the shared sink for every transcript_chunk,
+// stub or real: cache in the Redis recent window and enqueue for Durable
+// Writer (Cloud SQL transcripts + JSONL).
+func (h *Handler) persistTranscriptChunk(ctx context.Context, chunk contract.TranscriptChunk) {
 	if err := h.redis.StoreRecentTranscript(ctx, chunk); err != nil {
 		log.Printf("gateway: store recent transcript failed: %v", err)
 	}

@@ -71,11 +71,15 @@ let latestTileSnapshot = null;
 const VAD_INTERVAL_MS = 100; // VADサンプリング間隔
 const VAD_RMS_THRESHOLD = 0.02; // 発話判定のRMS閾値（仮値・後で実データ調整）
 const SPEECH_WINDOW_MS = 5000; // speech_ratio を出す移動窓
-// --- audio_chunk 送信 (plan/realtime-llm-context-next-steps.md Step 3):
-// VAD analyser の time-domain バッファをそのままPCMとしてGatewayへ送る。
-// まずはtranscript windowにデータが入ることの確認が目的なので低頻度でよい。
-const AUDIO_CHUNK_INTERVAL_MS = 2000;
-let audioChunkTimer = null;
+// --- audio_chunk 送信 (plan/realtime-llm-context-next-steps.md Step 4):
+// self(マイク)/other(タブ音声) それぞれの source node から
+// ScriptProcessorNode で連続PCMを取り、そのままGatewayへ送る。Step 3の
+// AnalyserNodeスナップショット方式(2秒おきに約85msだけ送る)は本物の
+// Speech-to-Text streamingには音声が欠けすぎるため、この連続キャプチャに
+// 置き換えた。
+const AUDIO_CHUNK_BUFFER_SIZE = 4096; // 48kHzで約85ms/chunk
+let audioChunkGainNode = null; // 無音でdestinationに繋ぐための共有GainNode
+const audioChunkProcessors = { self: null, other: null };
 // --- 代表フレーム取得 (§2.2 LLM定期パス用): 最初5分・30秒ごと ---
 const FRAME_CAPTURE_INTERVAL_MS = 30000; // 30秒ごと
 const FRAME_CAPTURE_DURATION_MS = 5 * 60 * 1000; // 最初の5分だけ
@@ -346,7 +350,6 @@ async function startCapture() {
     analysisTimer = window.setInterval(runAnalysisFrame, ANALYSIS_INTERVAL_MS);
     eventTimer = window.setInterval(sendMoodWaveSample, EVENT_INTERVAL_MS);
     vadTimer = window.setInterval(sampleVad, VAD_INTERVAL_MS);
-    audioChunkTimer = window.setInterval(sendAudioChunks, AUDIO_CHUNK_INTERVAL_MS);
     captureStartTs = Date.now();
     captureFrame(); // 開始直後に1枚
     frameTimer = window.setInterval(captureFrame, FRAME_CAPTURE_INTERVAL_MS);
@@ -364,14 +367,12 @@ function stopCapture() {
   if (analysisTimer) window.clearInterval(analysisTimer);
   if (eventTimer) window.clearInterval(eventTimer);
   if (vadTimer) window.clearInterval(vadTimer);
-  if (audioChunkTimer) window.clearInterval(audioChunkTimer);
   if (frameTimer) window.clearInterval(frameTimer);
   if (baselineTimer) window.clearInterval(baselineTimer);
   baselineTimer = null;
   analysisTimer = null;
   eventTimer = null;
   vadTimer = null;
-  audioChunkTimer = null;
   frameTimer = null;
   stopMoodMonitor();
   teardownAudioAnalysis();
@@ -1349,12 +1350,19 @@ async function setupAudioAnalysis(displayStream) {
     return;
   }
 
+  // ScriptProcessorNode は destination への経路が無いと onaudioprocess が
+  // 発火しない実装があるため、gain=0の共有ノードで無音のまま繋ぐ。
+  audioChunkGainNode = audioContext.createGain();
+  audioChunkGainNode.gain.value = 0;
+  audioChunkGainNode.connect(audioContext.destination);
+
   // 相手 = タブ音声（getDisplayMedia の audio トラックを流用。スピーカー前のデジタル音声）
   const audioTracks = displayStream.getAudioTracks();
   if (audioTracks[0]) {
     try {
       const src = audioContext.createMediaStreamSource(new MediaStream([audioTracks[0]]));
       vad.other.analyser = makeAnalyser(src);
+      audioChunkProcessors.other = setupAudioChunkCapture(src, "other");
       sendDiagnostic("audio_status", "other(tab) VAD enabled");
     } catch (error) {
       sendDiagnostic("audio_init_error", `other(tab) failed: ${error.name} ${error.message}`);
@@ -1375,6 +1383,7 @@ async function setupAudioAnalysis(displayStream) {
     try {
       const micSrc = audioContext.createMediaStreamSource(micStream);
       vad.self.analyser = makeAnalyser(micSrc);
+      audioChunkProcessors.self = setupAudioChunkCapture(micSrc, "self");
       sendDiagnostic("audio_status", "self(mic) VAD enabled");
     } catch (error) {
       sendDiagnostic("audio_init_error", `self(mic) connect failed: ${error.name} ${error.message}`);
@@ -1394,11 +1403,47 @@ function makeAnalyser(sourceNode) {
   return analyser;
 }
 
+// setupAudioChunkCapture fans out sourceNode into a ScriptProcessorNode that
+// sends every buffer as a continuous audio_chunk (plan/
+// realtime-llm-context-next-steps.md Step 4), independent of the VAD
+// analyser also fed from the same source.
+function setupAudioChunkCapture(sourceNode, speaker) {
+  const processor = audioContext.createScriptProcessor(AUDIO_CHUNK_BUFFER_SIZE, 1, 1);
+  processor.onaudioprocess = (event) => {
+    if (ws?.readyState !== WebSocket.OPEN) return;
+    const input = event.inputBuffer.getChannelData(0);
+    ws.send(
+      JSON.stringify({
+        type: "audio_chunk",
+        session_id: sessionId,
+        speaker,
+        t_ms: Date.now(),
+        sample_rate: audioContext.sampleRate,
+        pcm: encodePCM16Base64(input)
+      })
+    );
+  };
+  sourceNode.connect(processor);
+  processor.connect(audioChunkGainNode);
+  return processor;
+}
+
 function teardownAudioAnalysis() {
   if (micStream) {
     for (const t of micStream.getTracks()) t.stop();
   }
   micStream = null;
+  for (const key of ["self", "other"]) {
+    if (audioChunkProcessors[key]) {
+      audioChunkProcessors[key].onaudioprocess = null;
+      audioChunkProcessors[key].disconnect();
+      audioChunkProcessors[key] = null;
+    }
+  }
+  if (audioChunkGainNode) {
+    audioChunkGainNode.disconnect();
+    audioChunkGainNode = null;
+  }
   if (audioContext) audioContext.close().catch(() => {});
   audioContext = null;
   vad.self = createVadState();
@@ -1476,37 +1521,6 @@ function sampleVad() {
     s.speaking = speaking;
     s.history.push({ t: now, speaking });
     while (s.history.length && s.history[0].t < cutoff) s.history.shift();
-  }
-}
-
-// sendAudioChunks sends one audio_chunk per active VAD source (self/other)
-// straight from that analyser's time-domain buffer (architecture.md's Audio
-// Chunk contract, plan/realtime-llm-context-next-steps.md Step 3). Backend
-// only tracks arrival timestamps for the stub STT flush today (Step 4 will
-// wire a real decoder), so a short low-frequency snapshot is enough to
-// verify the transcript_window pipeline end to end.
-function sendAudioChunks() {
-  if (ws?.readyState !== WebSocket.OPEN) return;
-
-  const sampleRate = audioContext?.sampleRate ?? 48000;
-  const tMs = Date.now();
-
-  for (const speaker of ["self", "other"]) {
-    const s = vad[speaker];
-    if (!s.analyser) continue;
-
-    const buf = new Float32Array(s.analyser.fftSize);
-    s.analyser.getFloatTimeDomainData(buf);
-
-    const event = {
-      type: "audio_chunk",
-      session_id: sessionId,
-      speaker,
-      t_ms: tMs,
-      sample_rate: sampleRate,
-      pcm: encodePCM16Base64(buf)
-    };
-    ws.send(JSON.stringify(event));
   }
 }
 

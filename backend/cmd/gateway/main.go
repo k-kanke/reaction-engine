@@ -10,6 +10,7 @@ import (
 	"github.com/k-kanke/reaction-engine/backend/internal/gateway"
 	"github.com/k-kanke/reaction-engine/backend/internal/realtime"
 	"github.com/k-kanke/reaction-engine/backend/internal/redis"
+	"github.com/k-kanke/reaction-engine/backend/internal/speech"
 )
 
 func main() {
@@ -51,7 +52,17 @@ func main() {
 		generator = vertexGenerator
 	}
 
-	handler := gateway.NewHandlerWithFeedbackGenerator(redisClient, events, generator)
+	var recognizer speech.Recognizer
+	sttLanguageCode := firstNonEmpty(os.Getenv("STT_LANGUAGE_CODE"), "ja-JP")
+	if os.Getenv("ENABLE_REAL_STT") == "true" {
+		googleRecognizer, err := speech.NewGoogleRecognizer(context.Background(), os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+		if err != nil {
+			log.Fatalf("gateway: initialize speech recognizer: %v", err)
+		}
+		recognizer = googleRecognizer
+	}
+
+	handler := gateway.NewHandlerWithSTT(redisClient, events, generator, recognizer, sttLanguageCode)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
