@@ -89,7 +89,7 @@ module "backend_images" {
   iam_bindings = [
     {
       role    = "roles/artifactregistry.reader"
-      members = [module.media_service_account.member]
+      members = [module.media_service_account.member, module.gateway_service_account.member]
     }
   ]
 }
