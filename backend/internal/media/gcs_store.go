@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -161,6 +162,22 @@ func (s *GCSMediaStore) Read(ctx context.Context, mediaRef string) ([]byte, erro
 	defer r.Close()
 
 	return io.ReadAll(r)
+}
+
+func (s *GCSMediaStore) Write(ctx context.Context, sessionID string, parts []string, data []byte, contentType string) (string, error) {
+	object := path.Join(append([]string{"sessions", sessionID}, parts...)...)
+
+	w := s.client.Bucket(s.bucket).Object(object).NewWriter(ctx)
+	w.ContentType = contentType
+	if _, err := w.Write(data); err != nil {
+		w.Close()
+		return "", fmt.Errorf("media: write gcs object %q: %w", object, err)
+	}
+	if err := w.Close(); err != nil {
+		return "", fmt.Errorf("media: close gcs object %q: %w", object, err)
+	}
+
+	return fmt.Sprintf("gs://%s/%s", s.bucket, object), nil
 }
 
 // objectFromRef strips this store's gs://{bucket}/ prefix off a media_ref to
