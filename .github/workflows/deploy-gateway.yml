@@ -32,6 +32,10 @@ env:
   TF_VAR_jsonl_bucket_name: ${{ vars.JSONL_BUCKET_NAME }}
   TF_VAR_terraform_state_bucket_name: ${{ vars.TERRAFORM_STATE_BUCKET_NAME }}
   TF_VAR_media_api_invoker_members: ${{ vars.MEDIA_API_INVOKER_MEMBERS_JSON }}
+  TF_VAR_gmail_sender_from: ${{ vars.GMAIL_SENDER_FROM }}
+  TF_VAR_gmail_oauth_client_id: ${{ secrets.GMAIL_OAUTH_CLIENT_ID }}
+  TF_VAR_gmail_oauth_client_secret: ${{ secrets.GMAIL_OAUTH_CLIENT_SECRET }}
+  TF_VAR_gmail_oauth_refresh_token: ${{ secrets.GMAIL_OAUTH_REFRESH_TOKEN }}
 
 jobs:
   deploy:
