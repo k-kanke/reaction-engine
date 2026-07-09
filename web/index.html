@@ -65,13 +65,55 @@
   .nav .right { margin-left: auto; }
   @media (max-width: 720px) { .nav .links { display: none; } }
 
-  /* ---------- hero (3D scene) ---------- */
+  /* ---------- hero (product demo) ---------- */
   .hero { position: relative; min-height: 100svh; display: flex; align-items: center; overflow: hidden;
+    padding: 92px 0 40px;
     background: radial-gradient(1200px 700px at 70% 20%, #eef3ff 0%, #ffffff 55%); }
-  #scene { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
-  .glow { position: absolute; width: 520px; height: 520px; border-radius: 50%; pointer-events: none; z-index: 1;
-    background: radial-gradient(circle, rgba(30,80,255,0.10), transparent 65%);
-    transform: translate(-50%, -50%); transition: opacity .4s; opacity: 0; }
+
+  /* Meet画面 + サイドパネルのライブモック */
+  .hero-visual { position: relative; width: 100%; max-width: 460px; margin-left: auto;
+    display: flex; flex-direction: column; gap: 14px; }
+  @media (max-width: 900px) { .hero-visual { margin: 34px auto 0; } }
+
+  .meet-mock { background: #fff; border: 1px solid var(--line); border-radius: 16px;
+    box-shadow: var(--sh); overflow: hidden; }
+  .meet-bar { display: flex; align-items: center; gap: 6px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  .meet-bar i { width: 9px; height: 9px; border-radius: 50%; background: #e3e9f5; }
+  .meet-bar span { margin-left: 8px; font-size: 11.5px; font-weight: 600; color: var(--faint); }
+  .meet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 10px; }
+  .tile { position: relative; aspect-ratio: 16 / 9; border-radius: 10px; overflow: hidden;
+    background: linear-gradient(180deg, #eef2fb, #e4eaf7); transition: box-shadow .4s; }
+  .tile::before { content: ""; position: absolute; left: 50%; top: 34%; width: 26%; aspect-ratio: 1;
+    border-radius: 50%; transform: translate(-50%, -50%); background: #c3cde0; }
+  .tile::after { content: ""; position: absolute; left: 50%; top: 92%; width: 54%; aspect-ratio: 2 / 1;
+    border-radius: 50% 50% 0 0 / 100% 100% 0 0; transform: translate(-50%, -50%); background: #c3cde0; }
+  .tile.t2 { background: linear-gradient(180deg, #eef6f0, #e2ece6); } .tile.t2::before, .tile.t2::after { background: #bccdc2; }
+  .tile.t3 { background: linear-gradient(180deg, #f6f1ea, #eee6da); } .tile.t3::before, .tile.t3::after { background: #d2c5b0; }
+  .tile.react { box-shadow: inset 0 0 0 2.5px var(--live); }
+  .tile .det { position: absolute; inset: 14% 22%; border: 1.5px solid rgba(255,106,61,0.8); border-radius: 8px; }
+  .tile .det::after { content: "face 0.98"; position: absolute; top: -17px; left: -1px; font-size: 8.5px; font-weight: 700;
+    letter-spacing: .04em; color: #d9481f; background: var(--live-soft); border-radius: 4px; padding: 1px 5px; }
+
+  .panel-mock { width: 100%;
+    background: #fff; border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--sh-sm); padding: 13px 14px 12px; }
+  .panel-head { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 800; letter-spacing: -0.01em; }
+  .panel-head .rec { width: 8px; height: 8px; border-radius: 50%; background: var(--live); animation: pulse 1.7s infinite; }
+  .panel-head .live-tag { margin-left: auto; font-size: 9.5px; font-weight: 800; letter-spacing: .14em; color: #d9481f;
+    background: var(--live-soft); border-radius: 999px; padding: 2px 8px; }
+  #heroWave { display: block; width: 100%; height: 74px; margin-top: 10px;
+    background: var(--mist); border: 1px solid var(--line); border-radius: 8px; }
+  .wave-cap { display: flex; justify-content: space-between; font-size: 10px; color: var(--faint); margin-top: 6px; font-weight: 600; }
+  .moments { display: flex; flex-direction: column; gap: 6px; margin-top: 9px; min-height: 66px; }
+  .mchip { display: flex; align-items: center; gap: 9px; background: var(--mist); border: 1px solid var(--line);
+    border-radius: 9px; padding: 5px 9px 5px 5px; animation: chipin .5s cubic-bezier(.2,.8,.2,1) both; }
+  @keyframes chipin { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
+  .mchip .mthumb { flex: none; width: 38px; height: 25px; border-radius: 5px;
+    background: linear-gradient(135deg, #dfe7f6 40%, #cfd9ec); position: relative; overflow: hidden; }
+  .mchip .mthumb::after { content: ""; position: absolute; inset: 3px; border: 1px solid rgba(255,106,61,0.7); border-radius: 3px; }
+  .mchip .mtxt { font-size: 11px; color: var(--muted); font-weight: 600; }
+  .mchip .mtxt b { color: #d9481f; font-weight: 800; }
+  .mchip.cold .mtxt b { color: #3a5ccc; }
+  .mchip.cold .mthumb::after { border-color: rgba(30,80,255,0.55); }
   .hero-inner { position: relative; z-index: 2; width: 100%; }
   .hero-grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 40px; align-items: center; }
   @media (max-width: 900px) { .hero-grid { grid-template-columns: 1fr; } }
@@ -218,8 +260,6 @@
 <main id="top">
   <!-- HERO -->
   <section class="hero" id="hero">
-    <canvas id="scene"></canvas>
-    <div class="glow" id="glow"></div>
     <div class="wrap hero-inner">
       <div class="hero-grid">
         <div>
@@ -232,7 +272,23 @@
           </div>
           <div class="trust stage d5">Google Meet 対応 · Chrome 拡張 · 数クリックで導入</div>
         </div>
-        <div><!-- 3D scene shows through --></div>
+        <div class="hero-visual stage d3" aria-hidden="true">
+          <div class="meet-mock">
+            <div class="meet-bar"><i></i><i></i><i></i><span>Google Meet</span></div>
+            <div class="meet-grid">
+              <div class="tile t1" id="tile1"><span class="det"></span></div>
+              <div class="tile t2" id="tile2"></div>
+              <div class="tile t3" id="tile3"></div>
+              <div class="tile t4" id="tile4"></div>
+            </div>
+          </div>
+          <div class="panel-mock">
+            <div class="panel-head"><span class="rec"></span>Reaction Engine<span class="live-tag">LIVE</span></div>
+            <canvas id="heroWave"></canvas>
+            <div class="wave-cap"><span>会議の雰囲気</span><span>↑ 盛り上がり · ↓ 冷え込み</span></div>
+            <div class="moments" id="heroMoments"></div>
+          </div>
+        </div>
       </div>
     </div>
     <div class="scene-chip" id="chip"><span class="adot"></span><span id="chipT">部屋はついてきています</span></div>
@@ -361,161 +417,124 @@
   }, { threshold: 0.18 });
   document.querySelectorAll(".rv, .dash").forEach(function (el) { io.observe(el); });
 
-  /* ===== 3D audience scene ===== */
-  var cv = document.getElementById("scene");
-  var ctx = cv.getContext("2d");
+  /* ===== hero: live product demo (mood wave + moments) ===== */
   var chip = document.getElementById("chip"), chipT = document.getElementById("chipT");
-  var W = 0, H = 0, dpr = Math.min(window.devicePixelRatio || 1, 2);
-  var cx3 = 0, cy3 = 0; // scene center on screen
+  var wave = document.getElementById("heroWave");
+  var momentsBox = document.getElementById("heroMoments");
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  var wctx = wave.getContext("2d");
+  var WINDOW_MS = 22000;
+  var start = Date.now() - 8 * 60000; // 疑似ミーティング経過時間(8分経過から開始)
+  var hist = [];      // {t, v} 偏差 -1..1
+  var marks = [];     // {t, dir}
+  var bumps = [];     // {t0, amp, w}
 
-  function resize() {
-    var r = cv.getBoundingClientRect();
-    W = r.width; H = r.height;
-    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    var narrow = W < 900;
-    cx3 = narrow ? W * 0.5 : W * 0.72;
-    cy3 = narrow ? H * 0.72 : H * 0.52;
+  function sizeWave() {
+    var r = wave.getBoundingClientRect();
+    if (!r.width) return;
+    wave.width = Math.round(r.width * dpr);
+    wave.height = Math.round(r.height * dpr);
+    wctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
-  resize();
-  window.addEventListener("resize", resize);
+  sizeWave();
+  window.addEventListener("resize", sizeWave);
 
-  // nodes on a sphere shell (the "room" of audience members)
-  var N = 130, R = 210, F = 620;
-  var nodes = [];
-  for (var i = 0; i < N; i++) {
-    // fibonacci sphere for even spread
-    var k = i + 0.5;
-    var phi = Math.acos(1 - 2 * k / N);
-    var theta = Math.PI * (1 + Math.sqrt(5)) * k;
-    var jitter = 0.86 + Math.random() * 0.24;
-    nodes.push({
-      x: R * jitter * Math.sin(phi) * Math.cos(theta),
-      y: R * jitter * Math.sin(phi) * Math.sin(theta) * 0.82,
-      z: R * jitter * Math.cos(phi),
-      eng: 0.55 + Math.random() * 0.4,   // engagement 0..1
-      tgt: 0.7,
-      ph: Math.random() * Math.PI * 2,
-      r: 1.6 + Math.random() * 2.2
-    });
-  }
-  // precompute 2 nearest neighbors for constellation links
-  nodes.forEach(function (n) {
-    var d = nodes.map(function (m, j) {
-      var dx = n.x - m.x, dy = n.y - m.y, dz = n.z - m.z;
-      return { j: j, d: dx * dx + dy * dy + dz * dz };
-    }).sort(function (a, b) { return a.d - b.d; });
-    n.links = [d[1].j, d[2].j];
-  });
-
-  var rotY = 0, rotX = -0.12, tRotY = 0, tRotX = -0.12;
-  var mx = 0.5, my = 0.5;
-  var glow = document.getElementById("glow");
-
-  if (fine) {
-    document.getElementById("hero").addEventListener("mousemove", function (e) {
-      var r = cv.getBoundingClientRect();
-      mx = (e.clientX - r.left) / r.width; my = (e.clientY - r.top) / r.height;
-      tRotX = -0.12 + (my - 0.5) * -0.5;
-      glow.style.left = e.clientX + "px"; glow.style.top = e.clientY + "px"; glow.style.opacity = "1";
-    });
-    document.getElementById("hero").addEventListener("mouseleave", function () {
-      glow.style.opacity = "0"; tRotX = -0.12;
-    });
+  function moodAt(now) {
+    var t = (now - start) / 1000;
+    var v = Math.sin(t * 0.9) * 0.06 + Math.sin(t * 2.3 + 1.4) * 0.04;
+    for (var i = 0; i < bumps.length; i++) {
+      var b = bumps[i], dt = (now - b.t0) / 1000;
+      v += b.amp * Math.exp(-(dt * dt) / (2 * b.w * b.w));
+    }
+    return Math.max(-1, Math.min(1, v));
   }
 
-  var t = 0, frame = 0, avgEng = 0.7;
-  var LIVE = { r: 255, g: 106, b: 61 }, COOL = { r: 154, g: 164, b: 184 };
+  function drawWave() {
+    var now = Date.now();
+    hist.push({ t: now, v: moodAt(now) });
+    while (hist.length && hist[0].t < now - WINDOW_MS) hist.shift();
+    marks = marks.filter(function (m) { return m.t >= now - WINDOW_MS; });
 
-  function lerp(a, b, k) { return a + (b - a) * k; }
+    var r = wave.getBoundingClientRect(), w = r.width, h = r.height;
+    if (!w) return;
+    var X = function (t) { return ((t - (now - WINDOW_MS)) / WINDOW_MS) * w; };
+    var Y = function (v) { return h / 2 - v * (h / 2 - 6); };
 
-  function draw() {
-    t += 0.016; frame++;
-    // rotation: slow auto + mouse steering
-    tRotY += 0.0022 + (fine ? (mx - 0.5) * 0.004 : 0);
-    rotY = lerp(rotY, tRotY, 0.06);
-    rotX = lerp(rotX, tRotX, 0.06);
-
-    // engagement dynamics: occasionally someone drifts away / comes back
-    if (frame % 30 === 0) {
-      var pick = nodes[(Math.random() * N) | 0];
-      pick.tgt = Math.random() < 0.22 ? 0.15 + Math.random() * 0.2 : 0.65 + Math.random() * 0.3;
-    }
-    var sum = 0;
-    var sy = Math.sin(rotY), cyR = Math.cos(rotY), sx = Math.sin(rotX), cxR = Math.cos(rotX);
-
-    var proj = nodes.map(function (n) {
-      n.eng = lerp(n.eng, n.tgt, 0.02);
-      sum += n.eng;
-      // breathing offset
-      var br = 1 + Math.sin(t * 1.4 + n.ph) * 0.015;
-      var x = n.x * br, y = n.y * br, z = n.z * br;
-      // rotate Y then X
-      var x1 = x * cyR - z * sy, z1 = x * sy + z * cyR;
-      var y1 = y * cxR - z1 * sx, z2 = y * sx + z1 * cxR;
-      var s = F / (F + z2);
-      return { n: n, x: cx3 + x1 * s, y: cy3 + y1 * s, s: s, z: z2 };
+    wctx.clearRect(0, 0, w, h);
+    // baseline
+    wctx.strokeStyle = "#c6cede"; wctx.lineWidth = 1; wctx.setLineDash([3, 5]);
+    wctx.beginPath(); wctx.moveTo(0, h / 2); wctx.lineTo(w, h / 2); wctx.stroke();
+    wctx.setLineDash([]);
+    // trigger markers
+    marks.forEach(function (m) {
+      wctx.strokeStyle = m.dir > 0 ? "rgba(255,106,61,0.6)" : "rgba(30,80,255,0.45)";
+      wctx.lineWidth = 1.5;
+      wctx.beginPath(); wctx.moveTo(X(m.t), 4); wctx.lineTo(X(m.t), h - 4); wctx.stroke();
     });
-
-    avgEng = lerp(avgEng, sum / N, 0.05);
-
-    ctx.clearRect(0, 0, W, H);
-
-    // links (draw far-to-near for painter's order)
-    proj.slice().sort(function (a, b) { return a.z - b.z; });
-    ctx.lineWidth = 1;
-    for (var i2 = 0; i2 < proj.length; i2++) {
-      var p = proj[i2];
-      for (var li = 0; li < p.n.links.length; li++) {
-        var q = proj[p.n.links[li]];
-        var depth = (p.s + q.s) / 2;
-        var a = Math.max(0, (depth - 0.72) * 0.34);
-        if (a <= 0.005) continue;
-        ctx.strokeStyle = "rgba(30,80,255," + a.toFixed(3) + ")";
-        ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke();
-      }
-    }
-
-    // core (presenter) — pulsing
-    var coreR = 26 + Math.sin(t * 2.2) * 3;
-    var g = ctx.createRadialGradient(cx3, cy3, 0, cx3, cy3, coreR * 2.6);
-    g.addColorStop(0, "rgba(30,80,255,0.28)");
-    g.addColorStop(1, "rgba(30,80,255,0)");
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(cx3, cy3, coreR * 2.6, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = "#1e50ff";
-    ctx.beginPath(); ctx.arc(cx3, cy3, 7, 0, Math.PI * 2); ctx.fill();
-
-    // nodes
-    var ordered = proj.slice().sort(function (a, b) { return a.z - b.z; });
-    for (var i3 = 0; i3 < ordered.length; i3++) {
-      var pp = ordered[i3], n2 = pp.n;
-      var e = n2.eng;
-      var r2 = { r: lerp(COOL.r, LIVE.r, e), g: lerp(COOL.g, LIVE.g, e), b: lerp(COOL.b, LIVE.b, e) };
-      var alpha = 0.25 + pp.s * 0.55 * (0.35 + e * 0.65);
-      var rad = n2.r * pp.s * (0.7 + e * 0.6);
-      // glow for engaged front nodes
-      if (e > 0.6 && pp.s > 0.9) {
-        var gg = ctx.createRadialGradient(pp.x, pp.y, 0, pp.x, pp.y, rad * 4);
-        gg.addColorStop(0, "rgba(" + (r2.r|0) + "," + (r2.g|0) + "," + (r2.b|0) + ",0.22)");
-        gg.addColorStop(1, "rgba(255,106,61,0)");
-        ctx.fillStyle = gg;
-        ctx.beginPath(); ctx.arc(pp.x, pp.y, rad * 4, 0, Math.PI * 2); ctx.fill();
-      }
-      ctx.fillStyle = "rgba(" + (r2.r|0) + "," + (r2.g|0) + "," + (r2.b|0) + "," + alpha.toFixed(3) + ")";
-      ctx.beginPath(); ctx.arc(pp.x, pp.y, rad, 0, Math.PI * 2); ctx.fill();
-    }
-
-    // chip update
-    if (frame % 40 === 0) {
-      var low = avgEng < 0.5;
-      chip.classList.toggle("low", low);
-      chipT.textContent = low ? "反応が落ちています" : "部屋はついてきています";
-    }
+    if (hist.length < 2) return;
+    // fill + line
+    wctx.fillStyle = "rgba(255,106,61,0.12)";
+    wctx.beginPath(); wctx.moveTo(X(hist[0].t), h / 2);
+    hist.forEach(function (p) { wctx.lineTo(X(p.t), Y(p.v)); });
+    wctx.lineTo(X(hist[hist.length - 1].t), h / 2); wctx.closePath(); wctx.fill();
+    wctx.strokeStyle = "#ff6a3d"; wctx.lineWidth = 2.5; wctx.lineJoin = "round";
+    wctx.beginPath();
+    hist.forEach(function (p, i) { i ? wctx.lineTo(X(p.t), Y(p.v)) : wctx.moveTo(X(p.t), Y(p.v)); });
+    wctx.stroke();
   }
 
-  if (reduce) { draw(); }
-  else { (function loop() { draw(); requestAnimationFrame(loop); })(); }
+  function clock(ms) {
+    var s = Math.floor(ms / 1000), m = Math.floor(s / 60);
+    return m + ":" + ("0" + (s % 60)).slice(-2);
+  }
+
+  function addMoment(dir, amp, at) {
+    var el = document.createElement("div");
+    el.className = "mchip" + (dir > 0 ? "" : " cold");
+    el.innerHTML = '<span class="mthumb"></span><span class="mtxt"><b>' +
+      (dir > 0 ? "盛り上がり" : "冷え込み") + "</b> " + (dir > 0 ? "+" : "−") + amp.toFixed(2) +
+      " · " + clock(at - start) + "</span>";
+    momentsBox.prepend(el);
+    while (momentsBox.children.length > 2) momentsBox.removeChild(momentsBox.lastChild);
+  }
+
+  function fire() {
+    var dir = Math.random() < 0.68 ? 1 : -1;
+    var amp = 0.45 + Math.random() * 0.3;
+    var now = Date.now();
+    bumps.push({ t0: now + 900, amp: dir * amp, w: 1.1 });
+    bumps = bumps.slice(-6);
+    setTimeout(function () {
+      var at = Date.now();
+      marks.push({ t: at, dir: dir });
+      addMoment(dir, amp * 0.28, at);
+      // どれかのタイルが反応する
+      var tile = document.getElementById("tile" + (1 + ((Math.random() * 4) | 0)));
+      tile.classList.add("react");
+      setTimeout(function () { tile.classList.remove("react"); }, 1600);
+      chip.classList.toggle("low", dir < 0);
+      chipT.textContent = dir > 0 ? "盛り上がりを記録しました" : "反応が落ちています";
+      setTimeout(function () {
+        chip.classList.remove("low");
+        chipT.textContent = "部屋はついてきています";
+      }, 2600);
+    }, 900);
+    setTimeout(fire, 5200 + Math.random() * 3800);
+  }
+
+  // 過去22秒ぶんをプリフィルして、最初から波形が流れている状態にする
+  var now0 = Date.now();
+  bumps.push({ t0: now0 - 5000, amp: 0.55, w: 1.1 });
+  marks.push({ t: now0 - 4100, dir: 1 });
+  for (var tt = now0 - WINDOW_MS; tt < now0; tt += 120) hist.push({ t: tt, v: moodAt(tt) });
+  addMoment(1, 0.15, now0 - 4100);
+
+  if (reduce) {
+    drawWave();
+  } else {
+    (function loopW() { drawWave(); requestAnimationFrame(loopW); })();
+    setTimeout(fire, 2600);
+  }
 
   /* ===== 3D tilt cards ===== */
   if (fine && !reduce) {
