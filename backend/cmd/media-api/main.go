@@ -10,6 +10,7 @@ import (
 
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	"github.com/k-kanke/reaction-engine/backend/internal/media"
+	"github.com/k-kanke/reaction-engine/backend/internal/pubsub"
 )
 
 func main() {
@@ -50,7 +51,30 @@ func main() {
 	defer pool.Close()
 
 	store := media.NewPGStore(pool)
-	events := db.NewLocalEventStore(pool)
+
+	// EVENT_BUS_BACKEND mirrors cmd/gateway's split: "local" keeps
+	// db.LocalEventStore for docker-compose, "pubsub" publishes
+	// media_uploaded to the real "media-analysis-events" topic that
+	// image-analysis-worker's push subscription consumes.
+	eventBusBackend := os.Getenv("EVENT_BUS_BACKEND")
+	if eventBusBackend == "" {
+		eventBusBackend = "local"
+	}
+
+	var events media.EventPublisher
+	switch eventBusBackend {
+	case "local":
+		events = db.NewLocalEventStore(pool)
+	case "pubsub":
+		projectID := os.Getenv("GCP_PROJECT")
+		publisher, err := pubsub.NewPublisher(ctx, projectID)
+		if err != nil {
+			log.Fatalf("media-api: initialize pubsub publisher: %v", err)
+		}
+		events = publisher
+	default:
+		log.Fatalf("media-api: unknown EVENT_BUS_BACKEND %q (want local or pubsub)", eventBusBackend)
+	}
 
 	mediaStoreBackend := os.Getenv("MEDIA_STORE_BACKEND")
 	if mediaStoreBackend == "" {

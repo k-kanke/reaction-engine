@@ -15,7 +15,6 @@ import (
 	"nhooyr.io/websocket/wsjson"
 
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
-	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	"github.com/k-kanke/reaction-engine/backend/internal/postsessiontrigger"
 	"github.com/k-kanke/reaction-engine/backend/internal/realtime"
 	gwredis "github.com/k-kanke/reaction-engine/backend/internal/redis"
@@ -23,6 +22,17 @@ import (
 )
 
 const featureEventsTopic = "feature-events"
+
+// EventPublisher is the durable event bus boundary gateway publishes
+// mood_wave_sample/trigger_event/feedback_event/transcript_chunk payloads
+// to -- either the real Pub/Sub "feature-events" topic
+// (internal/pubsub.Publisher, EVENT_BUS_BACKEND=pubsub) or, for local dev,
+// db.LocalEventStore's Postgres-table stand-in (EVENT_BUS_BACKEND=local,
+// the default). Same shape as internal/media.EventPublisher, deliberately,
+// so both packages' callers can swap implementations identically.
+type EventPublisher interface {
+	Enqueue(ctx context.Context, topic, eventID string, payload any) error
+}
 
 // transcriptFlushIntervalMs is how much audio_chunk t_ms range accumulates
 // per speaker before the stub STT flushes a fake transcript_chunk.
@@ -60,14 +70,14 @@ type sttSession struct {
 
 type Handler struct {
 	redis              *gwredis.Client
-	events             *db.LocalEventStore
+	events             EventPublisher
 	llm                realtime.FeedbackGenerator
 	stt                speech.Recognizer
 	sttLanguageCode    string
 	postSessionTrigger postsessiontrigger.Trigger
 }
 
-func NewHandler(redis *gwredis.Client, events *db.LocalEventStore, llmEnabled bool) *Handler {
+func NewHandler(redis *gwredis.Client, events EventPublisher, llmEnabled bool) *Handler {
 	var generator realtime.FeedbackGenerator
 	if llmEnabled {
 		generator = realtime.StubFeedbackGenerator{}
@@ -78,14 +88,14 @@ func NewHandler(redis *gwredis.Client, events *db.LocalEventStore, llmEnabled bo
 // NewHandlerWithFeedbackGenerator builds a Handler with no real STT
 // (ENABLE_REAL_STT=false path): audio_chunk falls back to the stub
 // transcript builder below, unchanged from before Step 4.
-func NewHandlerWithFeedbackGenerator(redis *gwredis.Client, events *db.LocalEventStore, generator realtime.FeedbackGenerator) *Handler {
+func NewHandlerWithFeedbackGenerator(redis *gwredis.Client, events EventPublisher, generator realtime.FeedbackGenerator) *Handler {
 	return NewHandlerWithSTT(redis, events, generator, nil, "")
 }
 
 // NewHandlerWithSTT is NewHandlerWithFeedbackGenerator with an injected
 // real Speech-to-Text Recognizer. recognizer nil keeps the stub transcript
 // path (used by tests and local runs without GCP credentials).
-func NewHandlerWithSTT(redis *gwredis.Client, events *db.LocalEventStore, generator realtime.FeedbackGenerator, recognizer speech.Recognizer, sttLanguageCode string) *Handler {
+func NewHandlerWithSTT(redis *gwredis.Client, events EventPublisher, generator realtime.FeedbackGenerator, recognizer speech.Recognizer, sttLanguageCode string) *Handler {
 	return NewHandlerWithPostSessionTrigger(redis, events, generator, recognizer, sttLanguageCode, nil)
 }
 
@@ -94,7 +104,7 @@ func NewHandlerWithSTT(redis *gwredis.Client, events *db.LocalEventStore, genera
 // plan/post-session-report-implementation.md). trigger nil makes
 // session_end a no-op besides logging -- used by tests and local runs
 // without a deployed r-post-session-job/r-pdf-renderer to call.
-func NewHandlerWithPostSessionTrigger(redis *gwredis.Client, events *db.LocalEventStore, generator realtime.FeedbackGenerator, recognizer speech.Recognizer, sttLanguageCode string, trigger postsessiontrigger.Trigger) *Handler {
+func NewHandlerWithPostSessionTrigger(redis *gwredis.Client, events EventPublisher, generator realtime.FeedbackGenerator, recognizer speech.Recognizer, sttLanguageCode string, trigger postsessiontrigger.Trigger) *Handler {
 	return &Handler{redis: redis, events: events, llm: generator, stt: recognizer, sttLanguageCode: sttLanguageCode, postSessionTrigger: trigger}
 }
 

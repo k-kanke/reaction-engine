@@ -103,3 +103,15 @@ output "gmail_sender_job_name" {
   value       = module.gmail_sender_job.name
   description = "Trigger with `gcloud run jobs execute r-gmail-sender --region=<region> --args=--session-id=<id>,--to=<email>`."
 }
+
+output "pubsub_push_service_account_email" {
+  value = module.pubsub_push_service_account.email
+}
+
+output "feature_events_topic_name" {
+  value = module.feature_events_pubsub.topic_name
+}
+
+output "media_analysis_events_topic_name" {
+  value = module.media_analysis_events_pubsub.topic_name
+}

@@ -160,6 +160,11 @@ module "media_api_service" {
     GCS_MEDIA_BUCKET    = module.media_bucket.name
     MEDIA_API_PORT      = "8080"
     DATABASE_URL        = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+    # Pub/Sub migration (plan/post-session-report-implementation.md):
+    # media_uploaded now publishes to the real "media-analysis-events"
+    # topic instead of the local_events Postgres stand-in.
+    EVENT_BUS_BACKEND = "pubsub"
+    GCP_PROJECT       = var.project_id
   }
 
   invoker_members       = concat(var.media_api_invoker_members, [module.tester_service_account.member])
@@ -265,6 +270,10 @@ module "gateway_service" {
     ENABLE_POST_SESSION_JOBS = "true"
     GCP_PROJECT              = var.project_id
     GCP_REGION               = var.region
+    # Pub/Sub migration: mood_wave_sample/trigger/feedback/transcript now
+    # publish to the real "feature-events" topic instead of the
+    # local_events Postgres stand-in.
+    EVENT_BUS_BACKEND = "pubsub"
   }
 
   # Chrome extension clients connect directly and can't hold GCP identity
@@ -305,7 +314,7 @@ module "jsonl_bucket" {
   ]
 }
 
-# writer polls local_events (feature-events stand-in) and persists
+# writer receives feature-events via Pub/Sub push and persists
 # mood_wave_sample to JSONL plus trigger_events/feedback_events/transcripts
 # to both JSONL and Postgres -- needs Cloud SQL like gateway/media-api, but
 # no VPC connector (it never talks to Redis).
@@ -335,25 +344,27 @@ module "writer_service" {
     GCS_JSONL_BUCKET    = module.jsonl_bucket.name
     WRITER_PORT         = "8080"
     DATABASE_URL        = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+    # Pub/Sub migration (plan/post-session-report-implementation.md):
+    # writer no longer polls local_events -- Pub/Sub pushes each
+    # feature-events message to POST /pubsub/push instead, so this service
+    # can scale to zero between sessions.
+    EVENT_BUS_BACKEND = "pubsub"
   }
 
-  # writer is a poll-loop worker, not something callers hit -- no invoker
-  # members needed. Cloud Run's own health checks reach the container over
-  # the container port directly and aren't gated by roles/run.invoker.
+  # Only the feature-events push subscription (via pubsub_push_service_account)
+  # may call this service now.
   allow_unauthenticated = false
+  invoker_members       = [module.pubsub_push_service_account.member]
 
-  # A poll-loop worker has no incoming HTTP traffic to keep it warm, so
-  # min_instance_count=0 (the module default) would let Cloud Run scale it
-  # to zero and the poll loop would stop running. Keep exactly one instance
-  # alive at all times; this is a singleton consumer of local_events, so
-  # max_instance_count stays at 1 too (more instances would double-process
-  # the same unacked rows).
-  min_instance_count = 1
-  max_instance_count = 1
+  # No poll loop anymore -- Pub/Sub push wakes this service on demand, so it
+  # can scale to zero when no session is active instead of the fixed 1/1
+  # this had to keep polling Postgres every 2s.
+  min_instance_count = 0
+  max_instance_count = 5
 }
 
 # Step 2 (plan/post-session-report-implementation.md): image-analysis-worker
-# polls media-analysis-events (local_events stand-in) for media_uploaded
+# receives media-analysis-events via Pub/Sub push for media_uploaded
 # payloads and calls SetBaselineReady, populating participant_baselines /
 # visual_summaries that post-session-job's baseline_context depends on.
 # Needs Cloud SQL (like writer) plus Redis over the VPC connector (like
@@ -388,13 +399,17 @@ module "image_analysis_worker_service" {
     IMAGE_ANALYSIS_WORKER_DEBUG_PORT = "8082"
     REDIS_ADDR                       = "${module.redis.host}:${module.redis.port}"
     DATABASE_URL                     = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+    # Pub/Sub migration: media-analysis-events is now pushed to
+    # POST /pubsub/push instead of polled, so this can scale to zero
+    # between baseline-frame uploads.
+    EVENT_BUS_BACKEND = "pubsub"
   }
 
-  # Poll-loop worker like writer -- no invoker members, and needs to stay
-  # warm continuously or it stops draining media-analysis-events.
+  # Only the media-analysis-events push subscription may call this service now.
   allow_unauthenticated = false
-  min_instance_count    = 1
-  max_instance_count    = 1
+  invoker_members       = [module.pubsub_push_service_account.member]
+  min_instance_count    = 0
+  max_instance_count    = 5
 }
 
 # Step 4 (plan/post-session-report-implementation.md): the three Cloud Run
@@ -488,4 +503,44 @@ module "gmail_sender_job" {
   }
 
   invoker_members = [module.gateway_service_account.member]
+}
+
+# Pub/Sub migration (plan/post-session-report-implementation.md): replaces
+# writer/image-analysis-worker's local_events polling with real Pub/Sub
+# push subscriptions, so both services can scale to zero when no session is
+# active instead of staying pinned at min_instance_count=1 to poll Postgres
+# every 2s. One dedicated identity authenticates every push across both
+# topics -- it needs no project-wide role, only roles/run.invoker granted
+# by each target service's own invoker_members (least privilege: it can
+# invoke exactly the two services it's meant to, nothing else).
+module "pubsub_push_service_account" {
+  source = "../../modules/service-account"
+
+  project_id   = var.project_id
+  account_id   = "reaction-engine-pubsub-push"
+  display_name = "Reaction Engine Pub/Sub Push"
+}
+
+module "feature_events_pubsub" {
+  source = "../../modules/pubsub"
+
+  project_id     = var.project_id
+  project_number = data.google_project.current.number
+
+  topic_name                 = "feature-events"
+  push_endpoint              = "${module.writer_service.uri}/pubsub/push"
+  push_service_account_email = module.pubsub_push_service_account.email
+  publisher_members          = [module.gateway_service_account.member]
+}
+
+module "media_analysis_events_pubsub" {
+  source = "../../modules/pubsub"
+
+  project_id     = var.project_id
+  project_number = data.google_project.current.number
+
+  topic_name                 = "media-analysis-events"
+  push_endpoint              = "${module.image_analysis_worker_service.uri}/pubsub/push"
+  push_service_account_email = module.pubsub_push_service_account.email
+  publisher_members          = [module.media_service_account.member]
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	"github.com/k-kanke/reaction-engine/backend/internal/gateway"
 	"github.com/k-kanke/reaction-engine/backend/internal/postsessiontrigger"
+	"github.com/k-kanke/reaction-engine/backend/internal/pubsub"
 	"github.com/k-kanke/reaction-engine/backend/internal/realtime"
 	"github.com/k-kanke/reaction-engine/backend/internal/redis"
 	"github.com/k-kanke/reaction-engine/backend/internal/speech"
@@ -39,7 +40,31 @@ func main() {
 	}
 	defer pool.Close()
 
-	events := db.NewLocalEventStore(pool)
+	// EVENT_BUS_BACKEND mirrors JSONL_STORE_BACKEND/MEDIA_STORE_BACKEND's
+	// local/gcs split: "local" keeps the pre-Pub/Sub db.LocalEventStore
+	// stand-in (docker-compose, no live GCP project needed), "pubsub"
+	// publishes to the real "feature-events" topic that writer's push
+	// subscription consumes (plan/post-session-report-implementation.md's
+	// Pub/Sub migration).
+	eventBusBackend := os.Getenv("EVENT_BUS_BACKEND")
+	if eventBusBackend == "" {
+		eventBusBackend = "local"
+	}
+
+	var events gateway.EventPublisher
+	switch eventBusBackend {
+	case "local":
+		events = db.NewLocalEventStore(pool)
+	case "pubsub":
+		projectID := firstNonEmpty(os.Getenv("GCP_PROJECT"), os.Getenv("GOOGLE_CLOUD_PROJECT"))
+		publisher, err := pubsub.NewPublisher(context.Background(), projectID)
+		if err != nil {
+			log.Fatalf("gateway: initialize pubsub publisher: %v", err)
+		}
+		events = publisher
+	default:
+		log.Fatalf("gateway: unknown EVENT_BUS_BACKEND %q (want local or pubsub)", eventBusBackend)
+	}
 
 	var generator realtime.FeedbackGenerator
 	if os.Getenv("ENABLE_REAL_LLM") == "true" {
