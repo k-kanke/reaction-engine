@@ -1,0 +1,619 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Reaction Engine — 相手の反応が、見える。</title>
+<style>
+  :root {
+    --paper: #ffffff;
+    --mist: #f3f6fd;
+    --line: #e5eaf4;
+    --ink: #0e1630;
+    --muted: #59637a;
+    --faint: #8b94a7;
+    --brand: #1e50ff;
+    --brand-deep: #1740d6;
+    --brand-tint: #eaefff;
+    --live: #ff6a3d;
+    --live-soft: #ffe6dd;
+    --cool: #9aa4b8;
+    --sans: system-ui, -apple-system, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Yu Gothic", "Segoe UI", Roboto, sans-serif;
+    --maxw: 1140px;
+    --sh: 0 24px 70px rgba(14,22,48,0.14);
+    --sh-sm: 0 6px 22px rgba(14,22,48,0.07);
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font-family: var(--sans); line-height: 1.72;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+  }
+  ::selection { background: rgba(255,106,61,0.22); }
+  a { color: inherit; text-decoration: none; }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+
+  .btn { font-size: 15px; font-weight: 700; padding: 14px 28px; border-radius: 999px; border: 1.5px solid transparent;
+    cursor: pointer; display: inline-flex; align-items: center; gap: 8px; position: relative; overflow: hidden;
+    transition: transform .16s, box-shadow .22s, background .18s, color .18s, border-color .18s; }
+  .btn-primary { background: var(--brand); color: #fff; }
+  .btn-primary::after { content: ""; position: absolute; inset: 0; background: linear-gradient(100deg, transparent 30%, rgba(255,255,255,0.35) 50%, transparent 70%);
+    transform: translateX(-120%); transition: transform .6s ease; }
+  .btn-primary:hover::after { transform: translateX(120%); }
+  .btn-primary:hover { background: var(--brand-deep); transform: translateY(-2px); box-shadow: 0 16px 32px rgba(30,80,255,0.35); }
+  .btn-ghost { background: rgba(255,255,255,0.8); color: var(--brand); border-color: #cdd6ea; backdrop-filter: blur(6px); }
+  .btn-ghost:hover { border-color: var(--brand); transform: translateY(-2px); }
+  .btn-white { background: #fff; color: var(--brand); }
+  .btn-white:hover { transform: translateY(-2px); box-shadow: 0 14px 30px rgba(0,0,0,0.18); }
+
+  /* ---------- header ---------- */
+  header { position: fixed; top: 0; left: 0; right: 0; z-index: 40;
+    background: transparent; transition: background .3s, box-shadow .3s, border-color .3s;
+    border-bottom: 1px solid transparent; }
+  header.solid { background: rgba(255,255,255,0.86); backdrop-filter: blur(12px);
+    border-bottom-color: var(--line); box-shadow: 0 4px 24px rgba(14,22,48,0.05); }
+  .nav { max-width: var(--maxw); margin: 0 auto; padding: 16px 24px; display: flex; align-items: center; gap: 26px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 18px; letter-spacing: -0.02em; }
+  .brand .logo { width: 22px; height: 22px; border-radius: 7px; position: relative;
+    background: linear-gradient(135deg, #3d6bff, var(--brand)); box-shadow: 0 3px 9px rgba(30,80,255,0.4); }
+  .brand .logo::after { content: ""; position: absolute; inset: 6px 6px auto auto; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--live); box-shadow: 0 0 0 2px #fff; }
+  .nav .links { display: flex; gap: 24px; margin-left: 10px; }
+  .nav .links a { font-size: 15px; font-weight: 600; color: var(--muted); transition: color .18s; }
+  .nav .links a:hover { color: var(--ink); }
+  .nav .right { margin-left: auto; }
+  @media (max-width: 720px) { .nav .links { display: none; } }
+
+  /* ---------- hero (product demo) ---------- */
+  .hero { position: relative; min-height: 100svh; display: flex; align-items: center; overflow: hidden;
+    padding: 92px 0 40px;
+    background: radial-gradient(1200px 700px at 70% 20%, #eef3ff 0%, #ffffff 55%); }
+
+  /* Meet画面 + サイドパネルのライブモック */
+  .hero-visual { position: relative; width: 100%; max-width: 460px; margin-left: auto;
+    display: flex; flex-direction: column; gap: 14px; }
+  @media (max-width: 900px) { .hero-visual { margin: 34px auto 0; } }
+
+  .meet-mock { background: #fff; border: 1px solid var(--line); border-radius: 16px;
+    box-shadow: var(--sh); overflow: hidden; }
+  .meet-bar { display: flex; align-items: center; gap: 6px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+  .meet-bar i { width: 9px; height: 9px; border-radius: 50%; background: #e3e9f5; }
+  .meet-bar span { margin-left: 8px; font-size: 11.5px; font-weight: 600; color: var(--faint); }
+  .meet-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 10px; }
+  .tile { position: relative; aspect-ratio: 16 / 9; border-radius: 10px; overflow: hidden;
+    background: linear-gradient(180deg, #eef2fb, #e4eaf7); transition: box-shadow .4s; }
+  .tile::before { content: ""; position: absolute; left: 50%; top: 34%; width: 26%; aspect-ratio: 1;
+    border-radius: 50%; transform: translate(-50%, -50%); background: #c3cde0; }
+  .tile::after { content: ""; position: absolute; left: 50%; top: 92%; width: 54%; aspect-ratio: 2 / 1;
+    border-radius: 50% 50% 0 0 / 100% 100% 0 0; transform: translate(-50%, -50%); background: #c3cde0; }
+  .tile.t2 { background: linear-gradient(180deg, #eef6f0, #e2ece6); } .tile.t2::before, .tile.t2::after { background: #bccdc2; }
+  .tile.t3 { background: linear-gradient(180deg, #f6f1ea, #eee6da); } .tile.t3::before, .tile.t3::after { background: #d2c5b0; }
+  .tile.react { box-shadow: inset 0 0 0 2.5px var(--live); }
+  .tile .det { position: absolute; inset: 14% 22%; border: 1.5px solid rgba(255,106,61,0.8); border-radius: 8px; }
+  .tile .det::after { content: "face 0.98"; position: absolute; top: -17px; left: -1px; font-size: 8.5px; font-weight: 700;
+    letter-spacing: .04em; color: #d9481f; background: var(--live-soft); border-radius: 4px; padding: 1px 5px; }
+
+  .panel-mock { width: 100%;
+    background: #fff; border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--sh-sm); padding: 13px 14px 12px; }
+  .panel-head { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 800; letter-spacing: -0.01em; }
+  .panel-head .rec { width: 8px; height: 8px; border-radius: 50%; background: var(--live); animation: pulse 1.7s infinite; }
+  .panel-head .live-tag { margin-left: auto; font-size: 9.5px; font-weight: 800; letter-spacing: .14em; color: #d9481f;
+    background: var(--live-soft); border-radius: 999px; padding: 2px 8px; }
+  #heroWave { display: block; width: 100%; height: 74px; margin-top: 10px;
+    background: var(--mist); border: 1px solid var(--line); border-radius: 8px; }
+  .wave-cap { display: flex; justify-content: space-between; font-size: 10px; color: var(--faint); margin-top: 6px; font-weight: 600; }
+  .moments { display: flex; flex-direction: column; gap: 6px; margin-top: 9px; min-height: 66px; }
+  .mchip { display: flex; align-items: center; gap: 9px; background: var(--mist); border: 1px solid var(--line);
+    border-radius: 9px; padding: 5px 9px 5px 5px; animation: chipin .5s cubic-bezier(.2,.8,.2,1) both; }
+  @keyframes chipin { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
+  .mchip .mthumb { flex: none; width: 38px; height: 25px; border-radius: 5px;
+    background: linear-gradient(135deg, #dfe7f6 40%, #cfd9ec); position: relative; overflow: hidden; }
+  .mchip .mthumb::after { content: ""; position: absolute; inset: 3px; border: 1px solid rgba(255,106,61,0.7); border-radius: 3px; }
+  .mchip .mtxt { font-size: 11px; color: var(--muted); font-weight: 600; }
+  .mchip .mtxt b { color: #d9481f; font-weight: 800; }
+  .mchip.cold .mtxt b { color: #3a5ccc; }
+  .mchip.cold .mthumb::after { border-color: rgba(30,80,255,0.55); }
+  .hero-inner { position: relative; z-index: 2; width: 100%; }
+  .hero-grid { display: grid; grid-template-columns: 1.1fr 0.9fr; gap: 40px; align-items: center; }
+  @media (max-width: 900px) { .hero-grid { grid-template-columns: 1fr; } }
+  .eyebrow { font-size: 12.5px; font-weight: 700; letter-spacing: 0.2em; text-transform: uppercase; color: var(--brand); }
+  .hero h1 { font-size: clamp(44px, 7vw, 84px); line-height: 1.04; letter-spacing: -0.045em; font-weight: 800;
+    margin: 18px 0 0; text-wrap: balance; }
+  .hero h1 .see { color: var(--live); position: relative; display: inline-block; }
+  .hero h1 .see::after { content: ""; position: absolute; left: 2%; right: 2%; bottom: 6%; height: 0.14em;
+    background: var(--live-soft); z-index: -1; border-radius: 4px; transform-origin: left;
+    animation: underline 1s .9s cubic-bezier(.2,.8,.2,1) both; }
+  @keyframes underline { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+  .hero .lede { color: var(--muted); font-size: 19px; margin: 26px 0 0; max-width: 40ch; }
+  .hero-cta { display: flex; gap: 14px; margin-top: 34px; flex-wrap: wrap; }
+  .trust { font-size: 13px; color: var(--faint); margin-top: 18px; }
+
+  /* staged entrance */
+  .stage { opacity: 0; transform: translateY(26px); animation: rise .9s cubic-bezier(.2,.8,.2,1) forwards; }
+  .stage.d1 { animation-delay: .08s; } .stage.d2 { animation-delay: .2s; }
+  .stage.d3 { animation-delay: .34s; } .stage.d4 { animation-delay: .48s; } .stage.d5 { animation-delay: .62s; }
+  @keyframes rise { to { opacity: 1; transform: none; } }
+
+  /* live chip over scene */
+  .scene-chip { position: absolute; z-index: 3; right: 34px; bottom: 34px;
+    display: inline-flex; align-items: center; gap: 9px; font-size: 13.5px; font-weight: 700;
+    padding: 10px 18px; border-radius: 999px; background: rgba(255,255,255,0.85); backdrop-filter: blur(8px);
+    border: 1px solid var(--line); box-shadow: var(--sh-sm); color: #d9481f; transition: color .4s; }
+  .scene-chip.low { color: var(--cool); }
+  .scene-chip .adot { width: 8px; height: 8px; border-radius: 50%; background: var(--live);
+    box-shadow: 0 0 10px var(--live); animation: pulse 1.7s ease-in-out infinite; }
+  .scene-chip.low .adot { background: var(--cool); box-shadow: none; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.4;} }
+  @media (max-width: 720px) { .scene-chip { right: 16px; bottom: 16px; } }
+
+  .scroll-hint { position: absolute; z-index: 3; left: 50%; bottom: 22px; transform: translateX(-50%);
+    width: 26px; height: 42px; border: 2px solid #c6cede; border-radius: 14px; opacity: .7; }
+  .scroll-hint::after { content: ""; position: absolute; left: 50%; top: 8px; width: 4px; height: 8px; border-radius: 3px;
+    background: var(--brand); transform: translateX(-50%); animation: wheel 1.8s ease-in-out infinite; }
+  @keyframes wheel { 0%{ transform: translate(-50%,0); opacity: 1;} 70%{ transform: translate(-50%,14px); opacity: 0;} 100%{opacity:0;} }
+
+  /* ---------- scroll reveal ---------- */
+  .rv { opacity: 0; transform: translateY(38px); transition: opacity .8s cubic-bezier(.2,.8,.2,1), transform .8s cubic-bezier(.2,.8,.2,1); }
+  .rv.in { opacity: 1; transform: none; }
+  .rv.dl1 { transition-delay: .1s; } .rv.dl2 { transition-delay: .22s; } .rv.dl3 { transition-delay: .34s; }
+
+  /* ---------- sections ---------- */
+  section.block { padding: 110px 0; position: relative; }
+  .block.soft { background: var(--mist); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .sec-head { text-align: center; max-width: 640px; margin: 0 auto; }
+  .sec-k { font-size: 12.5px; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase; color: var(--live); }
+  .sec-title { font-size: clamp(30px, 4.2vw, 46px); font-weight: 800; letter-spacing: -0.03em; margin: 14px 0 0; text-wrap: balance; }
+  .sec-sub { color: var(--muted); font-size: 17.5px; margin: 16px auto 0; }
+
+  /* floating deco blobs */
+  .blob { position: absolute; border-radius: 50%; filter: blur(70px); pointer-events: none; z-index: 0; }
+  .blob.b1 { width: 380px; height: 380px; background: rgba(30,80,255,0.10); top: -100px; left: -120px; }
+  .blob.b2 { width: 300px; height: 300px; background: rgba(255,106,61,0.10); bottom: -80px; right: -80px; }
+
+  /* 3D tilt cards */
+  .feat { display: grid; grid-template-columns: repeat(3, 1fr); gap: 26px; margin-top: 58px; position: relative; z-index: 1;
+    perspective: 1200px; }
+  @media (max-width: 780px) { .feat { grid-template-columns: 1fr; } }
+  .fcard { background: #fff; border: 1px solid var(--line); border-radius: 20px; padding: 34px; box-shadow: var(--sh-sm);
+    transform-style: preserve-3d; transition: box-shadow .3s; will-change: transform; }
+  .fcard:hover { box-shadow: var(--sh); }
+  .fcard .when { font-size: 12.5px; font-weight: 700; letter-spacing: 0.06em; color: var(--brand);
+    background: var(--brand-tint); display: inline-block; padding: 5px 12px; border-radius: 999px; transform: translateZ(30px); }
+  .fcard h3 { font-size: 21px; margin: 18px 0 0; font-weight: 800; letter-spacing: -0.015em; transform: translateZ(24px); }
+  .fcard p { color: var(--muted); font-size: 15.5px; margin: 11px 0 0; transform: translateZ(16px); }
+  .fcard .art { height: 72px; margin-top: 22px; border-radius: 12px; background: var(--mist); position: relative; overflow: hidden;
+    transform: translateZ(10px); }
+  .fcard .art canvas { width: 100%; height: 100%; display: block; }
+
+  /* ---------- dashboard ---------- */
+  .dash { margin: 58px auto 0; max-width: 940px; background: #fff; border: 1px solid var(--line); border-radius: 22px;
+    box-shadow: var(--sh); overflow: hidden; position: relative; z-index: 1; }
+  .dash-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 16px 24px; border-bottom: 1px solid var(--line);
+    font-size: 13.5px; color: var(--muted); font-weight: 600; background: #fbfcfe; }
+  .dash-head .dd { color: var(--brand); }
+  .chip { font-size: 12px; padding: 4px 12px; border-radius: 999px; background: var(--live-soft); color: #d9481f; font-weight: 700; }
+  .dash-inner { padding: 30px; }
+  .dash-inner .k { font-size: 14px; color: var(--muted); font-weight: 600; }
+  .dash-inner svg { width: 100%; height: 170px; display: block; margin-top: 14px; }
+  .tl-path { stroke-dasharray: 1; stroke-dashoffset: 1; }
+  .dash.in .tl-path { animation: drawline 1.8s .2s cubic-bezier(.4,0,.2,1) forwards; }
+  @keyframes drawline { to { stroke-dashoffset: 0; } }
+  .tl-fill { opacity: 0; }
+  .dash.in .tl-fill { animation: fadein 1s 1.4s forwards; }
+  @keyframes fadein { to { opacity: 1; } }
+  .mark { opacity: 0; transform-origin: center; transform-box: fill-box; }
+  .dash.in .mark { animation: pop .5s cubic-bezier(.2,1.4,.4,1) forwards; }
+  .dash.in .mark.m2 { animation-delay: 2.15s; } .dash.in .mark.m1 { animation-delay: 1.9s; }
+  @keyframes pop { from { opacity: 0; transform: scale(0); } to { opacity: 1; transform: scale(1); } }
+  .marker { font-size: 11px; font-weight: 700; fill: var(--live); }
+  .notes { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 26px; }
+  @media (max-width: 640px) { .notes { grid-template-columns: 1fr; } }
+  .note { padding: 17px 19px; border-radius: 14px; border: 1px solid var(--line); }
+  .note.warn { background: #fff4ef; border-color: #ffd9c9; }
+  .note.good { background: #eef2ff; border-color: #d3ddff; }
+  .note .t { font-size: 12.5px; font-weight: 700; }
+  .note.warn .t { color: #d9481f; } .note.good .t { color: var(--brand); }
+  .note .m { font-size: 15px; margin-top: 6px; color: var(--ink); }
+
+  /* ---------- CTA ---------- */
+  .ctaband { position: relative; overflow: hidden; color: #fff;
+    background: linear-gradient(115deg, #1740d6, #1e50ff 40%, #3d6bff 70%, #1e50ff);
+    background-size: 240% 240%; animation: drift 10s ease-in-out infinite alternate; }
+  @keyframes drift { from { background-position: 0% 40%; } to { background-position: 100% 60%; } }
+  .ctaband .inner { max-width: var(--maxw); margin: 0 auto; padding: 92px 24px; text-align: center; position: relative; z-index: 1; }
+  .ctaband h2 { font-size: clamp(30px, 4.4vw, 48px); font-weight: 800; letter-spacing: -0.03em; margin: 0; text-wrap: balance; }
+  .ctaband p { font-size: 18px; margin: 16px auto 0; max-width: 40ch; opacity: 0.95; }
+  .ctaband .hero-cta { justify-content: center; margin-top: 32px; }
+  .ctaband .meta { font-size: 13px; opacity: 0.85; margin-top: 18px; }
+  .ctaband .ring { position: absolute; border: 1.5px solid rgba(255,255,255,0.14); border-radius: 50%; pointer-events: none; }
+  .ctaband .r1 { width: 560px; height: 560px; top: -280px; right: -140px; }
+  .ctaband .r2 { width: 380px; height: 380px; bottom: -190px; left: -90px; }
+
+  footer { padding: 48px 0; border-top: 1px solid var(--line); }
+  .foot { display: flex; gap: 24px; justify-content: space-between; flex-wrap: wrap; align-items: flex-start; }
+  .foot .ethic { max-width: 50ch; color: var(--muted); font-size: 13.5px; }
+  .foot .ethic b { color: var(--ink); }
+  .foot .flinks { display: flex; gap: 22px; font-size: 14px; }
+  .foot .flinks a { color: var(--muted); font-weight: 600; }
+  .foot .flinks a:hover { color: var(--brand); }
+
+  :focus-visible { outline: 2px solid var(--brand); outline-offset: 3px; border-radius: 6px; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .stage, .hero h1 .see::after { animation-duration: 0.01s !important; animation-delay: 0s !important; }
+    .rv { transition: none; opacity: 1; transform: none; }
+    .ctaband { animation: none; }
+    .scroll-hint { display: none; }
+  }
+</style>
+</head>
+<body>
+<header id="hdr">
+  <nav class="nav">
+    <a class="brand" href="#top"><span class="logo"></span>Reaction Engine</a>
+    <span class="links"><a href="#does">できること</a><a href="#after">見え方</a></span>
+    <span class="right"><a class="btn btn-primary" href="https://github.com/k-kanke/reaction-engine">拡張を追加（無料）</a></span>
+  </nav>
+</header>
+
+<main id="top">
+  <!-- HERO -->
+  <section class="hero" id="hero">
+    <div class="wrap hero-inner">
+      <div class="hero-grid">
+        <div>
+          <div class="eyebrow stage d1">For online presenters</div>
+          <h1><span class="stage d2" style="display:block">相手の反応が、</span><span class="see stage d3">見える。</span></h1>
+          <p class="lede stage d4">話しているあなたには見えない“手応え”を、リアルタイムに。会議のあとには、どこで伝わってどこで離れたかも教えてくれます。</p>
+          <div class="hero-cta stage d5">
+            <a class="btn btn-primary" href="https://github.com/k-kanke/reaction-engine">拡張を追加（無料） →</a>
+            <a class="btn btn-ghost" href="#after">見え方を見る</a>
+          </div>
+          <div class="trust stage d5">Google Meet 対応 · Chrome 拡張 · 数クリックで導入</div>
+        </div>
+        <div class="hero-visual stage d3" aria-hidden="true">
+          <div class="meet-mock">
+            <div class="meet-bar"><i></i><i></i><i></i><span>Google Meet</span></div>
+            <div class="meet-grid">
+              <div class="tile t1" id="tile1"><span class="det"></span></div>
+              <div class="tile t2" id="tile2"></div>
+              <div class="tile t3" id="tile3"></div>
+              <div class="tile t4" id="tile4"></div>
+            </div>
+          </div>
+          <div class="panel-mock">
+            <div class="panel-head"><span class="rec"></span>Reaction Engine<span class="live-tag">LIVE</span></div>
+            <canvas id="heroWave"></canvas>
+            <div class="wave-cap"><span>会議の雰囲気</span><span>↑ 盛り上がり · ↓ 冷え込み</span></div>
+            <div class="moments" id="heroMoments"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="scene-chip" id="chip"><span class="adot"></span><span id="chipT">部屋はついてきています</span></div>
+    <div class="scroll-hint" aria-hidden="true"></div>
+  </section>
+
+  <!-- WHAT IT DOES -->
+  <section class="block soft" id="does">
+    <div class="blob b1"></div><div class="blob b2"></div>
+    <div class="wrap">
+      <div class="sec-head rv">
+        <div class="sec-k">What it does</div>
+        <h2 class="sec-title">発表を、ひとりで抱えない。</h2>
+        <p class="sec-sub">相手の反応を代わりに見て、その場で・あとで、あなたに伝えます。やることは3つだけ。</p>
+      </div>
+      <div class="feat">
+        <div class="fcard rv dl1" data-tilt>
+          <span class="when">話している間</span>
+          <h3>手応えが、その場でわかる</h3>
+          <p>相手が集中しているか、反応が落ちてきたかを、話している最中にそっと知らせます。</p>
+          <div class="art"><canvas data-art="wave"></canvas></div>
+        </div>
+        <div class="fcard rv dl2" data-tilt>
+          <span class="when">会議のあと</span>
+          <h3>どこで離れたか、ひと目で</h3>
+          <p>会議のタイムラインで、反応が上がった瞬間・下がった瞬間がはっきり見えます。</p>
+          <div class="art"><canvas data-art="timeline"></canvas></div>
+        </div>
+        <div class="fcard rv dl3" data-tilt>
+          <span class="when">次に向けて</span>
+          <h3>活かせるアドバイス</h3>
+          <p>「ここの切り替えが急だったかも」など、次の発表に活かせるヒントを言葉で返します。</p>
+          <div class="art"><canvas data-art="type"></canvas></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- AFTER -->
+  <section class="block" id="after">
+    <div class="wrap">
+      <div class="sec-head rv">
+        <div class="sec-k">After the call</div>
+        <h2 class="sec-title">会議のあと、こう見える。</h2>
+        <p class="sec-sub">発表のどこで相手の反応が動いたか。そのまま、次への改善点になります。</p>
+      </div>
+
+      <div class="dash rv" id="dash">
+        <div class="dash-head">
+          <span class="dd">●</span>
+          <span>2026-07-04 のミーティング · 18分 · 3名</span>
+          <span class="chip">反応の低下 2回</span>
+        </div>
+        <div class="dash-inner">
+          <div class="k">相手の反応（時間の流れ →）</div>
+          <svg viewBox="0 0 640 170" preserveAspectRatio="none" role="img" aria-label="相手の反応のタイムライン">
+            <defs>
+              <linearGradient id="fillg" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#ff6a3d" stop-opacity="0.2"/>
+                <stop offset="1" stop-color="#ff6a3d" stop-opacity="0"/>
+              </linearGradient>
+            </defs>
+            <path class="tl-fill" d="M0,64 L52,52 L104,60 L156,46 L208,56 L260,92 L312,132 L364,116 L416,68 L468,60 L520,70 L572,116 L640,128 L640,170 L0,170 Z" fill="url(#fillg)"/>
+            <path class="tl-path" pathLength="1" d="M0,64 L52,52 L104,60 L156,46 L208,56 L260,92 L312,132 L364,116 L416,68 L468,60 L520,70 L572,116 L640,128"
+                  fill="none" stroke="#ff6a3d" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+            <g class="mark m1"><circle cx="312" cy="132" r="5.5" fill="#ff6a3d"/><text class="marker" x="312" y="152" text-anchor="middle">反応 ↓</text></g>
+            <g class="mark m2"><circle cx="572" cy="116" r="5.5" fill="#ff6a3d"/><text class="marker" x="572" y="108" text-anchor="middle">反応 ↓</text></g>
+          </svg>
+          <div class="notes">
+            <div class="note warn rv dl1">
+              <div class="t">6分あたり</div>
+              <div class="m">話題を切り替えた直後に反応が下がりました。切り替えをもう少しゆっくりにすると伝わりやすいかも。</div>
+            </div>
+            <div class="note good rv dl2">
+              <div class="t">9分あたり</div>
+              <div class="m">問いかけのあとに“間”をとった場面で、相手の頷きが増えました。ここは効いています。</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="ctaband">
+    <span class="ring r1"></span><span class="ring r2"></span>
+    <div class="inner">
+      <h2 class="rv">次の発表から、ひとりじゃない。</h2>
+      <p class="rv dl1">Chrome 拡張を追加して、Google Meet ですぐに使えます。相手の同意のうえで、あなた自身のために。</p>
+      <div class="hero-cta rv dl2">
+        <a class="btn btn-white" href="https://github.com/k-kanke/reaction-engine">拡張を追加（無料） →</a>
+      </div>
+      <div class="meta rv dl3">Chrome MV3 · Google Meet 対応 · インストール数クリック</div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap foot">
+      <div class="ethic">
+        <b>相手の感情を決めつけるものではありません。</b> 見えるのは反応の“変化”だけ。個人を採点・監視するのではなく、あなたの発表を良くするための道具です。
+      </div>
+      <div class="flinks">
+        <a href="https://github.com/k-kanke/reaction-engine">GitHub</a>
+        <a href="#does">できること</a>
+        <a href="#after">見え方</a>
+      </div>
+    </div>
+  </footer>
+</main>
+
+<script>
+(function () {
+  "use strict";
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var fine = window.matchMedia && window.matchMedia("(hover: hover) and (pointer: fine)").matches;
+
+  /* ===== header ===== */
+  var hdr = document.getElementById("hdr");
+  function onScroll() { hdr.classList.toggle("solid", window.scrollY > 24); }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+
+  /* ===== scroll reveal ===== */
+  var io = new IntersectionObserver(function (es) {
+    es.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } });
+  }, { threshold: 0.18 });
+  document.querySelectorAll(".rv, .dash").forEach(function (el) { io.observe(el); });
+
+  /* ===== hero: live product demo (mood wave + moments) ===== */
+  var chip = document.getElementById("chip"), chipT = document.getElementById("chipT");
+  var wave = document.getElementById("heroWave");
+  var momentsBox = document.getElementById("heroMoments");
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  var wctx = wave.getContext("2d");
+  var WINDOW_MS = 22000;
+  var start = Date.now() - 8 * 60000; // 疑似ミーティング経過時間(8分経過から開始)
+  var hist = [];      // {t, v} 偏差 -1..1
+  var marks = [];     // {t, dir}
+  var bumps = [];     // {t0, amp, w}
+
+  function sizeWave() {
+    var r = wave.getBoundingClientRect();
+    if (!r.width) return;
+    wave.width = Math.round(r.width * dpr);
+    wave.height = Math.round(r.height * dpr);
+    wctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  sizeWave();
+  window.addEventListener("resize", sizeWave);
+
+  function moodAt(now) {
+    var t = (now - start) / 1000;
+    var v = Math.sin(t * 0.9) * 0.06 + Math.sin(t * 2.3 + 1.4) * 0.04;
+    for (var i = 0; i < bumps.length; i++) {
+      var b = bumps[i], dt = (now - b.t0) / 1000;
+      v += b.amp * Math.exp(-(dt * dt) / (2 * b.w * b.w));
+    }
+    return Math.max(-1, Math.min(1, v));
+  }
+
+  function drawWave() {
+    var now = Date.now();
+    hist.push({ t: now, v: moodAt(now) });
+    while (hist.length && hist[0].t < now - WINDOW_MS) hist.shift();
+    marks = marks.filter(function (m) { return m.t >= now - WINDOW_MS; });
+
+    var r = wave.getBoundingClientRect(), w = r.width, h = r.height;
+    if (!w) return;
+    var X = function (t) { return ((t - (now - WINDOW_MS)) / WINDOW_MS) * w; };
+    var Y = function (v) { return h / 2 - v * (h / 2 - 6); };
+
+    wctx.clearRect(0, 0, w, h);
+    // baseline
+    wctx.strokeStyle = "#c6cede"; wctx.lineWidth = 1; wctx.setLineDash([3, 5]);
+    wctx.beginPath(); wctx.moveTo(0, h / 2); wctx.lineTo(w, h / 2); wctx.stroke();
+    wctx.setLineDash([]);
+    // trigger markers
+    marks.forEach(function (m) {
+      wctx.strokeStyle = m.dir > 0 ? "rgba(255,106,61,0.6)" : "rgba(30,80,255,0.45)";
+      wctx.lineWidth = 1.5;
+      wctx.beginPath(); wctx.moveTo(X(m.t), 4); wctx.lineTo(X(m.t), h - 4); wctx.stroke();
+    });
+    if (hist.length < 2) return;
+    // fill + line
+    wctx.fillStyle = "rgba(255,106,61,0.12)";
+    wctx.beginPath(); wctx.moveTo(X(hist[0].t), h / 2);
+    hist.forEach(function (p) { wctx.lineTo(X(p.t), Y(p.v)); });
+    wctx.lineTo(X(hist[hist.length - 1].t), h / 2); wctx.closePath(); wctx.fill();
+    wctx.strokeStyle = "#ff6a3d"; wctx.lineWidth = 2.5; wctx.lineJoin = "round";
+    wctx.beginPath();
+    hist.forEach(function (p, i) { i ? wctx.lineTo(X(p.t), Y(p.v)) : wctx.moveTo(X(p.t), Y(p.v)); });
+    wctx.stroke();
+  }
+
+  function clock(ms) {
+    var s = Math.floor(ms / 1000), m = Math.floor(s / 60);
+    return m + ":" + ("0" + (s % 60)).slice(-2);
+  }
+
+  function addMoment(dir, amp, at) {
+    var el = document.createElement("div");
+    el.className = "mchip" + (dir > 0 ? "" : " cold");
+    el.innerHTML = '<span class="mthumb"></span><span class="mtxt"><b>' +
+      (dir > 0 ? "盛り上がり" : "冷え込み") + "</b> " + (dir > 0 ? "+" : "−") + amp.toFixed(2) +
+      " · " + clock(at - start) + "</span>";
+    momentsBox.prepend(el);
+    while (momentsBox.children.length > 2) momentsBox.removeChild(momentsBox.lastChild);
+  }
+
+  function fire() {
+    var dir = Math.random() < 0.68 ? 1 : -1;
+    var amp = 0.45 + Math.random() * 0.3;
+    var now = Date.now();
+    bumps.push({ t0: now + 900, amp: dir * amp, w: 1.1 });
+    bumps = bumps.slice(-6);
+    setTimeout(function () {
+      var at = Date.now();
+      marks.push({ t: at, dir: dir });
+      addMoment(dir, amp * 0.28, at);
+      // どれかのタイルが反応する
+      var tile = document.getElementById("tile" + (1 + ((Math.random() * 4) | 0)));
+      tile.classList.add("react");
+      setTimeout(function () { tile.classList.remove("react"); }, 1600);
+      chip.classList.toggle("low", dir < 0);
+      chipT.textContent = dir > 0 ? "盛り上がりを記録しました" : "反応が落ちています";
+      setTimeout(function () {
+        chip.classList.remove("low");
+        chipT.textContent = "部屋はついてきています";
+      }, 2600);
+    }, 900);
+    setTimeout(fire, 5200 + Math.random() * 3800);
+  }
+
+  // 過去22秒ぶんをプリフィルして、最初から波形が流れている状態にする
+  var now0 = Date.now();
+  bumps.push({ t0: now0 - 5000, amp: 0.55, w: 1.1 });
+  marks.push({ t: now0 - 4100, dir: 1 });
+  for (var tt = now0 - WINDOW_MS; tt < now0; tt += 120) hist.push({ t: tt, v: moodAt(tt) });
+  addMoment(1, 0.15, now0 - 4100);
+
+  if (reduce) {
+    drawWave();
+  } else {
+    (function loopW() { drawWave(); requestAnimationFrame(loopW); })();
+    setTimeout(fire, 2600);
+  }
+
+  /* ===== 3D tilt cards ===== */
+  if (fine && !reduce) {
+    document.querySelectorAll("[data-tilt]").forEach(function (card) {
+      var raf = null;
+      card.addEventListener("mousemove", function (e) {
+        var r = card.getBoundingClientRect();
+        var px = (e.clientX - r.left) / r.width - 0.5;
+        var py = (e.clientY - r.top) / r.height - 0.5;
+        if (raf) cancelAnimationFrame(raf);
+        raf = requestAnimationFrame(function () {
+          card.style.transform = "rotateY(" + (px * 10) + "deg) rotateX(" + (py * -10) + "deg) translateZ(0)";
+        });
+      });
+      card.addEventListener("mouseleave", function () {
+        if (raf) cancelAnimationFrame(raf);
+        card.style.transition = "transform .5s cubic-bezier(.2,.8,.2,1), box-shadow .3s";
+        card.style.transform = "";
+        setTimeout(function () { card.style.transition = "box-shadow .3s"; }, 520);
+      });
+    });
+  }
+
+  /* ===== mini canvas art in cards ===== */
+  function setupArt(c) {
+    var x2 = c.getContext("2d");
+    var rc = c.getBoundingClientRect();
+    c.width = rc.width * dpr; c.height = rc.height * dpr;
+    x2.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return { ctx: x2, w: rc.width, h: rc.height };
+  }
+  var arts = [];
+  document.querySelectorAll("[data-art]").forEach(function (c) {
+    arts.push({ el: c, kind: c.getAttribute("data-art"), inited: false });
+  });
+  var artT = 0;
+  function drawArts() {
+    artT += 0.03;
+    arts.forEach(function (a) {
+      var r = a.el.getBoundingClientRect();
+      if (r.width === 0) return;
+      if (!a.inited) { a.s = setupArt(a.el); a.inited = true; }
+      var s = a.s, c2 = s.ctx;
+      c2.clearRect(0, 0, s.w, s.h);
+      if (a.kind === "wave") {
+        c2.strokeStyle = "#ff6a3d"; c2.lineWidth = 2; c2.beginPath();
+        for (var x = 0; x <= s.w; x += 3) {
+          var y = s.h / 2 + Math.sin(x * 0.05 + artT * 2) * 10 * Math.sin(x * 0.008 + artT * 0.7);
+          if (x === 0) c2.moveTo(x, y); else c2.lineTo(x, y);
+        }
+        c2.stroke();
+      } else if (a.kind === "timeline") {
+        c2.strokeStyle = "#1e50ff"; c2.lineWidth = 2; c2.beginPath();
+        var pts = [0.5, 0.42, 0.48, 0.36, 0.44, 0.68, 0.85, 0.72, 0.5, 0.44];
+        pts.forEach(function (p, i4) {
+          var x3 = (i4 / (pts.length - 1)) * s.w, y3 = p * s.h;
+          if (i4 === 0) c2.moveTo(x3, y3); else c2.lineTo(x3, y3);
+        });
+        c2.stroke();
+        var mi = 6, mx2 = (mi / (pts.length - 1)) * s.w, my2 = pts[mi] * s.h;
+        c2.fillStyle = "#ff6a3d";
+        c2.beginPath(); c2.arc(mx2, my2, 4 + Math.sin(artT * 3) * 1.2, 0, Math.PI * 2); c2.fill();
+      } else if (a.kind === "type") {
+        c2.fillStyle = "#9aa4b8"; c2.font = "600 11px system-ui";
+        var msg = "切り替えをゆっくりにすると伝わりやすいかも";
+        var nchar = Math.floor((artT * 6) % (msg.length + 14));
+        c2.fillStyle = "#59637a";
+        c2.fillText(msg.slice(0, Math.min(nchar, msg.length)), 12, s.h / 2 + 4);
+        if (Math.floor(artT * 3) % 2 === 0 && nchar <= msg.length) {
+          var wpx = c2.measureText(msg.slice(0, Math.min(nchar, msg.length))).width;
+          c2.fillStyle = "#1e50ff"; c2.fillRect(14 + wpx, s.h / 2 - 6, 2, 13);
+        }
+      }
+    });
+  }
+  if (!reduce) { (function loopA() { drawArts(); requestAnimationFrame(loopA); })(); }
+  else { drawArts(); }
+})();
+</script>
+
+</body>
+</html>

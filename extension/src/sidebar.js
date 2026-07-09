@@ -19,6 +19,7 @@ const elements = {
   statusBadge: document.getElementById("statusBadge"),
   wsUrl: document.getElementById("wsUrl"),
   connectButton: document.getElementById("connectButton"),
+  reportEmail: document.getElementById("reportEmail"),
   sessionId: document.getElementById("sessionId"),
   faceCount: document.getElementById("faceCount"),
   motionScore: document.getElementById("motionScore"),
@@ -189,9 +190,14 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 async function restoreSettings() {
-  const stored = await chrome.storage.local.get(["wsUrl"]);
+  const stored = await chrome.storage.local.get(["wsUrl", "reportEmail"]);
   elements.wsUrl.value = stored.wsUrl || window.REACTION_ENGINE_CONFIG?.gatewayWsUrl || "";
+  elements.reportEmail.value = stored.reportEmail || "";
 }
+
+elements.reportEmail.addEventListener("change", async () => {
+  await chrome.storage.local.set({ reportEmail: elements.reportEmail.value.trim() });
+});
 
 async function initEdgeVision() {
   const mediaPipeDetector = await createMediaPipeFaceDetector();
@@ -370,7 +376,8 @@ function stopCapture() {
   // ここに来るため、Stop ボタン以外の終了経路もまとめて拾える。stream が
   // null(まだキャプチャ開始前)なら実セッションではないので送らない。
   if (stream && ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "session_end", session_id: sessionId }));
+    const reportRecipient = elements.reportEmail.value.trim();
+    ws.send(JSON.stringify({ type: "session_end", session_id: sessionId, to: reportRecipient || undefined }));
   }
 
   if (analysisTimer) window.clearInterval(analysisTimer);

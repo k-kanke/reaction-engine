@@ -29,6 +29,19 @@ resource "google_cloud_run_v2_job" "this" {
           }
         }
 
+        dynamic "env" {
+          for_each = var.secret_env_vars
+          content {
+            name = env.key
+            value_source {
+              secret_key_ref {
+                secret  = env.value.secret_id
+                version = env.value.version
+              }
+            }
+          }
+        }
+
         dynamic "volume_mounts" {
           for_each = length(var.cloudsql_connection_names) > 0 ? [1] : []
           content {

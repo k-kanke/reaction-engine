@@ -10,6 +10,7 @@ import (
 
 	"github.com/k-kanke/reaction-engine/backend/internal/contract"
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
+	"github.com/k-kanke/reaction-engine/backend/internal/pubsub"
 	"github.com/k-kanke/reaction-engine/backend/internal/writer"
 )
 
@@ -38,7 +39,6 @@ func main() {
 	}
 	defer pool.Close()
 
-	events := db.NewLocalEventStore(pool)
 	store := writer.NewStore(pool)
 
 	// JSONL_STORE_BACKEND mirrors MEDIA_STORE_BACKEND (internal/media):
@@ -86,13 +86,70 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
-	go func() {
-		log.Printf("writer: healthz endpoint on :%s", port)
-		log.Fatal(http.ListenAndServe(":"+port, mux))
-	}()
 
-	log.Println("writer started")
+	// EVENT_BUS_BACKEND mirrors gateway/media-api's split (plan/
+	// post-session-report-implementation.md's Pub/Sub migration):
+	// "local" (default) keeps polling local_events, matching before;
+	// "pubsub" registers a push endpoint instead and never touches
+	// local_events -- Pub/Sub calls this service directly, so it no
+	// longer needs to stay warm polling Postgres every 2s.
+	eventBusBackend := os.Getenv("EVENT_BUS_BACKEND")
+	if eventBusBackend == "" {
+		eventBusBackend = "local"
+	}
 
+	switch eventBusBackend {
+	case "local":
+		events := db.NewLocalEventStore(pool)
+		go pollLocalEvents(ctx, events, jsonlStore, store)
+	case "pubsub":
+		mux.HandleFunc("/pubsub/push", newPushHandler(jsonlStore, store))
+	default:
+		log.Fatalf("writer: unknown EVENT_BUS_BACKEND %q (want local or pubsub)", eventBusBackend)
+	}
+
+	log.Printf("writer started, event_bus_backend=%s, healthz endpoint on :%s", eventBusBackend, port)
+	log.Fatal(http.ListenAndServe(":"+port, mux))
+}
+
+// newPushHandler builds the POST /pubsub/push handler Pub/Sub calls for
+// each "feature-events" message (EVENT_BUS_BACKEND=pubsub). A 200 response
+// acks the message; any other status tells Pub/Sub to retry per the
+// subscription's backoff policy (infra/modules/pubsub) -- which is what
+// now absorbs the transient GCS 429s internal/writer/gcs_store.go's
+// compose-append path can hit under bursty write volume, instead of the
+// old poll loop's fixed 2s retry.
+func newPushHandler(jsonlStore writer.JSONLStore, store *writer.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		msg, err := pubsub.DecodePush(r.Body)
+		if err != nil {
+			log.Printf("writer: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+
+		var payload contract.FeatureEventPayload
+		if err := json.Unmarshal(msg.Message.Data, &payload); err != nil {
+			// Poison message -- retrying won't fix malformed JSON, so ack
+			// it (200) rather than let Pub/Sub redeliver it forever.
+			log.Printf("writer: invalid payload for message_id=%s: %v", msg.Message.MessageID, err)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if !writeEvent(r.Context(), jsonlStore, store, payload) {
+			http.Error(w, "processing failed", http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("writer: wrote + acked event_id=%s session_id=%s", payload.EventID, payload.SessionID)
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// pollLocalEvents is the EVENT_BUS_BACKEND=local dev path: the original
+// Phase 5 poll loop against db.LocalEventStore, unchanged in behavior.
+func pollLocalEvents(ctx context.Context, events *db.LocalEventStore, jsonlStore writer.JSONLStore, store *writer.Store) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
@@ -109,7 +166,7 @@ func main() {
 				continue
 			}
 
-			if ok := writeEvent(ctx, jsonlStore, store, e.ID, payload); !ok {
+			if !writeEvent(ctx, jsonlStore, store, payload) {
 				continue
 			}
 
@@ -131,56 +188,57 @@ func main() {
 // transcript_chunks (if any, Phase 11) as both JSONL and a `transcripts`
 // Postgres row. Each event carries exactly one of these (see
 // contract.FeatureEventPayload). Returns false if any step failed, so the
-// caller leaves the event unacked for retry.
-func writeEvent(ctx context.Context, jsonlStore writer.JSONLStore, store *writer.Store, eventID int64, payload contract.FeatureEventPayload) bool {
+// caller (poll loop: leaves the event unacked for retry; push handler:
+// returns a 5xx so Pub/Sub retries) knows to retry.
+func writeEvent(ctx context.Context, jsonlStore writer.JSONLStore, store *writer.Store, payload contract.FeatureEventPayload) bool {
 	if payload.MoodWaveSample != nil {
 		if err := writer.AppendMoodWaveSample(ctx, jsonlStore, payload.SessionID, payload.EventID, payload.MoodWaveSample); err != nil {
-			log.Printf("writer: write mood wave sample jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			log.Printf("writer: write mood wave sample jsonl failed for event_id=%s: %v", payload.EventID, err)
 			return false
 		}
 	}
 
 	for _, trigger := range payload.TriggerEvents {
 		if err := store.EnsureSession(ctx, trigger.SessionID); err != nil {
-			log.Printf("writer: ensure session failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			log.Printf("writer: ensure session failed for event_id=%s: %v", payload.EventID, err)
 			return false
 		}
 		if err := store.InsertTriggerEvent(ctx, trigger); err != nil {
-			log.Printf("writer: insert trigger event failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			log.Printf("writer: insert trigger event failed for event_id=%s: %v", payload.EventID, err)
 			return false
 		}
 		if err := writer.AppendTriggerEvent(ctx, jsonlStore, trigger.SessionID, trigger.EventID, trigger); err != nil {
-			log.Printf("writer: write trigger event jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			log.Printf("writer: write trigger event jsonl failed for event_id=%s: %v", payload.EventID, err)
 			return false
 		}
 	}
 
 	for _, feedback := range payload.FeedbackEvents {
 		if err := store.EnsureSession(ctx, feedback.SessionID); err != nil {
-			log.Printf("writer: ensure session failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			log.Printf("writer: ensure session failed for event_id=%s: %v", payload.EventID, err)
 			return false
 		}
 		if err := store.InsertFeedbackEvent(ctx, feedback); err != nil {
-			log.Printf("writer: insert feedback event failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			log.Printf("writer: insert feedback event failed for event_id=%s: %v", payload.EventID, err)
 			return false
 		}
 		if err := writer.AppendFeedbackEvent(ctx, jsonlStore, feedback.SessionID, feedback.EventID, feedback); err != nil {
-			log.Printf("writer: write feedback event jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			log.Printf("writer: write feedback event jsonl failed for event_id=%s: %v", payload.EventID, err)
 			return false
 		}
 	}
 
 	for _, chunk := range payload.TranscriptChunks {
 		if err := store.EnsureSession(ctx, chunk.SessionID); err != nil {
-			log.Printf("writer: ensure session failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			log.Printf("writer: ensure session failed for event_id=%s: %v", payload.EventID, err)
 			return false
 		}
 		if err := store.InsertTranscriptChunk(ctx, chunk); err != nil {
-			log.Printf("writer: insert transcript failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			log.Printf("writer: insert transcript failed for event_id=%s: %v", payload.EventID, err)
 			return false
 		}
 		if err := writer.AppendTranscriptChunk(ctx, jsonlStore, chunk.SessionID, chunk.EventID, chunk); err != nil {
-			log.Printf("writer: write transcript jsonl failed for event id=%d event_id=%s: %v", eventID, payload.EventID, err)
+			log.Printf("writer: write transcript jsonl failed for event_id=%s: %v", payload.EventID, err)
 			return false
 		}
 	}

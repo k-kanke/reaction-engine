@@ -12,6 +12,7 @@ import (
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	"github.com/k-kanke/reaction-engine/backend/internal/imageanalysis"
 	"github.com/k-kanke/reaction-engine/backend/internal/media"
+	"github.com/k-kanke/reaction-engine/backend/internal/pubsub"
 	"github.com/k-kanke/reaction-engine/backend/internal/redis"
 )
 
@@ -53,7 +54,6 @@ func main() {
 	redisClient := redis.NewClient(redisAddr)
 	defer redisClient.Close()
 
-	events := db.NewLocalEventStore(pool)
 	store := imageanalysis.NewPGStore(pool)
 
 	mediaStoreBackend := os.Getenv("MEDIA_STORE_BACKEND")
@@ -86,13 +86,68 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	go func() {
-		log.Printf("image-analysis-worker started, debug endpoint on :%s", port)
-		if err := http.ListenAndServe(":"+port, mux); err != nil {
-			log.Fatal(err)
-		}
-	}()
+	// EVENT_BUS_BACKEND mirrors writer's split (plan/
+	// post-session-report-implementation.md's Pub/Sub migration): "local"
+	// (default) keeps polling local_events; "pubsub" registers a push
+	// endpoint instead, letting this service scale to zero between
+	// baseline-frame uploads instead of staying pinned at
+	// min_instance_count=1 to poll Postgres every 2s.
+	eventBusBackend := os.Getenv("EVENT_BUS_BACKEND")
+	if eventBusBackend == "" {
+		eventBusBackend = "local"
+	}
 
+	switch eventBusBackend {
+	case "local":
+		events := db.NewLocalEventStore(pool)
+		go pollLocalEvents(ctx, events, worker)
+	case "pubsub":
+		mux.HandleFunc("/pubsub/push", newPushHandler(worker))
+	default:
+		log.Fatalf("image-analysis-worker: unknown EVENT_BUS_BACKEND %q (want local or pubsub)", eventBusBackend)
+	}
+
+	log.Printf("image-analysis-worker started, event_bus_backend=%s, debug endpoint on :%s", eventBusBackend, port)
+	log.Fatal(http.ListenAndServe(":"+port, mux))
+}
+
+// newPushHandler builds the POST /pubsub/push handler Pub/Sub calls for
+// each "media-analysis-events" message (EVENT_BUS_BACKEND=pubsub). A 200
+// response acks the message; any other status tells Pub/Sub to retry per
+// the subscription's backoff policy (infra/modules/pubsub).
+func newPushHandler(worker *imageanalysis.Worker) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		msg, err := pubsub.DecodePush(r.Body)
+		if err != nil {
+			log.Printf("image-analysis-worker: %v", err)
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+
+		var payload contract.MediaUploadedEventPayload
+		if err := json.Unmarshal(msg.Message.Data, &payload); err != nil {
+			// Poison message -- retrying won't fix malformed JSON, so ack
+			// it (200) rather than let Pub/Sub redeliver it forever.
+			log.Printf("image-analysis-worker: invalid payload for message_id=%s: %v", msg.Message.MessageID, err)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if err := worker.ProcessMediaUploaded(r.Context(), payload); err != nil {
+			log.Printf("image-analysis-worker: process failed for event_id=%s: %v", payload.EventID, err)
+			http.Error(w, "processing failed", http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("image-analysis-worker: processed + acked event_id=%s session_id=%s audience_id=%s",
+			payload.EventID, payload.SessionID, payload.AudienceID)
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+// pollLocalEvents is the EVENT_BUS_BACKEND=local dev path: the original
+// poll loop against db.LocalEventStore, unchanged in behavior.
+func pollLocalEvents(ctx context.Context, events *db.LocalEventStore, worker *imageanalysis.Worker) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 

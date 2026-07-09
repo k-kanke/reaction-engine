@@ -75,3 +75,26 @@ variable "gmail_sender_image_tag" {
   type        = string
   description = "Short git commit hash of the gmail-sender image to deploy, e.g. output of `git rev-parse --short HEAD`. No default -- pass explicitly on every apply (-var or TF_VAR_gmail_sender_image_tag) so a deploy always traces back to one commit."
 }
+
+variable "gmail_sender_from" {
+  type        = string
+  description = "Gmail address that owns the OAuth refresh token below (gmail_oauth_refresh_token) -- the account gmail-sender sends report emails as. Set in terraform.tfvars, e.g. \"you@gmail.com\"."
+}
+
+variable "gmail_oauth_client_id" {
+  type        = string
+  sensitive   = true
+  description = "OAuth client ID for the Desktop app credential used by cmd/gmail-oauth-setup to mint gmail_oauth_refresh_token below (see cmd/gmail-sender/README.md). No default -- set in terraform.tfvars (not committed) or pass via TF_VAR_gmail_oauth_client_id."
+}
+
+variable "gmail_oauth_client_secret" {
+  type        = string
+  sensitive   = true
+  description = "OAuth client secret paired with gmail_oauth_client_id. No default -- set in terraform.tfvars (not committed) or pass via TF_VAR_gmail_oauth_client_secret."
+}
+
+variable "gmail_oauth_refresh_token" {
+  type        = string
+  sensitive   = true
+  description = "Refresh token minted by cmd/gmail-oauth-setup, authorizing gmail-sender to send as gmail_sender_from via the Gmail API. Testing-status OAuth consent screens expire this after 7 days -- re-run cmd/gmail-oauth-setup and re-apply when gmail-sender starts failing with invalid_grant. No default -- set in terraform.tfvars (not committed) or pass via TF_VAR_gmail_oauth_refresh_token."
+}

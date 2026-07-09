@@ -5,6 +5,17 @@ jsonl_bucket_name            = "your-gcp-project-id-reaction-engine-jsonl"
 terraform_state_bucket_name  = "your-gcp-project-id-tfstate"
 media_api_invoker_members    = ["user:you@example.com"]
 
+# gmail-sender (GMAIL_SEND_BACKEND=real): gmail_sender_from is the Gmail
+# account that owns the refresh token; the other three come from a GCP
+# Console OAuth client (Desktop app type) + running
+# `go run ./cmd/gmail-oauth-setup --client-id=... --client-secret=...`
+# once (see backend/cmd/gmail-sender/README.md). Never commit real values
+# here -- terraform.tfvars is gitignored precisely so these can live in it.
+# gmail_sender_from         = "you@gmail.com"
+# gmail_oauth_client_id     = "xxxxx.apps.googleusercontent.com"
+# gmail_oauth_client_secret = "xxxxx"
+# gmail_oauth_refresh_token = "xxxxx"
+
 # media_api_image_tag, gateway_image_tag, writer_image_tag,
 # image_analysis_worker_image_tag, post_session_job_image_tag,
 # pdf_renderer_image_tag and gmail_sender_image_tag aren't set here -- they
