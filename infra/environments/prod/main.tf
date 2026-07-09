@@ -487,6 +487,38 @@ module "gmail_sender_service_account" {
   project_roles = ["roles/cloudsql.client"]
 }
 
+# gmail-sender's OAuth2 credentials (GMAIL_SEND_BACKEND=real): a personal
+# Gmail account has no domain-wide delegation to grant a service account,
+# so gmail-sender authenticates as gmail_sender_from via a refresh token
+# minted once by cmd/gmail-oauth-setup instead (see
+# cmd/gmail-sender/README.md).
+module "gmail_oauth_client_id_secret" {
+  source = "../../modules/secret-manager"
+
+  project_id       = var.project_id
+  secret_id        = "gmail-oauth-client-id"
+  secret_value     = var.gmail_oauth_client_id
+  accessor_members = [module.gmail_sender_service_account.member]
+}
+
+module "gmail_oauth_client_secret_secret" {
+  source = "../../modules/secret-manager"
+
+  project_id       = var.project_id
+  secret_id        = "gmail-oauth-client-secret"
+  secret_value     = var.gmail_oauth_client_secret
+  accessor_members = [module.gmail_sender_service_account.member]
+}
+
+module "gmail_oauth_refresh_token_secret" {
+  source = "../../modules/secret-manager"
+
+  project_id       = var.project_id
+  secret_id        = "gmail-oauth-refresh-token"
+  secret_value     = var.gmail_oauth_refresh_token
+  accessor_members = [module.gmail_sender_service_account.member]
+}
+
 module "gmail_sender_job" {
   source = "../../modules/cloud-run-job"
 
@@ -499,7 +531,15 @@ module "gmail_sender_job" {
   cloudsql_connection_names = [module.db.connection_name]
 
   env_vars = {
-    DATABASE_URL = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+    DATABASE_URL       = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+    GMAIL_SEND_BACKEND = "real"
+    GMAIL_SENDER_FROM  = var.gmail_sender_from
+  }
+
+  secret_env_vars = {
+    GMAIL_OAUTH_CLIENT_ID     = { secret_id = module.gmail_oauth_client_id_secret.secret_id }
+    GMAIL_OAUTH_CLIENT_SECRET = { secret_id = module.gmail_oauth_client_secret_secret.secret_id }
+    GMAIL_OAUTH_REFRESH_TOKEN = { secret_id = module.gmail_oauth_refresh_token_secret.secret_id }
   }
 
   invoker_members = [module.gateway_service_account.member]
