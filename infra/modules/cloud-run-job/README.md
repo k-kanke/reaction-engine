@@ -32,6 +32,13 @@ Notable choices baked in, mirroring `modules/cloud-run-service`:
   set `invoker_members` to the callers that should be able to trigger an
   execution (e.g. `module.gateway_service_account.member` once Step 5 wires
   up session-end-triggered execution).
+- **Secrets are opt-in and separate from `env_vars`.** `secret_env_vars`
+  mounts a Secret Manager secret's latest (or pinned) version as an env var
+  via `value_source.secret_key_ref`, for values a running container needs
+  but shouldn't be readable from the Cloud Run resource's own definition
+  (e.g. an OAuth refresh token) -- pair with `modules/secret-manager`.
+  `service_account_email` still needs `roles/secretmanager.secretAccessor`
+  on each referenced secret.
 
 ## Usage
 

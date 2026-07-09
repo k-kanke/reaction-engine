@@ -35,6 +35,15 @@ variable "env_vars" {
   description = "Plain (non-secret) environment variables, e.g. { JSONL_STORE_BACKEND = \"gcs\", GCS_JSONL_BUCKET = \"...\" }."
 }
 
+variable "secret_env_vars" {
+  type = map(object({
+    secret_id = string
+    version   = optional(string, "latest")
+  }))
+  default     = {}
+  description = "Environment variables sourced from Secret Manager instead of a plain value, e.g. { GMAIL_OAUTH_REFRESH_TOKEN = { secret_id = module.gmail_oauth_refresh_token.secret_id } }. The runtime service account (service_account_email) must separately have roles/secretmanager.secretAccessor on each referenced secret (see modules/secret-manager's accessor_members)."
+}
+
 variable "cloudsql_connection_names" {
   type        = list(string)
   default     = []
