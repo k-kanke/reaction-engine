@@ -280,7 +280,7 @@ func (h *Handler) handleSessionEnd(raw json.RawMessage) {
 	}
 
 	log.Printf("gateway: session_end received session_id=%s, starting post-session pipeline", msg.SessionID)
-	go h.postSessionTrigger.TriggerSessionEnd(context.Background(), msg.SessionID)
+	go h.postSessionTrigger.TriggerSessionEnd(context.Background(), msg.SessionID, msg.ReportRecipient)
 }
 
 // enqueueTriggerAndFeedback publishes the trigger_event/feedback_event for

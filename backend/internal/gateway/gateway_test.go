@@ -45,18 +45,20 @@ func TestBuildFakeTranscriptChunk(t *testing.T) {
 // fakeTrigger records TriggerSessionEnd calls for assertions instead of
 // hitting the real Cloud Run Admin API.
 type fakeTrigger struct {
-	mu         sync.Mutex
-	sessionIDs []string
-	called     chan struct{}
+	mu               sync.Mutex
+	sessionIDs       []string
+	reportRecipients []string
+	called           chan struct{}
 }
 
 func newFakeTrigger() *fakeTrigger {
 	return &fakeTrigger{called: make(chan struct{}, 1)}
 }
 
-func (f *fakeTrigger) TriggerSessionEnd(ctx context.Context, sessionID string) {
+func (f *fakeTrigger) TriggerSessionEnd(ctx context.Context, sessionID, reportRecipient string) {
 	f.mu.Lock()
 	f.sessionIDs = append(f.sessionIDs, sessionID)
+	f.reportRecipients = append(f.reportRecipients, reportRecipient)
 	f.mu.Unlock()
 	f.called <- struct{}{}
 }
@@ -82,6 +84,33 @@ func TestHandleSessionEndStartsTrigger(t *testing.T) {
 	defer trigger.mu.Unlock()
 	if len(trigger.sessionIDs) != 1 || trigger.sessionIDs[0] != "sess_end_1" {
 		t.Errorf("sessionIDs = %v, want [sess_end_1]", trigger.sessionIDs)
+	}
+	if len(trigger.reportRecipients) != 1 || trigger.reportRecipients[0] != "" {
+		t.Errorf("reportRecipients = %v, want [\"\"] (no `to` field in the message)", trigger.reportRecipients)
+	}
+}
+
+func TestHandleSessionEndPassesReportRecipient(t *testing.T) {
+	trigger := newFakeTrigger()
+	h := NewHandlerWithPostSessionTrigger(nil, nil, nil, nil, "", trigger)
+
+	raw, err := json.Marshal(contract.SessionEndMessage{Type: "session_end", SessionID: "sess_end_3", ReportRecipient: "you@example.com"})
+	if err != nil {
+		t.Fatalf("marshal session_end message: %v", err)
+	}
+
+	h.handleSessionEnd(raw)
+
+	select {
+	case <-trigger.called:
+	case <-time.After(time.Second):
+		t.Fatal("TriggerSessionEnd was not called within 1s")
+	}
+
+	trigger.mu.Lock()
+	defer trigger.mu.Unlock()
+	if len(trigger.reportRecipients) != 1 || trigger.reportRecipients[0] != "you@example.com" {
+		t.Errorf("reportRecipients = %v, want [you@example.com]", trigger.reportRecipients)
 	}
 }
 
