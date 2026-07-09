@@ -20,20 +20,26 @@ import (
 // goroutine with a background context precisely so a slow pipeline can't
 // stall the WebSocket read loop or outlive the connection).
 type Trigger interface {
-	TriggerSessionEnd(ctx context.Context, sessionID string)
+	// TriggerSessionEnd runs post-session-job then pdf-renderer, and --
+	// only when reportRecipient is non-empty -- gmail-sender to email the
+	// resulting PDF. reportRecipient comes from
+	// contract.SessionEndMessage.ReportRecipient (extension/src/
+	// sidebar.html's "Report Email" field); an empty value means the user
+	// left it blank, so gmail-sender is skipped rather than sent to "".
+	TriggerSessionEnd(ctx context.Context, sessionID, reportRecipient string)
 }
 
 // CloudRunTrigger runs post-session-job then pdf-renderer as Cloud Run Job
 // executions, waiting for each to finish before starting the next --
 // pdf-renderer reads back the `reports` row post-session-job just wrote, so
 // it would find nothing (or a stale report) if the two ran concurrently.
-// gmail-sender isn't chained here: it also requires a recipient email,
-// which Step 8 wires up from the extension. Until then it's triggered
-// manually (`gcloud run jobs execute r-gmail-sender --args=...`).
+// gmail-sender runs last, only given a reportRecipient, since unlike the
+// other two it's optional per session rather than always required.
 type CloudRunTrigger struct {
 	client             *run.JobsClient
 	postSessionJobName string
 	pdfRendererJobName string
+	gmailSenderJobName string
 }
 
 // NewCloudRunTrigger dials the Cloud Run Admin API using Application
@@ -49,10 +55,11 @@ func NewCloudRunTrigger(ctx context.Context, projectID, region string) (*CloudRu
 		client:             client,
 		postSessionJobName: fmt.Sprintf("projects/%s/locations/%s/jobs/r-post-session-job", projectID, region),
 		pdfRendererJobName: fmt.Sprintf("projects/%s/locations/%s/jobs/r-pdf-renderer", projectID, region),
+		gmailSenderJobName: fmt.Sprintf("projects/%s/locations/%s/jobs/r-gmail-sender", projectID, region),
 	}, nil
 }
 
-func (t *CloudRunTrigger) TriggerSessionEnd(ctx context.Context, sessionID string) {
+func (t *CloudRunTrigger) TriggerSessionEnd(ctx context.Context, sessionID, reportRecipient string) {
 	if err := t.runJob(ctx, t.postSessionJobName, "--session-id="+sessionID); err != nil {
 		log.Printf("postsessiontrigger: post-session-job failed for session_id=%s: %v", sessionID, err)
 		return
@@ -61,7 +68,16 @@ func (t *CloudRunTrigger) TriggerSessionEnd(ctx context.Context, sessionID strin
 		log.Printf("postsessiontrigger: pdf-renderer failed for session_id=%s: %v", sessionID, err)
 		return
 	}
-	log.Printf("postsessiontrigger: post-session pipeline complete for session_id=%s", sessionID)
+
+	if reportRecipient == "" {
+		log.Printf("postsessiontrigger: post-session pipeline complete for session_id=%s (no report_recipient, skipping gmail-sender)", sessionID)
+		return
+	}
+	if err := t.runJob(ctx, t.gmailSenderJobName, "--session-id="+sessionID, "--to="+reportRecipient); err != nil {
+		log.Printf("postsessiontrigger: gmail-sender failed for session_id=%s: %v", sessionID, err)
+		return
+	}
+	log.Printf("postsessiontrigger: post-session pipeline complete for session_id=%s (report emailed)", sessionID)
 }
 
 // runJob starts one execution with args overriding the job's default

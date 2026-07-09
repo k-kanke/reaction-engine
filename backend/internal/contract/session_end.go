@@ -9,4 +9,10 @@ package contract
 type SessionEndMessage struct {
 	Type      string `json:"type"`
 	SessionID string `json:"session_id"`
+	// ReportRecipient is the address the post-session pipeline should
+	// email the report PDF to (extension/src/sidebar.html's "Report
+	// Email" field). Optional -- when empty, postsessiontrigger.Trigger
+	// runs post-session-job/pdf-renderer but skips the gmail-sender step
+	// entirely rather than sending to a blank address.
+	ReportRecipient string `json:"to,omitempty"`
 }
