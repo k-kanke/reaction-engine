@@ -16,6 +16,18 @@ on:
       - .github/workflows/deploy-media-api.yml
   workflow_dispatch:
 
+# Shared across all four deploy-*.yml workflows (same group name) since
+# they all run `terraform apply` against the one prod state -- without
+# this, a push touching multiple services' paths (e.g. infra/**) fires all
+# four concurrently, and each one's several `terraform state show`/`show`
+# reads of that same GCS-backed state in close succession has been
+# observed to intermittently 503. cancel-in-progress stays false: cancelling
+# a queued run is fine, but cancelling one mid-`terraform apply` risks a
+# stuck state lock or a half-applied deploy.
+concurrency:
+  group: prod-terraform-state
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write
@@ -65,95 +77,38 @@ jobs:
         working-directory: infra/environments/prod
         run: terraform init -input=false
 
-      - name: Read current gateway image tag
-        id: gateway
+      - name: Read current image tags
         working-directory: infra/environments/prod
+        # A single `terraform show` fetches the whole remote state once;
+        # each of the 6 image tags this workflow needs (every service
+        # except the one it deploys) is then extracted from that one local
+        # copy instead of a separate `terraform state show <resource>` per
+        # tag -- 6 separate calls each re-fetching the full state from GCS
+        # in quick succession was intermittently hitting a transient GCS
+        # 503 ("upstream connect error ... reset reason: overflow").
         run: |
-          tag="$(
-            terraform state show module.gateway_service.google_cloud_run_v2_service.this \
-              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/gateway:([^"]+)".*/\1/p' \
-              | head -n 1
-          )"
-          if [ -z "$tag" ]; then
-            echo "Failed to read current gateway image tag from Terraform state" >&2
-            exit 1
-          fi
-          echo "GATEWAY_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+          state="$(terraform show -no-color)"
 
-      - name: Read current writer image tag
-        id: writer
-        working-directory: infra/environments/prod
-        run: |
-          tag="$(
-            terraform state show module.writer_service.google_cloud_run_v2_service.this \
-              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/writer:([^"]+)".*/\1/p' \
-              | head -n 1
-          )"
-          if [ -z "$tag" ]; then
-            echo "Failed to read current writer image tag from Terraform state" >&2
-            exit 1
-          fi
-          echo "WRITER_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+          extract_tag() {
+            printf '%s\n' "$state" | sed -nE "s/.*image[[:space:]]*=[[:space:]]*\"[^\"]*\/$1:([^\"]+)\".*/\1/p" | head -n 1
+          }
 
-      - name: Read current image-analysis-worker image tag
-        id: image-analysis-worker
-        working-directory: infra/environments/prod
-        run: |
-          tag="$(
-            terraform state show module.image_analysis_worker_service.google_cloud_run_v2_service.this \
-              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/image-analysis-worker:([^"]+)".*/\1/p' \
-              | head -n 1
-          )"
-          if [ -z "$tag" ]; then
-            echo "Failed to read current image-analysis-worker image tag from Terraform state" >&2
-            exit 1
-          fi
-          echo "IMAGE_ANALYSIS_WORKER_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+          declare -A tags=(
+            [GATEWAY_IMAGE_TAG]="$(extract_tag gateway)"
+            [WRITER_IMAGE_TAG]="$(extract_tag writer)"
+            [IMAGE_ANALYSIS_WORKER_IMAGE_TAG]="$(extract_tag image-analysis-worker)"
+            [POST_SESSION_JOB_IMAGE_TAG]="$(extract_tag post-session-job)"
+            [PDF_RENDERER_IMAGE_TAG]="$(extract_tag pdf-renderer)"
+            [GMAIL_SENDER_IMAGE_TAG]="$(extract_tag gmail-sender)"
+          )
 
-      - name: Read current post-session-job image tag
-        id: post-session-job
-        working-directory: infra/environments/prod
-        run: |
-          tag="$(
-            terraform state show module.post_session_job.google_cloud_run_v2_job.this \
-              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/post-session-job:([^"]+)".*/\1/p' \
-              | head -n 1
-          )"
-          if [ -z "$tag" ]; then
-            echo "Failed to read current post-session-job image tag from Terraform state" >&2
-            exit 1
-          fi
-          echo "POST_SESSION_JOB_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
-
-      - name: Read current pdf-renderer image tag
-        id: pdf-renderer
-        working-directory: infra/environments/prod
-        run: |
-          tag="$(
-            terraform state show module.pdf_renderer_job.google_cloud_run_v2_job.this \
-              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/pdf-renderer:([^"]+)".*/\1/p' \
-              | head -n 1
-          )"
-          if [ -z "$tag" ]; then
-            echo "Failed to read current pdf-renderer image tag from Terraform state" >&2
-            exit 1
-          fi
-          echo "PDF_RENDERER_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
-
-      - name: Read current gmail-sender image tag
-        id: gmail-sender
-        working-directory: infra/environments/prod
-        run: |
-          tag="$(
-            terraform state show module.gmail_sender_job.google_cloud_run_v2_job.this \
-              | sed -nE 's/.*image[[:space:]]*=[[:space:]]*"[^"]*\/gmail-sender:([^"]+)".*/\1/p' \
-              | head -n 1
-          )"
-          if [ -z "$tag" ]; then
-            echo "Failed to read current gmail-sender image tag from Terraform state" >&2
-            exit 1
-          fi
-          echo "GMAIL_SENDER_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+          for name in "${!tags[@]}"; do
+            if [ -z "${tags[$name]}" ]; then
+              echo "Failed to read current $name from Terraform state" >&2
+              exit 1
+            fi
+            echo "$name=${tags[$name]}" >> "$GITHUB_ENV"
+          done
 
       - name: Build and push media-api image
         run: |
