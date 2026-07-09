@@ -10,6 +10,52 @@ data "google_project" "current" {
   project_id = var.project_id
 }
 
+# reaction-engine-github-deploy is the Workload Identity Federation service
+# account .github/workflows/deploy-*.yml authenticates as to run `terraform
+# apply` on every CD run (see google-github-actions/auth in those
+# workflows). The account itself and its roles were originally set up by
+# hand (gcloud) outside Terraform, which is why adding Pub/Sub
+# (modules/pubsub) and Secret Manager (modules/secret-manager) to this
+# config didn't come with the IAM this SA needed to manage them --
+# `terraform apply` failed on both with IAM_PERMISSION_DENIED the first CD
+# run after they were added. Bringing the full role set under Terraform
+# here (rather than just adding the two missing roles by hand again) means
+# the next resource type added to this config surfaces the same gap at
+# `terraform plan` time, not as a CD failure.
+locals {
+  github_deploy_service_account_email = "reaction-engine-github-deploy@${var.project_id}.iam.gserviceaccount.com"
+
+  # Matches what `gcloud projects get-iam-policy` showed as already bound
+  # before this block existed (verified against the live project so this
+  # first apply is a no-op for those roles, not a permissions change) plus
+  # roles/pubsub.admin and roles/secretmanager.admin, newly required.
+  github_deploy_roles = [
+    "roles/aiplatform.user",
+    "roles/artifactregistry.admin",
+    "roles/artifactregistry.writer",
+    "roles/cloudbuild.builds.editor",
+    "roles/cloudsql.admin",
+    "roles/compute.networkAdmin",
+    "roles/iam.serviceAccountAdmin",
+    "roles/iam.serviceAccountUser",
+    "roles/pubsub.admin",
+    "roles/redis.admin",
+    "roles/resourcemanager.projectIamAdmin",
+    "roles/run.admin",
+    "roles/secretmanager.admin",
+    "roles/storage.admin",
+    "roles/vpcaccess.admin",
+  ]
+}
+
+resource "google_project_iam_member" "github_deploy" {
+  for_each = toset(local.github_deploy_roles)
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${local.github_deploy_service_account_email}"
+}
+
 module "media_service_account" {
   source = "../../modules/service-account"
 
