@@ -34,11 +34,15 @@ var DebugLogEvidencePack = false
 // gateway used to gate the *next* trigger is visible to the client too.
 const feedbackCooldownMs = 30000
 
-// realtimeLLMTimeout mirrors REALTIME_LLM_TIMEOUT_MS in
-// backend/.env.example — the same budget internal/gateway used to enforce
-// before Step 4/5 of plan/mood-wave-contract-migration.md moved decision
-// logic here.
-const realtimeLLMTimeout = 1500 * time.Millisecond
+// realtimeLLMTimeout bounds how long HandleTriggerWithGenerator waits for
+// the LLM before falling back to ruleFallback. Raised from the original
+// 1500ms (mirroring REALTIME_LLM_TIMEOUT_MS in backend/.env.example / the
+// budget internal/gateway enforced before Step 4/5 of
+// plan/mood-wave-contract-migration.md moved decision logic here) to 10s
+// on 2026-07-09: in production, gemini-2.5-flash's generateContent
+// routinely took longer than 1500ms, so nearly every trigger fell back to
+// the rule-based feedback instead of the LLM one.
+const realtimeLLMTimeout = 10 * time.Second
 
 const (
 	llmStubModelVersion = "llm-stub-v1"
