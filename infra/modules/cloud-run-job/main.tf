@@ -70,6 +70,30 @@ resource "google_cloud_run_v2_job_iam_member" "invoker" {
   project  = var.project_id
   location = google_cloud_run_v2_job.this.location
   name     = google_cloud_run_v2_job.this.name
-  role     = "roles/run.invoker"
+  # Not roles/run.invoker: every real caller of a Cloud Run Job in this
+  # codebase runs it via RunJobRequest.Overrides (--session-id, --to --
+  # see the `args` variable's doc comment), which needs the
+  # run.jobs.runWithOverrides permission. run.invoker only grants
+  # run.jobs.run (no-overrides), so postsessiontrigger.CloudRunTrigger's
+  # calls were failing with PermissionDenied on run.jobs.runWithOverrides
+  # until this was roles/run.jobsExecutorWithOverrides instead.
+  role   = "roles/run.jobsExecutorWithOverrides"
+  member = each.value
+}
+
+# CloudRunTrigger.runJob (backend/internal/postsessiontrigger) blocks on
+# RunJob's long-running operation via op.Wait(ctx), which polls
+# run.operations.get -- not covered by run.jobsExecutorWithOverrides
+# either. roles/run.viewer is the smallest predefined role that has it
+# (plus the harmless run.operations.list/run.*.get-style read permissions
+# viewing this job's own executions needs), so it's granted alongside
+# rather than widening to roles/run.developer just for one permission.
+resource "google_cloud_run_v2_job_iam_member" "operations_viewer" {
+  for_each = toset(var.invoker_members)
+
+  project  = var.project_id
+  location = google_cloud_run_v2_job.this.location
+  name     = google_cloud_run_v2_job.this.name
+  role     = "roles/run.viewer"
   member   = each.value
 }
