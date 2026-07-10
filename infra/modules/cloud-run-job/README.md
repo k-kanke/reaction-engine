@@ -4,8 +4,8 @@ Terraform module for a single Cloud Run v2 Job, generic enough to reuse for
 `r-post-session-job`, `r-pdf-renderer`, and `r-gmail-sender`
 (plan/post-session-report-implementation.md Step 4).
 
-Wraps `google_cloud_run_v2_job` plus its `roles/run.invoker` IAM binding.
-Notable choices baked in, mirroring `modules/cloud-run-service`:
+Wraps `google_cloud_run_v2_job` plus its `roles/run.jobsExecutorWithOverrides`
+IAM binding. Notable choices baked in, mirroring `modules/cloud-run-service`:
 
 - **Cloud SQL without a VPC connector.** Pass `cloudsql_connection_names`
   (from `module.db.connection_name`) and the module attaches Cloud Run's
@@ -28,10 +28,15 @@ Notable choices baked in, mirroring `modules/cloud-run-service`:
   have side effects (report insert, PDF write, delivery insert) without
   dedup logic, so a failed execution should surface as failed rather than
   silently re-run and risk double-processing.
-- **Invoker access is explicit.** Default is nobody can call `jobs.run`;
-  set `invoker_members` to the callers that should be able to trigger an
-  execution (e.g. `module.gateway_service_account.member` once Step 5 wires
-  up session-end-triggered execution).
+- **Invoker access is explicit, and granted with overrides in mind.**
+  Default is nobody can call `jobs.run`; set `invoker_members` to the
+  callers that should be able to trigger an execution (e.g.
+  `module.gateway_service_account.member`). This grants
+  `roles/run.jobsExecutorWithOverrides`, not the more commonly-cited
+  `roles/run.invoker` -- every caller of a job this module creates invokes
+  it via `RunJobRequest.Overrides` (see the `args` variable below), which
+  needs the `run.jobs.runWithOverrides` permission that plain
+  `run.invoker` doesn't include.
 - **Secrets are opt-in and separate from `env_vars`.** `secret_env_vars`
   mounts a Secret Manager secret's latest (or pinned) version as an env var
   via `value_source.secret_key_ref`, for values a running container needs

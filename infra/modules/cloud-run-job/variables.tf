@@ -83,5 +83,5 @@ variable "deletion_protection" {
 variable "invoker_members" {
   type        = list(string)
   default     = []
-  description = "IAM members (e.g. \"serviceAccount:caller@project.iam.gserviceaccount.com\") granted roles/run.invoker on this job, i.e. allowed to call jobs.run. Needed for gateway's service account once Step 5 wires up session_end-triggered execution."
+  description = "IAM members (e.g. \"serviceAccount:caller@project.iam.gserviceaccount.com\") granted roles/run.jobsExecutorWithOverrides on this job -- run.jobs.run plus run.jobs.runWithOverrides, since every caller (e.g. gateway's postsessiontrigger.CloudRunTrigger on session_end) invokes with RunJobRequest.Overrides (--session-id etc.), not a plain run.jobs.run."
 }
