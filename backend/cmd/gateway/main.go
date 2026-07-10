@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
 	"github.com/k-kanke/reaction-engine/backend/internal/gateway"
@@ -102,6 +103,15 @@ func main() {
 	}
 
 	handler := gateway.NewHandlerWithPostSessionTrigger(redisClient, events, generator, recognizer, sttLanguageCode, postSessionTrigger)
+
+	if interval := os.Getenv("PERIODIC_FEEDBACK_INTERVAL"); interval != "" {
+		d, err := time.ParseDuration(interval)
+		if err != nil {
+			log.Fatalf("gateway: invalid PERIODIC_FEEDBACK_INTERVAL %q: %v", interval, err)
+		}
+		handler.SetPeriodicFeedbackInterval(d)
+		log.Printf("gateway: periodic feedback interval set to %v", d)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

@@ -357,6 +357,58 @@ func (c *Client) GetRecentTrigger(ctx context.Context, sessionID string) (contra
 	return trigger, true, nil
 }
 
+// feedbackRecentKey stores the last N feedback_events for a session so the
+// Realtime Worker can include recent feedback history in the LLM evidence
+// pack, letting the model avoid repeating the same advice.
+func feedbackRecentKey(sessionID string) string {
+	return fmt.Sprintf("feedback:recent:%s", sessionID)
+}
+
+// feedbackRecentMaxCount is how many feedback events to keep in the recent
+// ZSET. We keep more than the 3 the LLM reads so a trim race never drops
+// entries the next trigger needs.
+const feedbackRecentMaxCount = 10
+
+// StoreRecentFeedback appends one feedback_event to the session's recent
+// feedback ZSET (scored by t_ms), trims to feedbackRecentMaxCount, and
+// refreshes the key TTL.
+func (c *Client) StoreRecentFeedback(ctx context.Context, feedback contract.FeedbackEvent) error {
+	payload, err := json.Marshal(feedback)
+	if err != nil {
+		return err
+	}
+
+	key := feedbackRecentKey(feedback.SessionID)
+
+	pipe := c.rdb.Pipeline()
+	pipe.ZAdd(ctx, key, redis.Z{Score: float64(feedback.TMs), Member: payload})
+	// Keep only the most recent feedbackRecentMaxCount entries.
+	pipe.ZRemRangeByRank(ctx, key, 0, int64(-feedbackRecentMaxCount-1))
+	pipe.Expire(ctx, key, keyTTL)
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+// GetRecentFeedbackEvents returns the last `count` feedback_events for
+// sessionID, newest first. Used by the Realtime Worker to include recent
+// feedback history in the LLM evidence pack.
+func (c *Client) GetRecentFeedbackEvents(ctx context.Context, sessionID string, count int) ([]contract.FeedbackEvent, error) {
+	vals, err := c.rdb.ZRevRange(ctx, feedbackRecentKey(sessionID), 0, int64(count-1)).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	events := make([]contract.FeedbackEvent, 0, len(vals))
+	for _, v := range vals {
+		var fb contract.FeedbackEvent
+		if err := json.Unmarshal([]byte(v), &fb); err != nil {
+			return nil, err
+		}
+		events = append(events, fb)
+	}
+	return events, nil
+}
+
 // feedbackCooldownKey is architecture.md's "feedback:cooldown:{session_id}":
 // its mere presence (not its value) means the session is still within the
 // cooldown window from the last feedback_event, per the "9. ... cooldown /

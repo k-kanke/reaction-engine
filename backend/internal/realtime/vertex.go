@@ -153,9 +153,19 @@ func (g *VertexFeedbackGenerator) buildGenerateContentRequest(pack EvidencePack)
 		return nil, fmt.Errorf("vertex: marshal evidence pack: %w", err)
 	}
 
+	systemPrompt := "You are Reaction Engine's realtime presentation feedback model. Return only compact JSON with keys feedback_type, severity, message, reason_codes, evidence_quote, confidence. Do not overstate causality; phrase reactions as possibilities. Ground the message in transcript_window when it is non-empty: name the specific topic/phrase being discussed around the reaction change, and suggest one concrete next action (e.g. revisit that point, ask a question, slow down). If transcript_window is empty, describe only the mood trend generically. Use Japanese for message, written as natural spoken advice to the presenter (2 sentences max)."
+
+	if len(pack.RecentFeedback) > 0 {
+		systemPrompt += " IMPORTANT: recent_feedback contains your previous advice for this session. Do NOT repeat the same message or advice. Build on prior feedback — offer a new angle, acknowledge improvement, or escalate if the issue persists."
+	}
+
+	if pack.Purpose == "periodic_feedback" {
+		systemPrompt += " This is a periodic check (not triggered by a specific reaction change). Summarize the overall trend and give general advice. If everything looks stable, say so briefly with an encouraging tone."
+	}
+
 	parts := []map[string]any{
 		{
-			"text": "You are Reaction Engine's realtime presentation feedback model. Return only compact JSON with keys feedback_type, severity, message, reason_codes, evidence_quote, confidence. Do not overstate causality; phrase reactions as possibilities. Ground the message in transcript_window when it is non-empty: name the specific topic/phrase being discussed around the reaction change, and suggest one concrete next action (e.g. revisit that point, ask a question, slow down). If transcript_window is empty, describe only the mood trend generically. Use Japanese for message, written as natural spoken advice to the presenter (2 sentences max).",
+			"text": systemPrompt,
 		},
 		{
 			"text": "Realtime evidence pack:\n" + string(packJSON),

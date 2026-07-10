@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -68,13 +69,18 @@ type sttSession struct {
 	startedAt time.Time
 }
 
+// DefaultPeriodicFeedbackInterval is the default interval for periodic LLM
+// feedback checks (7 minutes). Configurable via PERIODIC_FEEDBACK_INTERVAL.
+const DefaultPeriodicFeedbackInterval = 7 * time.Minute
+
 type Handler struct {
-	redis              *gwredis.Client
-	events             EventPublisher
-	llm                realtime.FeedbackGenerator
-	stt                speech.Recognizer
-	sttLanguageCode    string
-	postSessionTrigger postsessiontrigger.Trigger
+	redis                    *gwredis.Client
+	events                   EventPublisher
+	llm                      realtime.FeedbackGenerator
+	stt                      speech.Recognizer
+	sttLanguageCode          string
+	postSessionTrigger       postsessiontrigger.Trigger
+	periodicFeedbackInterval time.Duration
 }
 
 func NewHandler(redis *gwredis.Client, events EventPublisher, llmEnabled bool) *Handler {
@@ -105,7 +111,13 @@ func NewHandlerWithSTT(redis *gwredis.Client, events EventPublisher, generator r
 // session_end a no-op besides logging -- used by tests and local runs
 // without a deployed r-post-session-job/r-pdf-renderer to call.
 func NewHandlerWithPostSessionTrigger(redis *gwredis.Client, events EventPublisher, generator realtime.FeedbackGenerator, recognizer speech.Recognizer, sttLanguageCode string, trigger postsessiontrigger.Trigger) *Handler {
-	return &Handler{redis: redis, events: events, llm: generator, stt: recognizer, sttLanguageCode: sttLanguageCode, postSessionTrigger: trigger}
+	return &Handler{redis: redis, events: events, llm: generator, stt: recognizer, sttLanguageCode: sttLanguageCode, postSessionTrigger: trigger, periodicFeedbackInterval: DefaultPeriodicFeedbackInterval}
+}
+
+// SetPeriodicFeedbackInterval overrides the default periodic feedback
+// interval. Zero disables periodic feedback.
+func (h *Handler) SetPeriodicFeedbackInterval(d time.Duration) {
+	h.periodicFeedbackInterval = d
 }
 
 // ServeWS handles GET /ws: it accepts the WebSocket connection, dispatches
@@ -143,6 +155,13 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// Periodic feedback: once the first mood_wave_sample arrives and we
+	// know the session_id, start a ticker goroutine that periodically
+	// generates LLM feedback even without a trigger event.
+	var periodicOnce sync.Once
+	periodicStop := make(chan struct{})
+	defer close(periodicStop)
+
 	for {
 		var raw json.RawMessage
 		if err := wsjson.Read(ctx, conn, &raw); err != nil {
@@ -162,7 +181,7 @@ func (h *Handler) ServeWS(w http.ResponseWriter, r *http.Request) {
 
 		switch envelope.Type {
 		case "mood_wave_sample":
-			h.handleMoodWaveSample(ctx, conn, raw)
+			h.handleMoodWaveSample(ctx, conn, raw, &periodicOnce, periodicStop)
 		case "audio_chunk":
 			h.handleAudioChunk(ctx, raw, audioAccumulators, sttSessions)
 		case "session_end":
@@ -208,11 +227,19 @@ func isAllowedWebSocketOrigin(r *http.Request) bool {
 // trigger_event/feedback_event are written back to Chrome over this
 // connection and separately enqueued for Durable Writer (Step 6) to
 // persist to trigger_events/feedback_events + JSONL.
-func (h *Handler) handleMoodWaveSample(ctx context.Context, conn *websocket.Conn, raw json.RawMessage) {
+func (h *Handler) handleMoodWaveSample(ctx context.Context, conn *websocket.Conn, raw json.RawMessage, periodicOnce *sync.Once, periodicStop chan struct{}) {
 	var msg contract.MoodWaveSampleMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		h.writeError(ctx, conn, "invalid mood_wave_sample payload")
 		return
+	}
+
+	// Start periodic feedback goroutine on first mood_wave_sample.
+	if h.periodicFeedbackInterval > 0 && h.llm != nil {
+		sessionID := msg.SessionID
+		periodicOnce.Do(func() {
+			go h.runPeriodicFeedback(ctx, conn, sessionID, periodicStop)
+		})
 	}
 
 	eventID := "evt_" + uuid.NewString()
@@ -481,6 +508,58 @@ func buildFakeTranscriptChunk(sessionID, speaker string, tStartMs, tEndMs int64)
 		Text:          fmt.Sprintf("[stub transcript speaker=%s %d-%dms]", speaker, tStartMs, tEndMs),
 		Confidence:    fakeTranscriptConfidence,
 		IsFinal:       true,
+	}
+}
+
+// runPeriodicFeedback runs in its own goroutine for the lifetime of a
+// WebSocket connection. Every periodicFeedbackInterval it calls
+// HandlePeriodicCheck to build an evidence pack from the latest mood_wave
+// data and generate LLM feedback, sending the result back to Chrome.
+func (h *Handler) runPeriodicFeedback(ctx context.Context, conn *websocket.Conn, sessionID string, stop chan struct{}) {
+	ticker := time.NewTicker(h.periodicFeedbackInterval)
+	defer ticker.Stop()
+
+	log.Printf("gateway: periodic feedback started session_id=%s interval=%v", sessionID, h.periodicFeedbackInterval)
+
+	for {
+		select {
+		case <-stop:
+			log.Printf("gateway: periodic feedback stopped session_id=%s", sessionID)
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			feedback, accepted, err := realtime.HandlePeriodicCheck(ctx, h.redis, sessionID, h.llm)
+			if err != nil {
+				log.Printf("gateway: periodic feedback error session_id=%s: %v", sessionID, err)
+				continue
+			}
+			if !accepted {
+				log.Printf("gateway: periodic feedback skipped (cooldown) session_id=%s", sessionID)
+				continue
+			}
+
+			if err := wsjson.Write(ctx, conn, feedback); err != nil {
+				log.Printf("gateway: periodic feedback write failed session_id=%s: %v", sessionID, err)
+				return
+			}
+
+			log.Printf("gateway: periodic feedback sent session_id=%s feedback_type=%s", sessionID, feedback.FeedbackType)
+
+			// Enqueue for durable persistence.
+			feedbackCopy := feedback
+			feedbackCopy.EventID = "evt_fb_periodic_" + uuid.NewString()
+			payload := contract.FeatureEventPayload{
+				EventID:            feedbackCopy.EventID,
+				SessionID:          sessionID,
+				TMs:                feedback.TMs,
+				ServerReceivedAtMs: time.Now().UnixMilli(),
+				FeedbackEvents:     []contract.FeedbackEvent{feedbackCopy},
+			}
+			if err := h.events.Enqueue(ctx, featureEventsTopic, feedbackCopy.EventID, payload); err != nil {
+				log.Printf("gateway: enqueue periodic feedback event failed: %v", err)
+			}
+		}
 	}
 }
 

@@ -50,6 +50,10 @@ const (
 	ruleConfidence      = 0.5
 )
 
+// MaxRecentFeedbackCount is how many past feedback_events to include in the
+// LLM evidence pack so the model avoids repeating the same advice.
+const MaxRecentFeedbackCount = 3
+
 // WaveStore is the Redis boundary this package needs. *internal/redis.Client
 // satisfies it structurally; tests can supply a fake.
 type WaveStore interface {
@@ -58,6 +62,9 @@ type WaveStore interface {
 	ListReadyBaselineMediaRefs(ctx context.Context, sessionID string) ([]string, error)
 	InFeedbackCooldown(ctx context.Context, sessionID string) (bool, error)
 	SetFeedbackCooldown(ctx context.Context, sessionID string, cooldownMs int) error
+	GetRecentFeedbackEvents(ctx context.Context, sessionID string, count int) ([]contract.FeedbackEvent, error)
+	StoreRecentFeedback(ctx context.Context, feedback contract.FeedbackEvent) error
+	GetLatestMoodWaveSample(ctx context.Context, sessionID string) (contract.MoodWaveSampleMessage, bool, error)
 }
 
 // BaselineFrameRef and EvidenceFrameRefOut are architecture.md's
@@ -84,6 +91,7 @@ type EvidencePack struct {
 	TranscriptWindow []contract.TranscriptChunk `json:"transcript_window"`
 	BaselineFrames   []BaselineFrameRef         `json:"baseline_frames"`
 	EvidenceFrames   []EvidenceFrameRefOut      `json:"evidence_frames"`
+	RecentFeedback   []contract.FeedbackEvent   `json:"recent_feedback,omitempty"`
 }
 
 // FeedbackGenerator is the optional realtime LLM boundary. Implementations
@@ -158,6 +166,12 @@ func HandleTriggerWithGenerator(ctx context.Context, store WaveStore, msg contra
 		return feedback, true, fmt.Errorf("set feedback cooldown: %w", cooldownErr)
 	}
 
+	// Store feedback in Redis for recent feedback history (next trigger's
+	// evidence pack will include it so the LLM avoids repeating advice).
+	if storeErr := store.StoreRecentFeedback(ctx, feedback); storeErr != nil {
+		log.Printf("realtime: store recent feedback failed (non-fatal): %v", storeErr)
+	}
+
 	return feedback, true, nil
 }
 
@@ -208,6 +222,12 @@ func buildEvidencePack(ctx context.Context, store WaveStore, sessionID string, m
 		}}
 	}
 
+	recentFeedback, err := store.GetRecentFeedbackEvents(ctx, sessionID, MaxRecentFeedbackCount)
+	if err != nil {
+		log.Printf("realtime: get recent feedback events failed (non-fatal): %v", err)
+		recentFeedback = nil
+	}
+
 	return EvidencePack{
 		Purpose:          "realtime_feedback",
 		SessionID:        sessionID,
@@ -216,6 +236,7 @@ func buildEvidencePack(ctx context.Context, store WaveStore, sessionID string, m
 		TranscriptWindow: transcript,
 		BaselineFrames:   baselineFrames,
 		EvidenceFrames:   evidenceFrames,
+		RecentFeedback:   recentFeedback,
 	}, nil
 }
 
@@ -242,6 +263,113 @@ func logEvidencePackSummary(sessionID string, trigger contract.TriggerInfo, pack
 			log.Printf("realtime: evidence pack json marshal failed session=%s trigger_id=%s err=%v", sessionID, trigger.TriggerID, err)
 		}
 	}
+}
+
+// PeriodicWindowDurationSec is the evidence window length for periodic
+// (non-trigger) feedback. Wider than the realtime 30s because periodic checks
+// cover 5-10 minutes of accumulated mood_wave data.
+const PeriodicWindowDurationSec = 300 // 5 minutes
+
+// HandlePeriodicCheck builds an evidence pack from the latest mood_wave data
+// and generates a periodic feedback event via the LLM. Unlike
+// HandleTriggerWithGenerator, this does not require a trigger — it creates a
+// synthetic one and uses a wider evidence window. Returns accepted=false if
+// the session is in cooldown or no mood data is available.
+func HandlePeriodicCheck(ctx context.Context, store WaveStore, sessionID string, generator FeedbackGenerator) (feedback contract.FeedbackEvent, accepted bool, err error) {
+	inCooldown, err := store.InFeedbackCooldown(ctx, sessionID)
+	if err != nil {
+		return contract.FeedbackEvent{}, false, fmt.Errorf("check feedback cooldown: %w", err)
+	}
+	if inCooldown {
+		return contract.FeedbackEvent{}, false, nil
+	}
+
+	latest, ok, err := store.GetLatestMoodWaveSample(ctx, sessionID)
+	if err != nil {
+		return contract.FeedbackEvent{}, false, fmt.Errorf("get latest mood wave sample: %w", err)
+	}
+	if !ok {
+		return contract.FeedbackEvent{}, false, nil
+	}
+
+	nowTMs := latest.TMs
+	windowStartTMs := nowTMs - int64(PeriodicWindowDurationSec)*1000
+
+	samples, err := store.GetRecentMoodWaveSamples(ctx, sessionID, windowStartTMs)
+	if err != nil {
+		return contract.FeedbackEvent{}, false, fmt.Errorf("get recent mood wave samples: %w", err)
+	}
+	meta, moodWave := BuildWindow(samples, nowTMs, PeriodicWindowDurationSec)
+
+	selfChunks, err := store.GetTranscriptWindow(ctx, sessionID, "self", windowStartTMs)
+	if err != nil {
+		return contract.FeedbackEvent{}, false, fmt.Errorf("get self transcript window: %w", err)
+	}
+	otherChunks, err := store.GetTranscriptWindow(ctx, sessionID, "other", windowStartTMs)
+	if err != nil {
+		return contract.FeedbackEvent{}, false, fmt.Errorf("get other transcript window: %w", err)
+	}
+	transcript := append(selfChunks, otherChunks...)
+	sort.Slice(transcript, func(i, j int) bool { return transcript[i].TStartMs < transcript[j].TStartMs })
+
+	baselineRefs, err := store.ListReadyBaselineMediaRefs(ctx, sessionID)
+	if err != nil {
+		return contract.FeedbackEvent{}, false, fmt.Errorf("list ready baseline media refs: %w", err)
+	}
+	baselineFrames := make([]BaselineFrameRef, 0, len(baselineRefs))
+	for _, ref := range baselineRefs {
+		baselineFrames = append(baselineFrames, BaselineFrameRef{MediaRef: ref})
+	}
+
+	recentFeedback, err := store.GetRecentFeedbackEvents(ctx, sessionID, MaxRecentFeedbackCount)
+	if err != nil {
+		log.Printf("realtime: periodic get recent feedback failed (non-fatal): %v", err)
+		recentFeedback = nil
+	}
+
+	syntheticTrigger := contract.TriggerInfo{
+		TriggerID: "periodic_" + fmt.Sprintf("%d", nowTMs),
+		Type:      "periodic",
+		Source:    "server",
+		PeakTMs:   nowTMs,
+	}
+
+	pack := EvidencePack{
+		Purpose:          "periodic_feedback",
+		SessionID:        sessionID,
+		Window:           meta,
+		MoodWave:         moodWave,
+		TranscriptWindow: transcript,
+		BaselineFrames:   baselineFrames,
+		RecentFeedback:   recentFeedback,
+	}
+
+	log.Printf("realtime: periodic check session=%s mood_wave_points=%d transcript_chunks=%d",
+		sessionID, len(pack.MoodWave.Points), len(pack.TranscriptWindow))
+
+	feedback = ruleFallback(sessionID, nowTMs, syntheticTrigger, pack.MoodWave)
+
+	if generator != nil {
+		llmCtx, cancel := context.WithTimeout(ctx, realtimeLLMTimeout)
+		candidate, llmErr := generator.GenerateFeedback(llmCtx, sessionID, nowTMs, syntheticTrigger, pack)
+		cancel()
+		if llmErr == nil {
+			feedback = candidate
+			log.Printf("realtime: periodic llm feedback used session=%s source=%s", sessionID, feedback.Source)
+		} else {
+			log.Printf("realtime: periodic llm feedback failed, using rule fallback session=%s reason=%v", sessionID, llmErr)
+		}
+	}
+
+	if cooldownErr := store.SetFeedbackCooldown(ctx, sessionID, feedback.CooldownMs); cooldownErr != nil {
+		return feedback, true, fmt.Errorf("set feedback cooldown: %w", cooldownErr)
+	}
+
+	if storeErr := store.StoreRecentFeedback(ctx, feedback); storeErr != nil {
+		log.Printf("realtime: periodic store recent feedback failed (non-fatal): %v", storeErr)
+	}
+
+	return feedback, true, nil
 }
 
 // ruleFallback is the deterministic, LLM-free feedback decision: it reads

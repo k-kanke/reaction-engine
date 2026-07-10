@@ -119,14 +119,16 @@ func TestGenerateLLMStubCandidate(t *testing.T) {
 // fakeWaveStore is an in-memory WaveStore for testing HandleTrigger without
 // a real Redis.
 type fakeWaveStore struct {
-	samples        []contract.MoodWaveSampleMessage
-	selfChunks     []contract.TranscriptChunk
-	otherChunks    []contract.TranscriptChunk
-	baselineRefs   []string
-	inCooldown     bool
-	cooldownSetMs  int
-	cooldownWasSet bool
-	failOn         string // name of the method to make return an error, or ""
+	samples          []contract.MoodWaveSampleMessage
+	selfChunks       []contract.TranscriptChunk
+	otherChunks      []contract.TranscriptChunk
+	baselineRefs     []string
+	recentFeedback   []contract.FeedbackEvent
+	storedFeedback   []contract.FeedbackEvent
+	inCooldown       bool
+	cooldownSetMs    int
+	cooldownWasSet   bool
+	failOn           string // name of the method to make return an error, or ""
 }
 
 var errFakeStoreFailure = context.DeadlineExceeded
@@ -169,6 +171,34 @@ func (f *fakeWaveStore) SetFeedbackCooldown(ctx context.Context, sessionID strin
 	f.cooldownWasSet = true
 	f.cooldownSetMs = cooldownMs
 	return nil
+}
+
+func (f *fakeWaveStore) GetRecentFeedbackEvents(ctx context.Context, sessionID string, count int) ([]contract.FeedbackEvent, error) {
+	if f.failOn == "GetRecentFeedbackEvents" {
+		return nil, errFakeStoreFailure
+	}
+	if count > len(f.recentFeedback) {
+		return f.recentFeedback, nil
+	}
+	return f.recentFeedback[:count], nil
+}
+
+func (f *fakeWaveStore) StoreRecentFeedback(ctx context.Context, feedback contract.FeedbackEvent) error {
+	if f.failOn == "StoreRecentFeedback" {
+		return errFakeStoreFailure
+	}
+	f.storedFeedback = append(f.storedFeedback, feedback)
+	return nil
+}
+
+func (f *fakeWaveStore) GetLatestMoodWaveSample(ctx context.Context, sessionID string) (contract.MoodWaveSampleMessage, bool, error) {
+	if f.failOn == "GetLatestMoodWaveSample" {
+		return contract.MoodWaveSampleMessage{}, false, errFakeStoreFailure
+	}
+	if len(f.samples) == 0 {
+		return contract.MoodWaveSampleMessage{}, false, nil
+	}
+	return f.samples[len(f.samples)-1], true, nil
 }
 
 func triggerMsg(trigger *contract.TriggerInfo) contract.MoodWaveSampleMessage {
