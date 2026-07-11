@@ -123,6 +123,13 @@ module "media_bucket" {
       # evidence frames media-api/image-analysis-worker deal with.
       role    = "roles/storage.objectAdmin"
       members = [module.pdf_renderer_service_account.member]
+    },
+    {
+      # gmail-sender reads back the report.pdf pdf-renderer wrote above
+      # (internal/media.MediaReader.Read) to attach it to the report email
+      # -- read-only, it never writes here.
+      role    = "roles/storage.objectViewer"
+      members = [module.gmail_sender_service_account.member]
     }
   ]
 }
@@ -283,7 +290,14 @@ module "gateway_service_account" {
   # (real Speech-to-Text streaming). Requires speech.googleapis.com to be
   # enabled on the project first -- not managed by this Terraform config,
   # same as aiplatform/storage/sql (see internal/speech/recognizer.go).
-  project_roles = ["roles/cloudsql.client", "roles/aiplatform.user", "roles/speech.client"]
+  #
+  # roles/run.viewer: postsessiontrigger.CloudRunTrigger.runJob blocks on
+  # RunJob's long-running operation via op.Wait(ctx), which polls
+  # run.operations.get. Operations aren't a child resource of the Job for
+  # IAM purposes -- granting roles/run.viewer scoped to each individual job
+  # (google_cloud_run_v2_job_iam_member) still left run.operations.get
+  # denied in practice, so this needs to be project-level instead.
+  project_roles = ["roles/cloudsql.client", "roles/aiplatform.user", "roles/speech.client", "roles/run.viewer"]
 }
 
 module "gateway_service" {
@@ -580,6 +594,13 @@ module "gmail_sender_job" {
     DATABASE_URL       = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
     GMAIL_SEND_BACKEND = "real"
     GMAIL_SENDER_FROM  = var.gmail_sender_from
+    # Without these, gmail-sender defaults to MEDIA_STORE_BACKEND=local and
+    # tries to read the gs:// report.pdf media_ref pdf-renderer wrote as a
+    # literal local path (tmp/media/gs:/...), which never exists -- see
+    # cmd/gmail-sender/main.go's sendReal, mirroring pdf-renderer/media-api's
+    # same MEDIA_STORE_BACKEND split.
+    MEDIA_STORE_BACKEND = "gcs"
+    GCS_MEDIA_BUCKET    = module.media_bucket.name
   }
 
   secret_env_vars = {

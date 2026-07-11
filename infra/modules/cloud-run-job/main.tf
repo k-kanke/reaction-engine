@@ -80,20 +80,3 @@ resource "google_cloud_run_v2_job_iam_member" "invoker" {
   role   = "roles/run.jobsExecutorWithOverrides"
   member = each.value
 }
-
-# CloudRunTrigger.runJob (backend/internal/postsessiontrigger) blocks on
-# RunJob's long-running operation via op.Wait(ctx), which polls
-# run.operations.get -- not covered by run.jobsExecutorWithOverrides
-# either. roles/run.viewer is the smallest predefined role that has it
-# (plus the harmless run.operations.list/run.*.get-style read permissions
-# viewing this job's own executions needs), so it's granted alongside
-# rather than widening to roles/run.developer just for one permission.
-resource "google_cloud_run_v2_job_iam_member" "operations_viewer" {
-  for_each = toset(var.invoker_members)
-
-  project  = var.project_id
-  location = google_cloud_run_v2_job.this.location
-  name     = google_cloud_run_v2_job.this.name
-  role     = "roles/run.viewer"
-  member   = each.value
-}
