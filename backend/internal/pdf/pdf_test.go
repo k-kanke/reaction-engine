@@ -105,3 +105,44 @@ func TestWrapLine_Empty(t *testing.T) {
 		t.Errorf("wrapLine(\"\") = %v, want a single empty line", got)
 	}
 }
+
+func TestStyleForLine(t *testing.T) {
+	cases := []struct {
+		name        string
+		raw         string
+		wantSize    float64
+		wantIndent  float64
+		wantMarker  string
+		wantContent string
+	}{
+		{"h1", "# Title", heading1FontSize, 0, "", "Title"},
+		{"h2", "## 総評", heading2FontSize, 0, "", "総評"},
+		{"h3", "### 詳細", heading3FontSize, 0, "", "詳細"},
+		{"bullet dash", "- 発言の抜粋", fontSize, bulletIndent, bulletMarker, "発言の抜粋"},
+		{"bullet star", "* 発言の抜粋", fontSize, bulletIndent, bulletMarker, "発言の抜粋"},
+		{"nested bullet dash", "  - 発言: 抜粋", fontSize, bulletIndent * 2, bulletMarker, "発言: 抜粋"},
+		{"nested bullet star", "  * 発言: 抜粋", fontSize, bulletIndent * 2, bulletMarker, "発言: 抜粋"},
+		{"plain", "反応は概ね安定しています。", fontSize, 0, "", "反応は概ね安定しています。"},
+		{"empty", "", fontSize, 0, "", ""},
+		{"bold markers stripped", "これは**重要**です", fontSize, 0, "", "これは重要です"},
+		{"heading with bold stripped", "## **総評**", heading2FontSize, 0, "", "総評"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			style, content := styleForLine(tc.raw)
+			if style.fontSize != tc.wantSize {
+				t.Errorf("fontSize = %v, want %v", style.fontSize, tc.wantSize)
+			}
+			if style.indent != tc.wantIndent {
+				t.Errorf("indent = %v, want %v", style.indent, tc.wantIndent)
+			}
+			if style.marker != tc.wantMarker {
+				t.Errorf("marker = %q, want %q", style.marker, tc.wantMarker)
+			}
+			if content != tc.wantContent {
+				t.Errorf("content = %q, want %q", content, tc.wantContent)
+			}
+		})
+	}
+}

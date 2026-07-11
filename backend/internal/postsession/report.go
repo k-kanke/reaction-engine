@@ -17,6 +17,13 @@ import (
 // 基本ロジックにし").
 const importantWindowRadiusMs = 90 * 1000
 
+// jst is a fixed +9:00 offset, not time.LoadLocation("Asia/Tokyo"): the
+// backend Docker image is built FROM gcr.io/distroless/static-debian12
+// (see backend/Dockerfile), which has no tzdata, so LoadLocation would
+// fail at runtime. Japan has no DST, so a fixed offset is exact, not an
+// approximation.
+var jst = time.FixedZone("JST", 9*60*60)
+
 // Report is the shape marshaled into reports.report (jsonb), matching
 // architecture.md's post_session_report input example under
 // 全体FBレポートフロー (purpose/session/wave_overview/important_windows/
@@ -176,7 +183,7 @@ func BuildReport(
 	return Report{
 		Purpose:                 "post_session_report",
 		Session:                 ReportSession{SessionID: sessionID, DurationMin: durationMin},
-		GeneratedAt:             generatedAt.UTC().Format(time.RFC3339),
+		GeneratedAt:             generatedAt.In(jst).Format(time.RFC3339),
 		Source:                  "post_session_stub",
 		TranscriptChunkCount:    len(transcripts),
 		MoodWaveSampleCount:     len(moodWaveSamples),
