@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/k-kanke/reaction-engine/backend/internal/db"
@@ -101,11 +102,12 @@ func main() {
 	log.Printf("pdf-renderer: rendered report_id=%s session_id=%s media_ref=%s bytes=%d", reportID, *sessionID, mediaRef, len(pdfBytes))
 }
 
-// reportToLines flattens a postsession.Report into the plain-text lines
-// internal/pdf.Render expects. Free-text fields (transcript_summary,
-// feedback message) routinely contain Japanese; pdf.Render embeds a CJK
-// font and word-wraps each line, so these render as-is — see internal/pdf's
-// doc comment.
+// reportToLines flattens a postsession.Report into Markdown-ish lines
+// internal/pdf.Render understands ("## "/"### " headings, "- " bullets,
+// blank lines as paragraph spacing -- see internal/pdf's doc comment).
+// Free-text fields (WaveOverview.Overall, transcript_summary, feedback
+// message) routinely contain Japanese; pdf.Render embeds a CJK font and
+// word-wraps each line, so these render as-is.
 func reportToLines(r postsession.Report) []string {
 	var lines []string
 
@@ -115,34 +117,49 @@ func reportToLines(r postsession.Report) []string {
 		fmt.Sprintf("Generated: %s", r.GeneratedAt),
 		fmt.Sprintf("Source: %s", r.Source),
 		"",
-		fmt.Sprintf("Wave overview: %s", r.WaveOverview.Overall),
 	)
-	for _, s := range r.WaveOverview.DropSections {
-		lines = append(lines, fmt.Sprintf("  drop:  %s", s))
+
+	// WaveOverview.Overall is either the LLM's Markdown-formatted overall
+	// feedback (cmd/post-session-job's ENABLE_REPORT_LLM path -- already
+	// starts with its own "## " heading, possibly multi-line) or, on
+	// LLM failure/timeout, postsession.describeOverall()'s single-line
+	// deterministic fallback (no heading of its own, hence the "## 総評"
+	// fallback heading below so the section still reads sensibly either
+	// way).
+	if !strings.HasPrefix(strings.TrimSpace(r.WaveOverview.Overall), "#") {
+		lines = append(lines, "## 総評")
 	}
-	for _, s := range r.WaveOverview.PeakPositiveSections {
-		lines = append(lines, fmt.Sprintf("  peak:  %s", s))
+	lines = append(lines, strings.Split(r.WaveOverview.Overall, "\n")...)
+
+	if len(r.WaveOverview.DropSections) > 0 || len(r.WaveOverview.PeakPositiveSections) > 0 {
+		lines = append(lines, "", "### 区間データ")
+		for _, s := range r.WaveOverview.DropSections {
+			lines = append(lines, fmt.Sprintf("- 低下区間: %s", s))
+		}
+		for _, s := range r.WaveOverview.PeakPositiveSections {
+			lines = append(lines, fmt.Sprintf("- 上昇区間: %s", s))
+		}
 	}
 
-	lines = append(lines, "", fmt.Sprintf("Important windows: %d", len(r.ImportantWindows)))
+	lines = append(lines, "", fmt.Sprintf("## 重要な瞬間 (%d件)", len(r.ImportantWindows)))
 	for i, w := range r.ImportantWindows {
-		lines = append(lines, fmt.Sprintf("  [%d] %s - %s (%s, slope_per_sec=%.4f)", i+1, w.Start, w.End, w.MoodWaveSummary.Overall, w.MoodWaveSummary.SlopePerSec))
+		lines = append(lines, fmt.Sprintf("- [%d] %s - %s (%s, slope_per_sec=%.4f)", i+1, w.Start, w.End, w.MoodWaveSummary.Overall, w.MoodWaveSummary.SlopePerSec))
 		if w.TranscriptSummary != "" {
-			lines = append(lines, fmt.Sprintf("      transcript: %s", w.TranscriptSummary))
+			lines = append(lines, fmt.Sprintf("  - 発言: %s", w.TranscriptSummary))
 		}
 		if len(w.EvidenceRefs) > 0 {
-			lines = append(lines, fmt.Sprintf("      evidence_frames: %d", len(w.EvidenceRefs)))
+			lines = append(lines, fmt.Sprintf("  - 証拠画像: %d件", len(w.EvidenceRefs)))
 		}
 	}
 
-	lines = append(lines, "", fmt.Sprintf("Realtime feedback events: %d", len(r.RealtimeFeedbackHistory)))
+	lines = append(lines, "", fmt.Sprintf("## リアルタイムフィードバック履歴 (%d件)", len(r.RealtimeFeedbackHistory)))
 	for _, f := range r.RealtimeFeedbackHistory {
-		lines = append(lines, fmt.Sprintf("  t_ms=%d type=%s severity=%s source=%s", f.TMs, f.FeedbackType, f.Severity, f.Source))
+		lines = append(lines, fmt.Sprintf("- t_ms=%d type=%s severity=%s source=%s", f.TMs, f.FeedbackType, f.Severity, f.Source))
 	}
 
-	lines = append(lines, "", fmt.Sprintf("Participants: %d", len(r.BaselineContext.Participants)))
+	lines = append(lines, "", fmt.Sprintf("## 参加者 (%d名)", len(r.BaselineContext.Participants)))
 	for _, p := range r.BaselineContext.Participants {
-		lines = append(lines, fmt.Sprintf("  %s (baseline_confidence=%.2f)", p.AudienceID, p.Confidence))
+		lines = append(lines, fmt.Sprintf("- %s (baseline_confidence=%.2f)", p.AudienceID, p.Confidence))
 	}
 
 	return lines

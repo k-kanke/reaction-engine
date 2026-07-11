@@ -483,10 +483,14 @@ module "image_analysis_worker_service" {
 module "post_session_job_service_account" {
   source = "../../modules/service-account"
 
-  project_id    = var.project_id
-  account_id    = "reaction-engine-post-session"
-  display_name  = "Reaction Engine Post-Session Job"
-  project_roles = ["roles/cloudsql.client"]
+  project_id   = var.project_id
+  account_id   = "reaction-engine-post-session"
+  display_name = "Reaction Engine Post-Session Job"
+  # roles/aiplatform.user: ENABLE_REPORT_LLM=true calls Vertex AI directly
+  # (postsession.VertexOverallFeedbackGenerator) to write
+  # WaveOverview.Overall, mirroring gateway_service_account's same role for
+  # the realtime feedback path.
+  project_roles = ["roles/cloudsql.client", "roles/aiplatform.user"]
 }
 
 module "post_session_job" {
@@ -504,6 +508,9 @@ module "post_session_job" {
     JSONL_STORE_BACKEND = "gcs"
     GCS_JSONL_BUCKET    = module.jsonl_bucket.name
     DATABASE_URL        = "postgres://${module.db.database_user}:${module.db.database_password}@/${module.db.database_name}?host=/cloudsql/${module.db.connection_name}&sslmode=disable"
+    ENABLE_REPORT_LLM   = "true"
+    GCP_PROJECT         = var.project_id
+    GCP_REGION          = var.region
   }
 
   invoker_members = [module.gateway_service_account.member]
