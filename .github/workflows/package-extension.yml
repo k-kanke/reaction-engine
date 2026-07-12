@@ -1,0 +1,47 @@
+name: Package Chrome extension
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - extension/**
+      - .github/workflows/package-extension.yml
+      - README.md
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package extension zip
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate extension manifest
+        run: test -f extension/manifest.json
+
+      - name: Create extension zip
+        run: |
+          cd extension
+          zip -r ../reaction-engine-extension.zip . \
+            -x "**/.DS_Store" \
+            -x "src/config.local.js"
+
+      - name: Publish latest extension release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: extension-latest
+          name: Reaction Engine Chrome Extension
+          body: |
+            Latest packaged Chrome extension for manual installation.
+
+            Download `reaction-engine-extension.zip`, unzip it, then load the unzipped folder from `chrome://extensions` with Developer mode enabled.
+          files: reaction-engine-extension.zip
+          make_latest: true
+          prerelease: false
+          overwrite_files: true
