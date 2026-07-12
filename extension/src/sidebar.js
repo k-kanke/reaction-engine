@@ -134,6 +134,12 @@ let activeExcursion = null; // {moment, startTs} 発火中(偏差が戻るまで
 const FACE_MISSING_TIMEOUT_MS = 60000;
 let lastFaceDetectedTs = 0;
 let faceErrorShown = false;
+// --- 絵文字スムージング: 直近7秒の平均valenceで判定し、最低7秒間維持 ---
+const FACE_ICON_WINDOW_MS = 7000;
+const FACE_ICON_HOLD_MS = 7000;
+let valenceHistory = []; // [{ts, valence}]
+let currentFaceMood = "neutral"; // "happy" | "neutral" | "sad" | "none"
+let faceMoodLockedUntil = 0;
 // architecture.md の mood_wave_sample.trigger: ローカルtriggerは
 // updateMoodMonitor(250ms周期)で発火するが、送信は sendMoodWaveSample
 // (1Hz)側で行うため、次のtickまでここに積んでおく。
@@ -373,6 +379,9 @@ async function startCapture() {
     lastFaceDetectedTs = Date.now();
     faceErrorShown = false;
     if (elements.faceError) elements.faceError.style.display = "none";
+    valenceHistory = [];
+    currentFaceMood = "neutral";
+    faceMoodLockedUntil = 0;
     setStatus("Capturing", "active");
   } catch (error) {
     setStatus("Capture failed", "error");
@@ -431,6 +440,9 @@ function stopCapture() {
   if (elements.faceError) elements.faceError.style.display = "none";
   faceErrorShown = false;
   lastFaceDetectedTs = 0;
+  valenceHistory = [];
+  currentFaceMood = "neutral";
+  faceMoodLockedUntil = 0;
   setStatus(ws ? "Connected" : "Idle", ws ? "active" : "");
 }
 
@@ -1992,29 +2004,49 @@ function updateMetrics(features) {
 }
 
 function updateFaceIcon(valence, faceCount) {
+  const now = Date.now();
+
+  // 顔未検出 → 即時反映（ホールド無視）
   if (faceCount === 0) {
-    elements.faceIcon.textContent = "😶";
-    elements.faceIcon.className = "face-icon";
-    elements.faceLabel.textContent = "未検出";
-    elements.faceLabel.className = "face-label";
+    valenceHistory = [];
+    applyFaceMood("none");
     return;
   }
-  if (valence > 0.15) {
-    elements.faceIcon.textContent = "😊";
-    elements.faceIcon.className = "face-icon happy";
-    elements.faceLabel.textContent = "笑顔";
-    elements.faceLabel.className = "face-label happy";
-  } else if (valence < -0.15) {
-    elements.faceIcon.textContent = "😟";
-    elements.faceIcon.className = "face-icon sad";
-    elements.faceLabel.textContent = "反応低下";
-    elements.faceLabel.className = "face-label sad";
-  } else {
-    elements.faceIcon.textContent = "😐";
-    elements.faceIcon.className = "face-icon neutral";
-    elements.faceLabel.textContent = "通常";
-    elements.faceLabel.className = "face-label neutral";
+
+  // valence履歴に追加し、ウィンドウ外を除去
+  valenceHistory.push({ ts: now, valence });
+  const cutoff = now - FACE_ICON_WINDOW_MS;
+  valenceHistory = valenceHistory.filter(s => s.ts >= cutoff);
+
+  // 直近ウィンドウの平均valenceで判定
+  const avg = valenceHistory.reduce((sum, s) => sum + s.valence, 0) / valenceHistory.length;
+  const newMood = avg > 0.15 ? "happy" : avg < -0.15 ? "sad" : "neutral";
+
+  // ホールド中は同じmoodを維持
+  if (now < faceMoodLockedUntil && newMood !== currentFaceMood) {
+    return;
   }
+
+  // mood変化時にホールドタイマーをセット
+  if (newMood !== currentFaceMood) {
+    faceMoodLockedUntil = now + FACE_ICON_HOLD_MS;
+  }
+  applyFaceMood(newMood);
+}
+
+function applyFaceMood(mood) {
+  currentFaceMood = mood;
+  const map = {
+    happy:   { icon: "😊", label: "笑顔",   iconClass: "face-icon happy",   labelClass: "face-label happy" },
+    neutral: { icon: "😐", label: "通常",    iconClass: "face-icon neutral", labelClass: "face-label neutral" },
+    sad:     { icon: "😟", label: "反応低下", iconClass: "face-icon sad",     labelClass: "face-label sad" },
+    none:    { icon: "😶", label: "未検出",   iconClass: "face-icon",         labelClass: "face-label" },
+  };
+  const m = map[mood] || map.neutral;
+  elements.faceIcon.textContent = m.icon;
+  elements.faceIcon.className = m.iconClass;
+  elements.faceLabel.textContent = m.label;
+  elements.faceLabel.className = m.labelClass;
 }
 
 function setStatus(label, variant = "") {
