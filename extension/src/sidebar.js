@@ -3,7 +3,6 @@ import {
   FaceLandmarker,
   FilesetResolver
 } from "../vendor/mediapipe/vision_bundle.mjs";
-import { analyzeVideoWithGemini } from "./gemini.js";
 
 const ANALYSIS_INTERVAL_MS = 250;
 const EVENT_INTERVAL_MS = 1000;
@@ -17,8 +16,8 @@ const NOD_MIN_PHASE_MS = 120;
 
 const elements = {
   statusBadge: document.getElementById("statusBadge"),
-  wsUrl: document.getElementById("wsUrl"),
   connectButton: document.getElementById("connectButton"),
+  backendLinkHint: document.getElementById("backendLinkHint"),
   reportEmail: document.getElementById("reportEmail"),
   sessionId: document.getElementById("sessionId"),
   faceCount: document.getElementById("faceCount"),
@@ -33,11 +32,6 @@ const elements = {
   feedbackPanel: document.getElementById("feedbackPanel"),
   feedbackEmpty: document.getElementById("feedbackEmpty"),
   exportButton: document.getElementById("exportButton"),
-  geminiApiKey: document.getElementById("geminiApiKey"),
-  saveApiKeyButton: document.getElementById("saveApiKeyButton"),
-  geminiAnalyzeButton: document.getElementById("geminiAnalyzeButton"),
-  geminiStatus: document.getElementById("geminiStatus"),
-  geminiResult: document.getElementById("geminiResult"),
   videoFile: document.getElementById("videoFile"),
   uploadPlayButton: document.getElementById("uploadPlayButton"),
   uploadStopButton: document.getElementById("uploadStopButton"),
@@ -135,9 +129,6 @@ let activeExcursion = null; // {moment, startTs} 発火中(偏差が戻るまで
 const FACE_MISSING_TIMEOUT_MS = 60000;
 let lastFaceDetectedTs = 0;
 let faceErrorShown = false;
-// --- フィードバック吹き出し ---
-const BUBBLE_DISPLAY_MS = 12000;
-let bubbleTimer = null;
 // --- 絵文字スムージング: 直近7秒の平均valenceで判定し、最低7秒間維持 ---
 const FACE_ICON_WINDOW_MS = 7000;
 const FACE_ICON_HOLD_MS = 7000;
@@ -184,7 +175,7 @@ function createVadState() {
   };
 }
 
-elements.sessionId.textContent = sessionId;
+if (elements.sessionId) elements.sessionId.textContent = sessionId;
 restoreSettings();
 initEdgeVision();
 
@@ -192,13 +183,12 @@ elements.startButton.addEventListener("click", startCapture);
 elements.stopButton.addEventListener("click", stopCapture);
 elements.micPermButton.addEventListener("click", openMicPermission);
 elements.connectButton.addEventListener("click", toggleWebSocket);
-elements.videoFile.addEventListener("change", handleVideoFileSelect);
-elements.uploadPlayButton.addEventListener("click", startVideoFileAnalysis);
-elements.uploadStopButton.addEventListener("click", stopVideoFileAnalysis);
+if (elements.videoFile) elements.videoFile.addEventListener("change", handleVideoFileSelect);
+if (elements.uploadPlayButton) elements.uploadPlayButton.addEventListener("click", startVideoFileAnalysis);
+if (elements.uploadStopButton) elements.uploadStopButton.addEventListener("click", stopVideoFileAnalysis);
 if (elements.exportButton) elements.exportButton.addEventListener("click", downloadSessionJson);
-elements.saveApiKeyButton.addEventListener("click", saveGeminiApiKey);
-elements.geminiAnalyzeButton.addEventListener("click", runGeminiAnalysis);
-elements.unifiedReportButton.addEventListener("click", generateUnifiedReport);
+if (elements.unifiedReportButton) elements.unifiedReportButton.addEventListener("click", generateUnifiedReport);
+updateCaptureControls();
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type === "meet_tile_snapshot") {
@@ -208,8 +198,7 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 async function restoreSettings() {
-  const stored = await chrome.storage.local.get(["wsUrl", "reportEmail"]);
-  elements.wsUrl.value = stored.wsUrl || window.REACTION_ENGINE_CONFIG?.gatewayWsUrl || "";
+  const stored = await chrome.storage.local.get(["reportEmail"]);
   elements.reportEmail.value = stored.reportEmail || "";
 }
 
@@ -335,6 +324,12 @@ function openMicPermission() {
 }
 
 async function startCapture() {
+  if (!isWebSocketConnected()) {
+    setStatus("Connect first", "error");
+    updateBackendLinkHint("先に Backend Link を Connected にしてください。");
+    return;
+  }
+
   try {
     setStatus("Requesting capture");
     // マイク要求を画面共有と "同じクリック操作の中" で同時に開始する。
@@ -424,8 +419,7 @@ function stopCapture() {
   stream = null;
   elements.sourceVideo.srcObject = null;
   elements.sourceVideo.src = "";
-  elements.startButton.disabled = false;
-  elements.stopButton.disabled = true;
+  updateCaptureControls();
   previousFrame = null;
   tracks = [];
   trackHistory = new Map();
@@ -434,7 +428,7 @@ function stopCapture() {
   drawEmptyPreview();
   // Reset face icon to idle state
   if (elements.faceIcon) {
-    elements.faceIcon.textContent = "😐";
+    elements.faceIcon.textContent = "😌";
     elements.faceIcon.className = "face-icon";
   }
   if (elements.faceLabel) {
@@ -453,6 +447,7 @@ function stopCapture() {
 let videoFileUrl = null;
 
 function handleVideoFileSelect() {
+  if (!elements.videoFile || !elements.uploadControls || !elements.uploadPlayButton || !elements.uploadStopButton) return;
   const file = elements.videoFile.files[0];
   if (!file) {
     elements.uploadControls.style.display = "none";
@@ -462,10 +457,10 @@ function handleVideoFileSelect() {
   elements.uploadPlayButton.disabled = false;
   elements.uploadStopButton.disabled = true;
   logEvent({ type: "video_file_selected", message: file.name });
-  updateGeminiButton();
 }
 
 async function startVideoFileAnalysis() {
+  if (!elements.videoFile || !elements.uploadPlayButton || !elements.uploadStopButton) return;
   const file = elements.videoFile.files[0];
   if (!file) return;
 
@@ -481,7 +476,7 @@ async function startVideoFileAnalysis() {
   video.currentTime = 0;
 
   sessionId = createSessionId();
-  elements.sessionId.textContent = sessionId;
+  if (elements.sessionId) elements.sessionId.textContent = sessionId;
 
   try {
     await video.play();
@@ -537,9 +532,9 @@ function stopVideoFileAnalysis() {
 
   video.src = "";
   setAnalysisResolution(640, 360);
-  elements.uploadPlayButton.disabled = false;
-  elements.uploadStopButton.disabled = true;
-  elements.startButton.disabled = false;
+  if (elements.uploadPlayButton) elements.uploadPlayButton.disabled = false;
+  if (elements.uploadStopButton) elements.uploadStopButton.disabled = true;
+  updateCaptureControls();
   previousFrame = null;
   tracks = [];
   trackHistory = new Map();
@@ -1935,22 +1930,32 @@ async function toggleWebSocket() {
     ws.close();
     ws = null;
     elements.connectButton.textContent = "Connect";
+    elements.connectButton.disabled = false;
+    updateCaptureControls();
+    updateBackendLinkHint("Connected になると Start Capture が有効になります。");
     setStatus(stream ? "Capturing" : "Idle", stream ? "active" : "");
     return;
   }
 
-  const url = elements.wsUrl.value.trim();
-  await chrome.storage.local.set({ wsUrl: url });
+  const url = window.REACTION_ENGINE_CONFIG?.gatewayWsUrl || "";
 
   if (!url) {
-    logEvent({ type: "websocket_skipped", message: "WebSocket URL is empty" });
+    logEvent({ type: "websocket_skipped", message: "Gateway WebSocket URL is not configured" });
     return;
   }
 
   try {
+    elements.connectButton.disabled = true;
+    elements.connectButton.textContent = "Connecting...";
+    updateBackendLinkHint("接続中です。");
+    updateCaptureControls();
+    setStatus("Connecting");
     ws = new WebSocket(url);
     ws.addEventListener("open", () => {
+      elements.connectButton.disabled = false;
       elements.connectButton.textContent = "Disconnect";
+      updateCaptureControls();
+      updateBackendLinkHint("Connected。Start Capture を開始できます。");
       setStatus("Connected", "active");
       logEvent({ type: "websocket_open", url });
     });
@@ -1963,18 +1968,47 @@ async function toggleWebSocket() {
     });
     ws.addEventListener("close", () => {
       ws = null;
+      elements.connectButton.disabled = false;
       elements.connectButton.textContent = "Connect";
+      updateCaptureControls();
+      updateBackendLinkHint("Connected になると Start Capture が有効になります。");
       setStatus(stream ? "Capturing" : "Idle", stream ? "active" : "");
       logEvent({ type: "websocket_close" });
     });
     ws.addEventListener("error", () => {
+      elements.connectButton.disabled = false;
+      updateCaptureControls();
+      updateBackendLinkHint("接続に失敗しました。もう一度 Connect を押してください。");
       setStatus("WebSocket error", "error");
       logEvent({ type: "websocket_error" });
     });
   } catch (error) {
+    elements.connectButton.disabled = false;
+    elements.connectButton.textContent = "Connect";
+    updateCaptureControls();
+    updateBackendLinkHint("接続に失敗しました。もう一度 Connect を押してください。");
     setStatus("WebSocket failed", "error");
     logEvent({ type: "websocket_error", message: error.message });
   }
+}
+
+function isWebSocketConnected() {
+  return ws?.readyState === WebSocket.OPEN;
+}
+
+function updateCaptureControls() {
+  if (stream) {
+    elements.startButton.disabled = true;
+    elements.stopButton.disabled = false;
+    return;
+  }
+
+  elements.startButton.disabled = !isWebSocketConnected();
+  elements.stopButton.disabled = true;
+}
+
+function updateBackendLinkHint(text) {
+  if (elements.backendLinkHint) elements.backendLinkHint.textContent = text;
 }
 
 function updateMetrics(features) {
@@ -2043,10 +2077,10 @@ function updateFaceIcon(valence, faceCount) {
 function applyFaceMood(mood) {
   currentFaceMood = mood;
   const map = {
-    happy:   { icon: "😊", label: "笑顔",   iconClass: "face-icon happy",   labelClass: "face-label happy" },
-    neutral: { icon: "😐", label: "通常",    iconClass: "face-icon neutral", labelClass: "face-label neutral" },
-    sad:     { icon: "😟", label: "反応低下", iconClass: "face-icon sad",     labelClass: "face-label sad" },
-    none:    { icon: "😶", label: "未検出",   iconClass: "face-icon",         labelClass: "face-label" },
+    happy:   { icon: "🙂", label: "良好",     iconClass: "face-icon happy",   labelClass: "face-label happy" },
+    neutral: { icon: "😌", label: "通常",     iconClass: "face-icon neutral", labelClass: "face-label neutral" },
+    sad:     { icon: "🤔", label: "反応低下", iconClass: "face-icon sad",     labelClass: "face-label sad" },
+    none:    { icon: "○",  label: "未検出",   iconClass: "face-icon",         labelClass: "face-label" },
   };
   const m = map[mood] || map.neutral;
   elements.faceIcon.textContent = m.icon;
@@ -2064,17 +2098,11 @@ function logEvent(_event) {
   // Event log removed from UI — kept as no-op so callers don't break.
 }
 
-// フィードバックを顔アイコンの吹き出しとして表示する。
-// 12秒後に自動で消える。新しいフィードバックが来たら上書き。
+// フィードバックを顔アイコン横のコメント欄として表示する。
+// 新しいフィードバックが来たら最新コメントに上書きする。
 function renderFeedback(feedback) {
   const bubble = elements.faceBubble;
   if (!bubble) return;
-
-  // 既存タイマーをクリア
-  if (bubbleTimer) {
-    clearTimeout(bubbleTimer);
-    bubbleTimer = null;
-  }
 
   // 吹き出しの中身を組み立て
   bubble.className = `face-bubble severity-${feedback.severity || "info"}`;
@@ -2087,12 +2115,6 @@ function renderFeedback(feedback) {
   }
   bubble.innerHTML = html;
   bubble.style.display = "block";
-
-  // 12秒後に自動消去
-  bubbleTimer = setTimeout(() => {
-    bubble.style.display = "none";
-    bubbleTimer = null;
-  }, BUBBLE_DISPLAY_MS);
 }
 
 function escapeHtml(str) {
@@ -2121,89 +2143,19 @@ function createEmptyFeatures() {
   };
 }
 
-// --- Gemini Analysis ---
-
-let geminiApiKeyStored = null;
 let latestGeminiResult = null;
-
-async function restoreGeminiApiKey() {
-  // Try config.local.js first (hardcoded key for dev convenience)
-  try {
-    const config = await import("./config.local.js");
-    if (config.GEMINI_API_KEY) {
-      geminiApiKeyStored = config.GEMINI_API_KEY;
-      elements.geminiApiKey.value = "••••••••";
-      updateGeminiButton();
-      logEvent({ type: "gemini_api_key_loaded", source: "config.local.js" });
-      return;
-    }
-  } catch {
-    // config.local.js not found or empty — fall through to chrome.storage
-  }
-
-  const stored = await chrome.storage.local.get(["geminiApiKey"]);
-  if (stored.geminiApiKey) {
-    geminiApiKeyStored = stored.geminiApiKey;
-    elements.geminiApiKey.value = "••••••••";
-    updateGeminiButton();
-  }
-}
-restoreGeminiApiKey();
-
-async function saveGeminiApiKey() {
-  const key = elements.geminiApiKey.value.trim();
-  if (!key || key === "••••••••") return;
-  await chrome.storage.local.set({ geminiApiKey: key });
-  geminiApiKeyStored = key;
-  elements.geminiApiKey.value = "••••••••";
-  updateGeminiButton();
-  logEvent({ type: "gemini_api_key_saved" });
-}
-
-function updateGeminiButton() {
-  const hasKey = !!geminiApiKeyStored;
-  const hasFile = !!elements.videoFile.files[0];
-  elements.geminiAnalyzeButton.disabled = !(hasKey && hasFile);
-}
-
-async function runGeminiAnalysis() {
-  const file = elements.videoFile.files[0];
-  if (!file || !geminiApiKeyStored) return;
-
-  elements.geminiAnalyzeButton.disabled = true;
-  elements.geminiResult.style.display = "none";
-  elements.geminiStatus.textContent = "Starting...";
-
-  try {
-    const result = await analyzeVideoWithGemini(
-      geminiApiKeyStored,
-      file,
-      (status) => { elements.geminiStatus.textContent = status; }
-    );
-
-    latestGeminiResult = result;
-    elements.geminiResult.textContent = JSON.stringify(result, null, 2);
-    elements.geminiResult.style.display = "";
-    elements.geminiStatus.textContent = "Analysis complete";
-    logEvent({ type: "gemini_analysis_complete", participant_count: result.participants?.length ?? 0 });
-    updateUnifiedReportButton();
-  } catch (error) {
-    elements.geminiStatus.textContent = `Error: ${error.message}`;
-    logEvent({ type: "gemini_analysis_error", message: error.message });
-  } finally {
-    updateGeminiButton();
-  }
-}
 
 // --- Unified Report ---
 
 function updateUnifiedReportButton() {
   // Enable when we have session data OR gemini result
+  if (!elements.unifiedReportButton) return;
   const hasGemini = !!latestGeminiResult;
   elements.unifiedReportButton.disabled = !hasGemini;
 }
 
 async function generateUnifiedReport() {
+  if (!elements.unifiedReportButton || !elements.unifiedReportStatus || !elements.unifiedReport) return;
   elements.unifiedReportButton.disabled = true;
   elements.unifiedReportStatus.textContent = "レポート生成中...";
 
@@ -2393,6 +2345,7 @@ function findGeminiMatch(stats, geminiParticipants) {
 
 function renderUnifiedReport(report) {
   const el = elements.unifiedReport;
+  if (!el) return;
   let html = "";
 
   // Meeting overview
@@ -2822,7 +2775,9 @@ function renderMoments() {
   const grid = elements.momentsGrid;
   if (!grid) return;
 
-  elements.momentsEmpty.style.display = moments.length ? "none" : "";
+  if (elements.momentsEmpty) {
+    elements.momentsEmpty.style.display = moments.length ? "none" : "";
+  }
   grid.textContent = "";
 
   for (const moment of moments) {

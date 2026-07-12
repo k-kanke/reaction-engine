@@ -24,11 +24,13 @@
         <video id="sourceVideo" autoplay muted playsinline></video>
 
         <div id="faceStatus" class="face-status">
-          <div class="face-icon-wrap">
-            <div id="faceIcon" class="face-icon" aria-label="参加者の表情">😐</div>
-            <div id="faceBubble" class="face-bubble" style="display:none"></div>
+          <div class="face-icon-panel">
+            <div id="faceIcon" class="face-icon" aria-label="参加者の反応">😌</div>
+            <div id="faceLabel" class="face-label">待機中</div>
           </div>
-          <div id="faceLabel" class="face-label">待機中</div>
+          <div id="faceBubble" class="face-bubble is-empty">
+            <p class="bubble-message">フィードバック待機中</p>
+          </div>
         </div>
 
         <div id="faceError" class="face-error" style="display:none">
@@ -49,67 +51,49 @@
             <span class="signal-label">Attention</span>
             <strong id="attentionScore">0.00</strong>
           </div>
-          <div class="signal signal-session">
-            <span class="signal-label">Session</span>
-            <strong id="sessionId">-</strong>
-          </div>
         </div>
+        <span id="sessionId" class="visually-hidden">-</span>
 
-        <canvas id="moodWave" class="mood-wave" width="720" height="96" style="display:none"></canvas>
+        <canvas id="moodWave" class="mood-wave" width="720" height="96"></canvas>
 
         <div class="controls">
-          <button id="startButton" type="button" class="primary">Start Capture</button>
+          <button id="startButton" type="button" class="primary" disabled>Start Capture</button>
           <button id="stopButton" type="button" disabled>Stop</button>
           <button id="micPermButton" type="button" class="controls-wide">マイクを許可</button>
         </div>
       </section>
 
-      <section class="section">
+      <section class="section" style="display:none">
         <h2 class="eyebrow">Moments</h2>
-        <p class="hint" id="momentsEmpty">波形が大きく動いた瞬間のスクリーンショットがここに並びます(直近15秒のメモリバッファから取得。自動保存はされません)。</p>
         <div id="momentsGrid" class="moments-grid"></div>
       </section>
 
       <section class="section">
         <h2 class="eyebrow">Backend Link</h2>
-        <label class="field-label" for="wsUrl">WebSocket URL</label>
-        <div class="row">
-          <input id="wsUrl" type="url" placeholder="ws://localhost:8787/realtime">
-          <button id="connectButton" type="button">Connect</button>
+        <div class="backend-actions">
+          <button id="connectButton" type="button" class="primary block">Connect</button>
+          <p id="backendLinkHint" class="hint">Connected になると Start Capture が有効になります。</p>
         </div>
-        <p class="hint">未設定でもローカル解析とログ表示は動きます。</p>
 
-        <label class="field-label" for="reportEmail">レポート送信先メールアドレス</label>
-        <input id="reportEmail" type="email" placeholder="you@example.com">
-        <p class="hint">セッション終了時、全体フィードバックレポート(PDF)の送信先。未入力の場合は送信されません。</p>
-      </section>
-
-      <section class="section">
-        <h2 class="eyebrow">Recorded File</h2>
-        <label class="field-label" for="videoFile">録画ファイルを解析</label>
-        <input id="videoFile" type="file" accept="video/*">
-        <div class="upload-controls row" style="display:none">
-          <button id="uploadPlayButton" type="button" class="primary">再生 &amp; 解析</button>
-          <button id="uploadStopButton" type="button" disabled>停止</button>
+        <div class="mail-settings">
+          <label class="field-label" for="reportEmail">レポート送信先メールアドレス</label>
+          <input id="reportEmail" type="email" placeholder="you@example.com">
+          <p class="hint">セッション終了時、全体フィードバックレポート(PDF)の送信先。未入力の場合は送信されません。</p>
         </div>
       </section>
 
       <section class="section">
-        <h2 class="eyebrow">Gemini Analysis</h2>
-        <div class="row">
-          <input id="geminiApiKey" type="password" placeholder="Gemini API Key">
-          <button id="saveApiKeyButton" type="button">保存</button>
+        <div class="premium-feature">
+          <div>
+            <div class="premium-header">
+              <h2 class="eyebrow">Recorded File</h2>
+              <span class="premium-badge">Premium</span>
+            </div>
+            <p class="premium-title">録画ファイル解析</p>
+            <p class="hint">録画を使ったセッション後分析は、今後のプレミアム機能として提供予定です。</p>
+          </div>
+          <button type="button" class="premium-button" disabled>Coming soon</button>
         </div>
-        <button id="geminiAnalyzeButton" type="button" class="primary block" disabled>録画を Gemini で分析</button>
-        <p id="geminiStatus" class="hint"></p>
-        <pre id="geminiResult" class="gemini-result" style="display:none"></pre>
-      </section>
-
-      <section class="section">
-        <h2 class="eyebrow">Unified Report</h2>
-        <button id="unifiedReportButton" type="button" class="primary block" disabled>リアルタイム + Gemini 統合レポート生成</button>
-        <p id="unifiedReportStatus" class="hint"></p>
-        <div id="unifiedReport" class="unified-report" style="display:none"></div>
       </section>
 
       <section class="section" style="display:none">
