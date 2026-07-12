@@ -2490,12 +2490,6 @@ function pct(ratio) {
   return `${Math.round(ratio * 100)}%`;
 }
 
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = String(str);
-  return div.innerHTML;
-}
-
 // --- 雰囲気波形 + モーメント検出 ---
 
 function startMoodMonitor() {
