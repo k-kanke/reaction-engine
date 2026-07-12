@@ -51,7 +51,8 @@ const elements = {
   faceIcon: document.getElementById("faceIcon"),
   faceLabel: document.getElementById("faceLabel"),
   faceError: document.getElementById("faceError"),
-  faceStatus: document.getElementById("faceStatus")
+  faceStatus: document.getElementById("faceStatus"),
+  faceBubble: document.getElementById("faceBubble")
 };
 
 const canvas = elements.preview;
@@ -134,6 +135,9 @@ let activeExcursion = null; // {moment, startTs} 発火中(偏差が戻るまで
 const FACE_MISSING_TIMEOUT_MS = 60000;
 let lastFaceDetectedTs = 0;
 let faceErrorShown = false;
+// --- フィードバック吹き出し ---
+const BUBBLE_DISPLAY_MS = 12000;
+let bubbleTimer = null;
 // --- 絵文字スムージング: 直近7秒の平均valenceで判定し、最低7秒間維持 ---
 const FACE_ICON_WINDOW_MS = 7000;
 const FACE_ICON_HOLD_MS = 7000;
@@ -191,7 +195,7 @@ elements.connectButton.addEventListener("click", toggleWebSocket);
 elements.videoFile.addEventListener("change", handleVideoFileSelect);
 elements.uploadPlayButton.addEventListener("click", startVideoFileAnalysis);
 elements.uploadStopButton.addEventListener("click", stopVideoFileAnalysis);
-elements.exportButton.addEventListener("click", downloadSessionJson);
+if (elements.exportButton) elements.exportButton.addEventListener("click", downloadSessionJson);
 elements.saveApiKeyButton.addEventListener("click", saveGeminiApiKey);
 elements.geminiAnalyzeButton.addEventListener("click", runGeminiAnalysis);
 elements.unifiedReportButton.addEventListener("click", generateUnifiedReport);
@@ -2006,10 +2010,12 @@ function updateMetrics(features) {
 function updateFaceIcon(valence, faceCount) {
   const now = Date.now();
 
-  // 顔未検出 → 即時反映（ホールド無視）
+  // 顔未検出 → 1分以上続いた場合のみ「未検出」表示。それまでは直前の表情を維持。
   if (faceCount === 0) {
-    valenceHistory = [];
-    applyFaceMood("none");
+    if (lastFaceDetectedTs > 0 && now - lastFaceDetectedTs > FACE_MISSING_TIMEOUT_MS) {
+      valenceHistory = [];
+      applyFaceMood("none");
+    }
     return;
   }
 
@@ -2054,52 +2060,45 @@ function setStatus(label, variant = "") {
   elements.statusBadge.className = `badge ${variant}`.trim();
 }
 
-function logEvent(event) {
-  const item = document.createElement("li");
-  item.textContent = JSON.stringify(event);
-  elements.eventLog.prepend(item);
-
-  while (elements.eventLog.children.length > 30) {
-    elements.eventLog.lastElementChild?.remove();
-  }
+function logEvent(_event) {
+  // Event log removed from UI — kept as no-op so callers don't break.
 }
 
-// Dev-only display for contract.FeedbackEvent (backend/internal/contract/feedback.go).
-// architecture.md lists sidebar rendering of feedback_event as in-scope but
-// not yet built (only mood wave / moment snapshot are); this is a minimal
-// stand-in until a real design exists.
+// フィードバックを顔アイコンの吹き出しとして表示する。
+// 12秒後に自動で消える。新しいフィードバックが来たら上書き。
 function renderFeedback(feedback) {
-  if (elements.feedbackEmpty) {
-    elements.feedbackEmpty.style.display = "none";
+  const bubble = elements.faceBubble;
+  if (!bubble) return;
+
+  // 既存タイマーをクリア
+  if (bubbleTimer) {
+    clearTimeout(bubbleTimer);
+    bubbleTimer = null;
   }
 
-  const item = document.createElement("li");
-  item.className = `feedback-card severity-${feedback.severity || "info"}`;
+  // 吹き出しの中身を組み立て
+  bubble.className = `face-bubble severity-${feedback.severity || "info"}`;
 
-  const meta = document.createElement("div");
-  meta.className = "feedback-meta";
-  meta.textContent = [feedback.feedback_type, feedback.severity, feedback.source]
-    .filter(Boolean)
-    .join(" / ");
-  item.appendChild(meta);
-
-  const message = document.createElement("p");
-  message.className = "feedback-message";
-  message.textContent = feedback.message || "(no message)";
-  item.appendChild(message);
-
+  let html = "";
+  const msg = feedback.message || "(no message)";
+  html += `<p class="bubble-message">${escapeHtml(msg)}</p>`;
   if (feedback.evidence_quote) {
-    const quote = document.createElement("p");
-    quote.className = "feedback-quote";
-    quote.textContent = `"${feedback.evidence_quote}"`;
-    item.appendChild(quote);
+    html += `<p class="bubble-quote">"${escapeHtml(feedback.evidence_quote)}"</p>`;
   }
+  bubble.innerHTML = html;
+  bubble.style.display = "block";
 
-  elements.feedbackPanel.prepend(item);
+  // 12秒後に自動消去
+  bubbleTimer = setTimeout(() => {
+    bubble.style.display = "none";
+    bubbleTimer = null;
+  }, BUBBLE_DISPLAY_MS);
+}
 
-  while (elements.feedbackPanel.children.length > 5) {
-    elements.feedbackPanel.lastElementChild?.remove();
-  }
+function escapeHtml(str) {
+  const d = document.createElement("div");
+  d.textContent = str;
+  return d.innerHTML;
 }
 
 function createEmptyFeatures() {
@@ -2489,12 +2488,6 @@ function formatDuration(sec) {
 
 function pct(ratio) {
   return `${Math.round(ratio * 100)}%`;
-}
-
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = String(str);
-  return div.innerHTML;
 }
 
 // --- 雰囲気波形 + モーメント検出 ---
