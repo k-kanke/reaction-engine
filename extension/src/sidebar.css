@@ -159,6 +159,13 @@ body {
   padding: 18px 10px;
 }
 
+.face-icon-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .face-icon {
   font-size: 64px;
   line-height: 1;
@@ -168,6 +175,68 @@ body {
 
 .face-icon.happy { transform: scale(1.1); }
 .face-icon.sad { transform: scale(0.95); }
+
+/* Speech bubble for feedback */
+.face-bubble {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+  max-width: 200px;
+  min-width: 120px;
+  padding: 8px 11px;
+  white-space: normal;
+  word-break: break-word;
+  animation: bubble-in 300ms ease;
+  z-index: 10;
+}
+
+.face-bubble::before {
+  content: "";
+  position: absolute;
+  right: 100%;
+  top: 50%;
+  transform: translateY(-50%);
+  border: 6px solid transparent;
+  border-right-color: var(--border-strong);
+}
+
+.face-bubble::after {
+  content: "";
+  position: absolute;
+  right: calc(100% - 1px);
+  top: 50%;
+  transform: translateY(-50%);
+  border: 5px solid transparent;
+  border-right-color: var(--panel);
+}
+
+.face-bubble.severity-info { border-left: 3px solid var(--live); }
+.face-bubble.severity-low { border-left: 3px solid var(--amber); }
+.face-bubble.severity-high,
+.face-bubble.severity-critical { border-left: 3px solid var(--danger); }
+
+.face-bubble .bubble-message {
+  margin: 0;
+}
+
+.face-bubble .bubble-quote {
+  color: var(--muted);
+  font-size: 10.5px;
+  font-style: italic;
+  margin: 4px 0 0;
+}
+
+@keyframes bubble-in {
+  from { opacity: 0; transform: translateY(-50%) translateX(-6px); }
+  to   { opacity: 1; transform: translateY(-50%) translateX(0); }
+}
 
 .face-label {
   color: var(--muted);
