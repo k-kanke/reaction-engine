@@ -2006,10 +2006,12 @@ function updateMetrics(features) {
 function updateFaceIcon(valence, faceCount) {
   const now = Date.now();
 
-  // 顔未検出 → 即時反映（ホールド無視）
+  // 顔未検出 → 1分以上続いた場合のみ「未検出」表示。それまでは直前の表情を維持。
   if (faceCount === 0) {
-    valenceHistory = [];
-    applyFaceMood("none");
+    if (lastFaceDetectedTs > 0 && now - lastFaceDetectedTs > FACE_MISSING_TIMEOUT_MS) {
+      valenceHistory = [];
+      applyFaceMood("none");
+    }
     return;
   }
 
