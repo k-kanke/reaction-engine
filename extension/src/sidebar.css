@@ -149,31 +149,56 @@ body {
   padding: 10px;
 }
 
-.viewfinder {
-  padding: 7px;
-  position: relative;
+/* Face status display — replaces the old viewfinder + waveform */
+
+.face-status {
+  align-items: center;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 18px 10px;
 }
 
-#preview {
-  aspect-ratio: 16 / 9;
-  background: var(--well);
-  border-radius: 4px;
-  display: block;
-  width: 100%;
+.face-icon {
+  font-size: 64px;
+  line-height: 1;
+  text-align: center;
+  transition: transform 300ms ease;
 }
 
-.vf-corner {
-  border: 2px solid var(--amber);
-  height: 14px;
-  opacity: 0.9;
-  position: absolute;
-  width: 14px;
+.face-icon.happy { transform: scale(1.1); }
+.face-icon.sad { transform: scale(0.95); }
+
+.face-label {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-align: center;
+  text-transform: uppercase;
 }
 
-.vf-tl { border-bottom: 0; border-right: 0; left: 0; top: 0; }
-.vf-tr { border-bottom: 0; border-left: 0; right: 0; top: 0; }
-.vf-bl { border-right: 0; border-top: 0; bottom: 0; left: 0; }
-.vf-br { border-left: 0; border-top: 0; bottom: 0; right: 0; }
+.face-label.happy { color: var(--live); }
+.face-label.neutral { color: var(--amber); }
+.face-label.sad { color: #7aa2e8; }
+
+.face-error {
+  align-items: center;
+  background: rgba(240, 104, 93, 0.12);
+  border: 1px solid rgba(240, 104, 93, 0.4);
+  border-radius: 6px;
+  color: var(--danger);
+  display: flex;
+  font-size: 12px;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 8px 12px;
+}
+
+.face-error-icon {
+  font-size: 16px;
+  flex: none;
+}
 
 #sourceVideo {
   display: none;

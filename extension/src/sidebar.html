@@ -20,14 +20,18 @@
       </header>
 
       <section class="monitor" aria-label="Live monitor">
-        <div class="viewfinder">
-          <canvas id="preview" width="640" height="360"></canvas>
-          <span class="vf-corner vf-tl" aria-hidden="true"></span>
-          <span class="vf-corner vf-tr" aria-hidden="true"></span>
-          <span class="vf-corner vf-bl" aria-hidden="true"></span>
-          <span class="vf-corner vf-br" aria-hidden="true"></span>
-        </div>
+        <canvas id="preview" width="640" height="360" style="display:none"></canvas>
         <video id="sourceVideo" autoplay muted playsinline></video>
+
+        <div id="faceStatus" class="face-status">
+          <div id="faceIcon" class="face-icon" aria-label="参加者の表情">😐</div>
+          <div id="faceLabel" class="face-label">待機中</div>
+        </div>
+
+        <div id="faceError" class="face-error" style="display:none">
+          <span class="face-error-icon">⚠</span>
+          <span>顔が検出されていません（1分以上）</span>
+        </div>
 
         <div class="signal-strip">
           <div class="signal">
@@ -35,8 +39,8 @@
             <strong id="faceCount">0</strong>
           </div>
           <div class="signal">
-            <span class="signal-label">Motion</span>
-            <strong id="motionScore">0.00</strong>
+            <span class="signal-label">Mood</span>
+            <strong id="motionScore">-</strong>
           </div>
           <div class="signal">
             <span class="signal-label">Attention</span>
@@ -48,11 +52,7 @@
           </div>
         </div>
 
-        <canvas id="moodWave" class="mood-wave" width="720" height="96" aria-label="雰囲気の波形"></canvas>
-        <div class="wave-legend">
-          <span class="legend-item legend-mood">Mood</span>
-          <span class="legend-item legend-attn">Attention</span>
-        </div>
+        <canvas id="moodWave" class="mood-wave" width="720" height="96" style="display:none"></canvas>
 
         <div class="controls">
           <button id="startButton" type="button" class="primary">Start Capture</button>

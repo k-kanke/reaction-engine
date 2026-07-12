@@ -47,7 +47,11 @@ const elements = {
   unifiedReport: document.getElementById("unifiedReport"),
   moodWave: document.getElementById("moodWave"),
   momentsGrid: document.getElementById("momentsGrid"),
-  momentsEmpty: document.getElementById("momentsEmpty")
+  momentsEmpty: document.getElementById("momentsEmpty"),
+  faceIcon: document.getElementById("faceIcon"),
+  faceLabel: document.getElementById("faceLabel"),
+  faceError: document.getElementById("faceError"),
+  faceStatus: document.getElementById("faceStatus")
 };
 
 const canvas = elements.preview;
@@ -126,6 +130,10 @@ let moodTriggerArmed = true;
 let nodActiveSince = null;
 let lastNodTriggerTs = 0;
 let activeExcursion = null; // {moment, startTs} 発火中(偏差が戻るまで)の盛り上がり区間
+// --- 顔未検出エラー: 1分以上顔が検出されなければ警告を出す ---
+const FACE_MISSING_TIMEOUT_MS = 60000;
+let lastFaceDetectedTs = 0;
+let faceErrorShown = false;
 // architecture.md の mood_wave_sample.trigger: ローカルtriggerは
 // updateMoodMonitor(250ms周期)で発火するが、送信は sendMoodWaveSample
 // (1Hz)側で行うため、次のtickまでここに積んでおく。
@@ -362,6 +370,9 @@ async function startCapture() {
     startMoodMonitor();
     baselineCaptureStartTs = Date.now();
     baselineTimer = window.setInterval(captureBaselineFrames, BASELINE_CAPTURE_INTERVAL_MS);
+    lastFaceDetectedTs = Date.now();
+    faceErrorShown = false;
+    if (elements.faceError) elements.faceError.style.display = "none";
     setStatus("Capturing", "active");
   } catch (error) {
     setStatus("Capture failed", "error");
@@ -408,6 +419,18 @@ function stopCapture() {
   latestFeatures = createEmptyFeatures();
   updateMetrics(latestFeatures);
   drawEmptyPreview();
+  // Reset face icon to idle state
+  if (elements.faceIcon) {
+    elements.faceIcon.textContent = "😐";
+    elements.faceIcon.className = "face-icon";
+  }
+  if (elements.faceLabel) {
+    elements.faceLabel.textContent = "待機中";
+    elements.faceLabel.className = "face-label";
+  }
+  if (elements.faceError) elements.faceError.style.display = "none";
+  faceErrorShown = false;
+  lastFaceDetectedTs = 0;
   setStatus(ws ? "Connected" : "Idle", ws ? "active" : "");
 }
 
@@ -1939,9 +1962,59 @@ async function toggleWebSocket() {
 }
 
 function updateMetrics(features) {
-  elements.faceCount.textContent = String(features.face_count ?? 0);
-  elements.motionScore.textContent = Number(features.motion_score ?? 0).toFixed(2);
+  const faceCount = features.face_count ?? 0;
+  elements.faceCount.textContent = String(faceCount);
   elements.attentionScore.textContent = Number(features.attention_score ?? 0).toFixed(2);
+
+  // --- 顔表情アイコン更新 ---
+  const valence = features.room_engagement?.valence_mean ?? 0;
+  updateFaceIcon(valence, faceCount);
+
+  // Mood signal: show valence as a simple label
+  if (faceCount > 0) {
+    elements.motionScore.textContent = valence > 0.15 ? "Good" : valence < -0.15 ? "Low" : "Normal";
+  } else {
+    elements.motionScore.textContent = "-";
+  }
+
+  // --- 顔未検出エラー (1分) ---
+  const now = Date.now();
+  if (faceCount > 0) {
+    lastFaceDetectedTs = now;
+    if (faceErrorShown) {
+      faceErrorShown = false;
+      elements.faceError.style.display = "none";
+    }
+  } else if (lastFaceDetectedTs > 0 && now - lastFaceDetectedTs > FACE_MISSING_TIMEOUT_MS && !faceErrorShown) {
+    faceErrorShown = true;
+    elements.faceError.style.display = "flex";
+  }
+}
+
+function updateFaceIcon(valence, faceCount) {
+  if (faceCount === 0) {
+    elements.faceIcon.textContent = "😶";
+    elements.faceIcon.className = "face-icon";
+    elements.faceLabel.textContent = "未検出";
+    elements.faceLabel.className = "face-label";
+    return;
+  }
+  if (valence > 0.15) {
+    elements.faceIcon.textContent = "😊";
+    elements.faceIcon.className = "face-icon happy";
+    elements.faceLabel.textContent = "笑顔";
+    elements.faceLabel.className = "face-label happy";
+  } else if (valence < -0.15) {
+    elements.faceIcon.textContent = "😟";
+    elements.faceIcon.className = "face-icon sad";
+    elements.faceLabel.textContent = "反応低下";
+    elements.faceLabel.className = "face-label sad";
+  } else {
+    elements.faceIcon.textContent = "😐";
+    elements.faceIcon.className = "face-icon neutral";
+    elements.faceLabel.textContent = "通常";
+    elements.faceLabel.className = "face-label neutral";
+  }
 }
 
 function setStatus(label, variant = "") {
